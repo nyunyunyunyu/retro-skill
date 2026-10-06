@@ -85,12 +85,14 @@ git clone https://github.com/nyunyunyunyu/retro-skill
 |---|---|
 | `/retro` | 复盘一次 |
 | `/retro pause` | 暂停整个项目：`PROGRESS.md` 改名为 `PROGRESS.paused.md`，所有提醒立刻停止，定时检查删掉 |
-| `/retro resume` | 恢复：改回 `PROGRESS.md`，复盘一次，接着干活 |
+| `/retro resume` | 恢复：改回 `PROGRESS.md`（没有暂停的文件时，给你看最近一次归档的日期和目标，确认后恢复，等于撤销 `done`），复盘一次，接着干活 |
 | `/retro done` | 完成：`PROGRESS.md` 归档为 `PROGRESS.done-日期-时间.md`，提醒和定时检查关闭 |
 
-agent 发现完成标准已经达到时，会删掉自己的定时检查，提醒你运行 `/retro done`。
+**任务完成后自动关闭**：agent 确认任务完成时会自己执行 `done`。确认的依据是 Claude Code 的 `/goal` 已判定达成，或者完成标准逐条都有这次会话里的证据，拿不准就不执行。Codex 的 `/goal` 是 agent 自评，所以 Codex 下一律要证据。误判了用 `/retro resume` 撤销。建议把 `PROGRESS.md` 的完成标准原样写进 `/goal`：Claude Code 的 `/goal` 每轮由一个独立的模型判断是否达成，没达成会自动继续干，判断比干活的 agent 自评更可靠。只写 `/goal` 不写 `PROGRESS.md` 不行，hook 只认 `PROGRESS.md`。
 
 只想让某个会话停下：打断它，用自己的话告诉它暂停。它会删掉这个会话的定时检查，暂停期间也不会被复盘提醒带着重新开工，等你说继续再重建，不影响项目里的其他会话。
+
+**用了 `/goal` 的会话**：暂停时还要运行 `/goal clear`（Codex：`/goal pause`）。`/goal` 每轮结束都会判断，没达成就自动开始下一轮，agent 自己清除不了。只按 Esc 打断不受影响。
 
 ## 常驻规则
 
