@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // PostToolUse / PostToolUseFailure hook. Only active in projects with a PROGRESS.md at the root.
-// Nudges Claude to run the retro skill every EVERY tool calls, and when FAILS of the last WINDOW calls failed.
+// Nudges the agent to run the retro skill every EVERY tool calls, and when FAILS of the last WINDOW calls failed.
+// Works for Claude Code and Codex. Codex has no failure event and no exit code in tool_response,
+// so there only the periodic nudge applies.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
