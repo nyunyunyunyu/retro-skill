@@ -12,6 +12,7 @@ An enhancement for `/goal` in [Claude Code](https://claude.com/claude-code) and 
 | 暂停、清除、恢复会话后保留 | ✅ `/goal clear`（Codex：`/goal pause`） | — |
 | 等后台任务时唤醒 | ✅ 仅 Claude Code：自带检查（本插件把首次间隔设为 10 分钟） | — |
 | 定期复盘方法、迭代速度、是否卡在细节 | — | ✅ 每 40 次工具调用提醒，直到复盘做完 |
+| 路线和优先级评审 | — | ✅ 每小时在后台跑一次独立评审，不阻塞主 agent，同一项目同一时间最多一个，超过 20 分钟作废 |
 | `PROGRESS.md` 快照 | — | ✅ |
 | 等授权时不干等，过一阵再问 | — | ✅ 记进“待授权”，用两个一次性定时提醒在 30 分钟和 2 小时后追问 |
 
@@ -20,10 +21,16 @@ retro 只在会话有活跃的 `/goal` 时生效，目标结束就自动停，�
 ## 包含什么
 
 - **retro skill**：几分钟的快速复盘，结束时只给 3 行决定。
-  1. 路线：平台期、修一个坏一个时，换本质不同的路线并做最便宜的验证实验。
+  1. 路线：快速复盘里只在当前路线内做小调整（重排“下一步”），换路线交给后台的路线评审。
   2. 迭代速度：先测量再优化瓶颈；评测代码本身往往是最大杠杆（如 30s CPU → 0.1s GPU），按 `节省 = Δt × 剩余轮数 > 实现时间 × 2` 决定做不做；有明确的停止条件；长时间评测放后台跑，等待期间不空等。
   3. 细节与等待：不在关键路径上的问题记一行“暂缓”，回主线。需要用户授权时不干等：记进“待授权”，提一次，继续做别的，没答复的最多再问两次。
-  4. `PROGRESS.md`：快照不是日志，改写不追加，不超过约 60 行；“目标”一栏和 `/goal` 的条件一致。
+  4. `PROGRESS.md`：快照不是日志，改写不追加，不超过约 60 行；“目标”一栏和 `/goal` 的条件一致；每条路线写明押注理由、放弃条件和复查点。
+- **路线评审子代理**（`route-reviewer`）：和主 agent 同一组模型，思考强度开到最高，在后台运行。
+  - 输入：PROGRESS.md、`results.tsv`、git log，以及上次的评审。可以跑不占 GPU 的轻量探测，只写 `.retro/` 目录。
+  - 输出：200 字以内的建议，结论是保持、调整优先级、先探测或换路线四选一，附依据，以及会改变结论的条件。交结论前会重读最新状态，避免和主线脱节。
+  - 主 agent 怎么采纳：做完手头这一步再决定。复查点之前，只有放弃条件触发才换路线；调整优先级、推翻上次结论都需要新证据，以免来回换路线。快速复盘不能换路线，也不能自己提前发起评审。
+  - 防重复：何时评审只由 hook 决定。到点时，hook 用一个排他的锁文件原子地登记一次，把 `.retro/route-review.md` 第一行写成 `running`，并记下是哪个会话登记的。同一项目开多个会话、并行工具调用都只会登记一个，后续提醒也只发给登记的那个会话。它启动子代理后标记 `spawned`，没标记的话 hook 每 10 次调用催一次。
+  - 防过时：超过 20 分钟，任何会话的 hook 都会自动把这轮改成作废，并提醒登记的会话停掉子代理。子代理开始时和写结论前都会核对第一行是不是自己那一轮，不是就不写入，所以作废的结论不会覆盖新状态。
 - **提醒 hook**（`retro-nudge.mjs`，PostToolUse）：从会话记录里读出当前有没有活跃的 `/goal`。有的话，复盘必然改写 `PROGRESS.md`，就用它的修改时间判断上次复盘：从目标开始或上次复盘起超过 40 次工具调用，就提醒复盘，并允许 agent 先做完手头这一步；被忽略的话每 10 次调用再提醒一次，直到 `PROGRESS.md` 更新为止。subagent 的工具调用不计入；Claude Code 的 `/btw` 没有工具；Codex 的 `/side` 是临时线程，没有会话记录文件，hook 直接跳过。
 
 需要 Node.js 在 PATH 上。先克隆：
@@ -34,11 +41,14 @@ git clone https://github.com/nyunyunyunyu/retro-skill
 
 ## 安装：Claude Code
 
-1. 复制 skill：
+1. 复制 skill 和路线评审子代理：
 
    ```bash
    cp -r retro-skill/skills/retro ~/.claude/skills/
+   mkdir -p ~/.claude/agents && cp retro-skill/agents/claude/route-reviewer.md ~/.claude/agents/
    ```
+
+   如果 `~/.claude/agents/` 是新建的，已经在运行的会话要重启一次才能看到这个子代理。
 
 2. 合并进 `~/.claude/settings.json`（保留已有内容）。`env` 那一项把 `/goal` 自带的后台任务检查提前：第一次在 10 分钟，之后间隔逐步拉长。它对所有 `/goal` 会话都生效，需要 Claude Code v2.1.234 以上；不想要就去掉这一项：
 
@@ -59,10 +69,11 @@ git clone https://github.com/nyunyunyunyu/retro-skill
 
 ## 安装：Codex
 
-1. 复制 skill：
+1. 复制 skill 和路线评审子代理（思考强度设为 `max`，模型继承主会话）：
 
    ```bash
    mkdir -p ~/.agents/skills && cp -r retro-skill/skills/retro ~/.agents/skills/
+   mkdir -p ~/.codex/agents && cp retro-skill/agents/codex/route-reviewer.toml ~/.codex/agents/
    ```
 
 2. 新建或合并进 `~/.codex/hooks.json`：
@@ -106,6 +117,7 @@ git clone https://github.com/nyunyunyunyu/retro-skill
 - **依赖未公开的会话记录格式**：Claude Code 的 `goal_status` 记录和 `Goal cleared` 记录，以及 Codex 的 `thread_goal_updated` 事件。格式变了的话，hook 会安静地失效，不会报错。
 - **Codex 里 `/goal clear` 不会写进会话记录**，hook 看不到，要停 retro 请用 `/goal pause`。
 - agent 卡在一次工具调用中间时（例如权限弹窗正等你确认），没有任何机制能唤醒它。用 Claude Code 的自动模式可以避免这种阻塞。
+- 路线评审用最高思考强度，目标活跃、主 agent 一直在干活时每小时一次，token 开销明显。hook 只在工具调用时检查，主 agent 空闲时不会启动评审。`.retro/` 不需要提交，可以加进 `.gitignore`。
 - Codex 没有等后台任务时的自动唤醒（`/goal` 的等待检查目前只有 Claude Code 有文档说明）。
 - 恢复会话时 Claude Code 会重新写一条“设定目标”的记录，所以复盘计数会在恢复时清零。
 
