@@ -11,7 +11,11 @@ A skill for [Claude Code](https://claude.com/claude-code) and [Codex](https://gi
   2. 迭代速度：先测量再优化瓶颈；评测代码本身往往是最大杠杆（如 30s CPU → 0.1s GPU），按 `节省 = Δt × 剩余轮数 > 实现时间 × 2` 决定做不做；有明确的停止条件；长时间评测放后台跑，等待期间不空等。
   3. 细节：不在关键路径上的问题记一行“暂缓”，回主线。
   4. `PROGRESS.md`：快照不是日志，改写不追加，不超过约 60 行。
-- **提醒 hook**（`retro-nudge.mjs`）：项目根目录有 `PROGRESS.md` 时，每 40 次工具调用提醒一次复盘；在 Claude Code 里，最近 10 次调用有 3 次失败（典型的“改一下、跑一下、又失败”循环）时也会提醒。没有 `PROGRESS.md` 的项目里什么都不做，subagent 的工具调用不计入。
+- **提醒 hook**（`retro-nudge.mjs`），只在项目根目录有 `PROGRESS.md` 时工作：
+  - 复盘必然改写 `PROGRESS.md`，所以用它的修改时间判断上次复盘。超过 40 次工具调用没更新，就提醒复盘，并允许 agent 先做完手头这一步。被忽略的话每 10 次调用再提醒一次，直到 `PROGRESS.md` 更新为止。
+  - 复盘欠着的时候，agent 结束这一轮前会被拦一次（Stop hook），在自然断点补上复盘。
+  - Claude Code 里，最近 10 次调用有 3 次失败（典型的“改一下、跑一下、又失败”循环）时也会提醒。
+  - subagent 的工具调用不计入。
 
 需要 Node.js 在 PATH 上。先克隆：
 
@@ -37,6 +41,9 @@ git clone https://github.com/nyunyunyunyu/retro-skill
        ],
        "PostToolUseFailure": [
          { "matcher": "*", "hooks": [{ "type": "command", "command": "node \"$HOME/.claude/skills/retro/scripts/retro-nudge.mjs\"", "timeout": 10 }] }
+       ],
+       "Stop": [
+         { "hooks": [{ "type": "command", "command": "node \"$HOME/.claude/skills/retro/scripts/retro-nudge.mjs\"", "timeout": 10 }] }
        ]
      }
    }
@@ -63,6 +70,9 @@ git clone https://github.com/nyunyunyunyu/retro-skill
      "hooks": {
        "PostToolUse": [
          { "hooks": [{ "type": "command", "command": "node \"$HOME/.agents/skills/retro/scripts/retro-nudge.mjs\"", "commandWindows": "node C:/Users/<you>/.agents/skills/retro/scripts/retro-nudge.mjs", "timeout": 10 }] }
+       ],
+       "Stop": [
+         { "hooks": [{ "type": "command", "command": "node \"$HOME/.agents/skills/retro/scripts/retro-nudge.mjs\"", "commandWindows": "node C:/Users/<you>/.agents/skills/retro/scripts/retro-nudge.mjs", "timeout": 10 }] }
        ]
      }
    }
@@ -74,7 +84,7 @@ git clone https://github.com/nyunyunyunyu/retro-skill
 
 用法：在长任务项目里输入 `$retro`。
 
-**和 Claude Code 的区别**：Codex 没有单独的工具失败事件，传给 hook 的工具结果里也没有退出码，所以只有每 40 次调用的定期提醒，没有失败提醒。
+**和 Claude Code 的区别**：Codex 没有单独的工具失败事件，传给 hook 的工具结果里也没有退出码，所以没有失败提醒。逾期提醒和 Stop 拦截两边都有。
 
 ## 两行规则
 
