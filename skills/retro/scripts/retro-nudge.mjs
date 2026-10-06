@@ -1,9 +1,11 @@
 #!/usr/bin/env node
-// Hook for PostToolUse, PostToolUseFailure and Stop, for Claude Code and Codex. Only active in projects with a
+// Hook for SessionStart, PostToolUse, PostToolUseFailure and Stop, for Claude Code and Codex. Only active in projects with a
 // PROGRESS.md at the root. A retro always rewrites PROGRESS.md, so its mtime marks the last retro: once DUE tool
 // calls pass without an update, nudge every REPEAT calls until it is updated, and block the end of a turn once, so
 // an agent busy with something important can defer the retro to a natural breakpoint but not skip it.
 // Also nudges when FAILS of the last WINDOW calls failed (Claude Code only: Codex reports no failures to hooks).
+// SessionStart (incl. resume/compact) reminds the agent to read PROGRESS.md and re-create the 10-minute timer:
+// tool calls can't fire while the agent idles waiting, and Claude Code's session timers are lost on restart.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -18,6 +20,10 @@ try { retroAt = fs.statSync(path.join(process.env.CLAUDE_PROJECT_DIR || input.cw
 if (input.agent_id) process.exit(0);
 
 const event = input.hook_event_name || 'PostToolUse';
+if (event === 'SessionStart') {
+  process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: event, additionalContext: '本项目根目录有 PROGRESS.md，是一个进行中的长任务：先读它。如果这个会话还没有 retro 定时检查（Claude Code 可用 CronList 查看），按 retro skill 里的写法建一个每 10 分钟的。' } }));
+  process.exit(0);
+}
 // One line per tool call, "<ms timestamp><flag>", appended: parallel tool calls running this hook don't lose counts.
 const file = path.join(os.tmpdir(), `claude-retro-${String(input.session_id).replace(/[^\w-]/g, '_')}.log`);
 let lines = [];
