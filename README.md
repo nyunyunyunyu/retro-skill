@@ -11,7 +11,7 @@ A [Claude Code](https://claude.com/claude-code) skill that makes long-running co
   2. 迭代速度：先测量再优化瓶颈；评测代码本身往往是最大杠杆（如 30s CPU → 0.1s GPU），按 `节省 = Δt × 剩余轮数 > 实现时间 × 2` 决定做不做；有明确的停止条件；长时间评测放后台跑，等待期间不空等。
   3. 细节：不在关键路径上的问题记一行“暂缓”，回主线。
   4. `PROGRESS.md`：快照不是日志，改写不追加，不超过约 60 行。
-- **提醒 hook**（`retro-nudge.mjs`）：项目根目录有 `PROGRESS.md` 时，每 40 次工具调用、或连续 3 次工具调用失败，提醒 Claude 复盘。没有 `PROGRESS.md` 的项目里什么都不做。
+- **提醒 hook**（`retro-nudge.mjs`）：项目根目录有 `PROGRESS.md` 时，每 40 次工具调用、或最近 10 次调用里有 3 次失败（典型的“改一下、跑一下、又失败”循环），提醒 Claude 复盘。没有 `PROGRESS.md` 的项目里什么都不做。
 
 ## 安装
 
