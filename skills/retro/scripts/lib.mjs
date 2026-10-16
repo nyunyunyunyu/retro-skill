@@ -4,7 +4,9 @@
 //   log.tsv          append-only event log (time, session, event, detail), for the progress desk and later analysis
 //   sessions/<id>.json   sessions that hold an active /goal here, for the progress desk
 //   tasks/<task>/report.md   executor reports; ideas.md, results.tsv, route-review.md, reviews/ are written by agents
+//   user-inbox.jsonl what the user said at the progress desk, until the hook hands it over; then kept in user-said.md
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 // RETRO_TIME_SCALE shrinks every interval, for tests only (e.g. 0.01 turns an hour into 36 s).
@@ -45,7 +47,7 @@ export const mtime = f => { try { return fs.statSync(f).mtimeMs; } catch { retur
 export const read = f => { try { return fs.readFileSync(f, 'utf8'); } catch { return ''; } };
 
 // Files the scripts and agents generate; kept out of git so worktrees don't carry stale copies.
-const GENERATED = ['slot', 'slot.lock', 'retro-done', 'log.tsv', 'sessions/', 'tasks/', 'reviews/', 'probes/', 'ideas.md', 'results.tsv', 'route-review.md'];
+const GENERATED = ['slot', 'slot.lock', 'retro-done', 'log.tsv', 'sessions/', 'tasks/', 'reviews/', 'probes/', 'ideas.md', 'results.tsv', 'route-review.md', 'user-inbox.jsonl', 'user-said.md'];
 // A new .retro/ ignores everything. An existing one (some projects commit parts of it) gets a .gitignore for the
 // generated files only, unless it already has one.
 export function ensureDir(root) {
@@ -125,13 +127,35 @@ export function openIdeas(root) {
   return fs.existsSync(f) ? (read(f).match(/^\s*[-*] \[ \]/gm) || []).length : null;
 }
 
+// The hook's cached goal state for a session ({active, cond, start, …} in the system temp dir), or null.
+export function goalCache(sessionId) {
+  const sid = String(sessionId).replace(/[^\w-]/g, '_');
+  try { return JSON.parse(fs.readFileSync(path.join(os.tmpdir(), `claude-retro-${sid}.goal`), 'utf8')); } catch { return null; }
+}
+
+// When a transcript was last written: its mtime, or the timestamp of its last record if later. Codex keeps its
+// rollout file open, and on Windows the mtime then stays at the session's start.
+export function lastWrite(file) {
+  let t = mtime(file);
+  try {
+    const fd = fs.openSync(file, 'r');
+    const size = fs.fstatSync(fd).size, n = Math.min(size, 65536);
+    const buf = Buffer.alloc(n);
+    fs.readSync(fd, buf, 0, n, size - n);
+    fs.closeSync(fd);
+    const m = [...buf.toString('utf8').matchAll(/"timestamp":"([^"]+)"/g)].pop();
+    if (m) t = Math.max(t, Date.parse(m[1]) || 0);
+  } catch {}
+  return t;
+}
+
 // Sessions that recorded an active /goal in this project, most recently active first.
 export function sessions(root) {
   const d = path.join(dir(root), 'sessions');
   let names = [];
   try { names = fs.readdirSync(d).filter(f => f.endsWith('.json')); } catch {}
   return names.map(f => { try { return JSON.parse(read(path.join(d, f))); } catch { return null; } })
-    .filter(Boolean).map(s => ({ ...s, active: mtime(s.transcript_path) })).sort((a, b) => b.active - a.active);
+    .filter(Boolean).map(s => ({ ...s, active: lastWrite(s.transcript_path) })).sort((a, b) => b.active - a.active);
 }
 
 // Newest sign of task progress in the project: a task report, a ledger row, a commit on any branch or worktree, or

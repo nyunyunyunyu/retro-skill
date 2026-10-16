@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-// Hook for Claude Code (PostToolUse, Stop, SubagentStop) and Codex (PostToolUse) that enhances /goal. It only acts
-// while the session has an active /goal, read from the session transcript (Claude Code: goal_status attachments and
-// "Goal cleared" records; Codex: thread_goal_updated events). These are internal formats; if they change, it goes quiet.
+// Hook for Claude Code and Codex (PostToolUse, Stop, SubagentStop) that enhances /goal. It only acts while the session
+// has an active /goal, read from the session transcript (Claude Code: goal_status attachments and "Goal cleared"
+// records; Codex: thread_goal_updated events, overruled by its goal database). These are internal formats; if they
+// change, it goes quiet.
 //
 // Retro: due once, since max(goal start, last `retro.mjs done`), 60 min have passed, 4 results came back (distinct
 // subagents finishing, or new task reports) or the main agent made 40 tool calls. Then it nudges on the first main
@@ -11,6 +12,7 @@
 // runs low, otherwise a review. If nothing new came back in the past hour it reserves nothing and reports a stall.
 // A reservation must be launched within 20 min; the review/scout then has 20/40 min. Any session voids overdue ones.
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -27,8 +29,9 @@ const event = input.hook_event_name || 'PostToolUse';
 const debug = path.join(os.tmpdir(), 'claude-retro-debug');
 if (fs.existsSync(debug)) {
   try {
-    const { session_id, agent_id, agent_type, stop_hook_active, tool_name, background_tasks } = input;
-    fs.appendFileSync(debug + '.log', JSON.stringify({ t: iso(now), event, session_id, agent_id, agent_type, stop_hook_active, tool_name, background_tasks }) + '\n');
+    const { session_id, agent_id, agent_type, stop_hook_active, tool_name, background_tasks, cwd, transcript_path } = input;
+    const toolKeys = input.tool_input && typeof input.tool_input === 'object' ? Object.keys(input.tool_input) : typeof input.tool_input;
+    fs.appendFileSync(debug + '.log', JSON.stringify({ t: iso(now), event, session_id, agent_id, agent_type, stop_hook_active, tool_name, background_tasks, cwd, transcript_path, keys: Object.keys(input), toolKeys }) + '\n');
   } catch {}
 }
 if (!['PostToolUse', 'Stop', 'SubagentStop'].includes(event) || typeof input.transcript_path !== 'string') process.exit(0);
@@ -41,8 +44,9 @@ const RESUME = /^\s*\/?(resume|continue|restart|unpause|go on|恢复|继续)\s*[
 
 if (event === 'SubagentStop') {
   // A subagent finished: a result, keyed by agent id so follow-ups to the same agent count once. Skip the
-  // review/scout agents and internal ones (/btw, prompt suggestions) that report an empty agent_type.
-  if (input.agent_type && !SLOT_AGENTS.has(input.agent_type)) {
+  // review/scout agents, internal ones (/btw, prompt suggestions) that report an empty agent_type, and Codex's
+  // approval reviewers.
+  if (input.agent_type && !SLOT_AGENTS.has(input.agent_type) && !/guardian/i.test(input.agent_type)) {
     try { fs.appendFileSync(base + '.log', `${me} r ${String(input.agent_id || process.pid).replace(/\s/g, '')}\n`); } catch {}
   }
   process.exit(0);
@@ -51,11 +55,12 @@ if (event === 'SubagentStop') {
 if (input.agent_id) process.exit(0);
 
 const goal = goalState(input.transcript_path, base + '.goal');
-if (!goal.active) process.exit(0);
+if (!goal.active || goal.child) process.exit(0);
 
 const stopping = event === 'Stop';
 const root = mainCheckout(process.env.CLAUDE_PROJECT_DIR || input.cwd || process.cwd());
 const CLI = fileURLToPath(new URL('./retro.mjs', import.meta.url)).replace(/\\/g, '/');
+const SKILL = fileURLToPath(new URL('../SKILL.md', import.meta.url)).replace(/\\/g, '/');
 const cmd = sub => `\`node "${CLI}" ${sub} --root "${root.replace(/\\/g, '/')}"\``;
 const notes = [];
 
@@ -77,6 +82,7 @@ const lastBlock = read(base + '.blocked').trim();
 if (stopping && lastBlock !== '' && calls.length <= Number(lastBlock)) process.exit(0);
 
 try { if (!stopping) launched(); } catch {}
+try { userInbox(); } catch {}
 try { goalNote(); } catch {}
 try { sessionFile(); } catch {}
 try { retroNudge(); } catch {}
@@ -108,6 +114,30 @@ function launched() {
     writeSlot(root, { ...t.kv, spawned: iso(now) });
     return true;
   })) log(root, sid, 'launched', `${s.type} ${s.kv.start}`);
+}
+
+// What the user said at the progress desk (`retro.mjs tell`): messages addressed to this session are handed over
+// once and kept in user-said.md; ones nobody picked up within 6 h go there too, marked undelivered.
+function userInbox() {
+  const inbox = path.join(root, '.retro', 'user-inbox.jsonl');
+  if (!fs.existsSync(inbox) || !fs.statSync(inbox).size) return;
+  const mine = locked(root, () => {
+    const keep = [], got = [], said = [];
+    for (const l of read(inbox).split('\n').filter(Boolean)) {
+      let m;
+      try { m = JSON.parse(l); } catch { continue; }
+      if (m.to === input.session_id) { got.push(m.text); said.push(`- ${m.at} ${m.text}`); }
+      else if (now - Date.parse(m.at) > 6 * 3600e3) said.push(`- ${m.at} （没有送达）${m.text}`);
+      else keep.push(l + '\n');
+    }
+    if (said.length) fs.appendFileSync(path.join(root, '.retro', 'user-said.md'), said.join('\n') + '\n');
+    fs.writeFileSync(inbox, keep.join(''));
+    return got;
+  });
+  if (!mine?.length) return;
+  const text = mine.join('\n');
+  log(root, sid, 'told', text);
+  notes.push(`用户在进度台说了下面的话，转给你（按 retro skill 第 1 节优先处理：先分清是指令、想法还是问题；长期有效的指令马上记进 PROGRESS.md 的“用户指令”；需要回答的，在回复里回答）：\n${text}`);
 }
 
 // Record the session holding the goal, so the progress desk can find its transcript.
@@ -166,7 +196,7 @@ function retroNudge() {
     if (nudge && k === firstDue) log(root, sid, 'retro-due', `${Math.round((now - R) / 60e3)}min ${resultsAt(now)}results ${since.length}calls`);
   }
   if (!nudge) return;
-  let text = `复盘到期（距上次复盘或目标开始 ${Math.round((now - R) / 60e3)} 分钟，期间交回 ${resultsAt(now)} 个结果，主会话 ${since.length} 次工具调用）。先做完手头这一步，不要打断正在进行的事；到下一个断点时按 retro skill 复盘：先运行 ${cmd('inbox')} 收集交回的内容，最后运行 ${cmd('done')}，这个提醒随之停止。`;
+  let text = `复盘到期（距上次复盘或目标开始 ${Math.round((now - R) / 60e3)} 分钟，期间交回 ${resultsAt(now)} 个结果，主会话 ${since.length} 次工具调用）。先做完手头这一步，不要打断正在进行的事；到下一个断点时按 retro skill（${SKILL}）复盘：先运行 ${cmd('inbox')} 收集交回的内容，最后运行 ${cmd('done')}，这个提醒随之停止。`;
   const size = fs.existsSync(path.join(root, 'PROGRESS.md')) ? fs.statSync(path.join(root, 'PROGRESS.md')).size : 0;
   if (size > C.PROGRESS_MAX) text += ` PROGRESS.md 现在 ${(size / 1024).toFixed(1)} KB，超过 4 KB：这次复盘先压缩它（命令和环境移到 RUNBOOK.md，过程细节移到任务笔记）。`;
   notes.push(text);
@@ -176,7 +206,13 @@ function slot() {
   let s = readSlot(root);
   const mine = () => s.by === sid;
   const repeat = stopping || (upTo.length > 0 && upTo.length % C.REPEAT === 0);
-  const spawnText = (type, start) => `在后台启动 ${type === 'scout' ? 'idea-scout（全局侦察）' : 'route-reviewer（路线评审）'} 子代理，提示写：“${type === 'scout' ? '侦察本项目' : '评审本项目的路线'}。开始时间 ${start}；脚本 ${CLI}；项目 ${root.replace(/\\/g, '/')}”。`;
+  const spawnText = (type, start) => {
+    const name = type === 'scout' ? 'idea-scout' : 'route-reviewer';
+    const how = goal.codex
+      ? `用 spawn_agent 启动 ${name} 子代理（agent_type 设为 "${name}"，fork_turns 设为 "none"），message 写`
+      : `在后台启动 ${name} 子代理（Agent 工具，subagent_type 设为 ${name}，run_in_background 设为 true），提示写`;
+    return `${how}：“${type === 'scout' ? '侦察本项目' : '评审本项目的路线'}。开始时间 ${start}；脚本 ${CLI}；项目 ${root.replace(/\\/g, '/')}”。`;
+  };
   const stopNote = '你启动的后台评审/侦察超过时间上限，已自动作废。能停就停掉它（Claude Code 用 TaskStop，Codex 用对应的停止子代理工具）；停不掉也没关系，它交结论时会发现已作废，不会写入。';
   // Tell the owner once to stop a voided subagent it launched, then drop `spawned` so it isn't told again.
   const tellOwner = start => locked(root, t => {
@@ -240,21 +276,64 @@ function slot() {
   }
 }
 
+// The thread's goal row in Codex's goal database (<CODEX_HOME>/goals_<n>.sqlite, table thread_goals): the agent
+// completing it, a token or usage limit, and /goal clear (which deletes the row) show only there. Returns the row,
+// null when the thread has none, undefined when the database can't be read (then the rollout is all there is).
+function codexGoal(thread) {
+  try {
+    const home = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+    const db = fs.readdirSync(home).filter(f => /^goals_\d+\.sqlite$/.test(f)).sort((a, b) => parseInt(a.slice(6), 10) - parseInt(b.slice(6), 10)).pop();
+    if (!db) return undefined;
+    process.removeAllListeners('warning'); // node:sqlite is experimental in Node 22 and would say so on stderr
+    const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite');
+    const h = new DatabaseSync(path.join(home, db), { readOnly: true });
+    try { return h.prepare('SELECT objective, status, created_at_ms FROM thread_goals WHERE thread_id = ?').get(String(thread)) ?? null; } finally { h.close(); }
+  } catch { return undefined; }
+}
+
 // Latest goal state of the transcript. The cache keeps the byte offset already scanned, so each run reads only what
 // was appended since; a corrupt or missing cache just means one full scan. A goal is identified by its condition
 // text (Codex: its createdAt), so the goal_status record Claude Code rewrites on resume or compaction doesn't restart
 // it; a condition that extends the current one ("…，成功后…") counts as the same goal, and so does one set again
 // within 12 h after it stopped (paused with /goal clear, or set aside for a temporary goal): it keeps its start.
+// Codex's rollout only records what the user sets, pauses or resumes, so its goal database has the last word.
 function goalState(transcript, cacheFile) {
-  const fresh = { path: transcript, off: 0, active: false, start: 0, cond: '', prev: '', replaced: false, unfinished: '', past: [] };
+  // v: bump whenever a field is added that is only computed on a full scan, so older caches get rebuilt.
+  const fresh = { v: 2, path: transcript, off: 0, active: false, start: 0, cond: '', prev: '', replaced: false, unfinished: '', past: [], codex: false, child: false };
   const norm = s => String(s ?? '').trim();
   const same = (a, b) => norm(a) === norm(b) || (norm(b) !== '' && norm(a).startsWith(norm(b)));
   // The current goal stops being current: remember it (last 5), so setting it again soon continues it.
   const shelve = (st, at) => {
     if (norm(st.cond)) st.past = [...st.past.filter(p => norm(p.cond) !== norm(st.cond)), { cond: st.cond, start: st.start, end: at }].slice(-5);
   };
+  // One goal record: active or not, its condition (null: unchanged), its creation time (Codex only, else 0).
+  const apply = (st, at, active, cond, created) => {
+    const changed = cond !== null && norm(cond) !== norm(st.cond);
+    if (active && st.active && created && created === st.start) {
+      if (cond !== null) st.cond = cond; // Codex: the same goal, its objective edited in place
+    } else if (active && changed && st.active && !created && same(cond, st.cond)) {
+      st.cond = cond; // extended the same goal
+    } else if (active && (changed || !st.active || (created && created !== st.start))) {
+      // A new goal, or a goal set again (Codex: a different createdAt means a new one).
+      const c = cond ?? st.cond;
+      if (st.active) shelve(st, at);
+      const back = created ? null : [...st.past].reverse().find(p => same(c, p.cond) && at - p.end < C.SAME_GOAL_GAP);
+      st.replaced = st.active && changed && !back;
+      if (st.replaced) st.unfinished = st.cond;
+      if (back && same(st.unfinished, back.cond)) st.unfinished = '';
+      st.prev = changed ? st.cond : '';
+      st.cond = c;
+      st.start = created || back?.start || at;
+    } else if (!active && st.active) {
+      shelve(st, at);
+    }
+    st.active = active;
+  };
   let st = fresh;
-  try { st = { ...fresh, ...JSON.parse(fs.readFileSync(cacheFile, 'utf8')) }; } catch {}
+  try {
+    const c = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+    if (c.v === fresh.v) st = { ...fresh, ...c };
+  } catch {}
   try {
     const fd = fs.openSync(transcript, 'r');
     const size = fs.fstatSync(fd).size;
@@ -263,6 +342,12 @@ function goalState(transcript, cacheFile) {
     fs.readSync(fd, buf, 0, buf.length, st.off);
     fs.closeSync(fd);
     const end = buf.lastIndexOf(10) + 1; // complete lines only
+    // A Codex rollout starts with session_meta; a Codex subagent's names its parent and never holds the goal.
+    if (st.off === 0) {
+      const head = buf.toString('utf8', 0, Math.min(end, 8192));
+      st.codex = /^\{"timestamp":"[^"]*",("ordinal":\d+,)?"type":"session_meta"/.test(head);
+      st.child = head.includes('"source":{"subagent"');
+    }
     const hits = new Set();
     for (const pat of ['"type":"goal_status"', 'Goal cleared', '"type":"thread_goal_updated"']) {
       for (let i = buf.indexOf(pat); i >= 0 && i < end; i = buf.indexOf(pat, i + 1)) hits.add(buf.lastIndexOf(10, i) + 1);
@@ -283,27 +368,13 @@ function goalState(transcript, cacheFile) {
         cond = g.objective == null ? null : String(g.objective);
         created = g.createdAt ? g.createdAt * 1000 : 0;
       }
-      if (active === null) continue;
-      const changed = cond !== null && norm(cond) !== norm(st.cond);
-      if (active && changed && st.active && !created && same(cond, st.cond)) {
-        st.cond = cond; // extended the same goal
-      } else if (active && (changed || !st.active || (created && created !== st.start))) {
-        // A new goal, or a goal set again (Codex: a different createdAt means a new one).
-        const c = cond ?? st.cond;
-        if (st.active) shelve(st, at);
-        const back = created ? null : [...st.past].reverse().find(p => same(c, p.cond) && at - p.end < C.SAME_GOAL_GAP);
-        st.replaced = st.active && changed && !back;
-        if (st.replaced) st.unfinished = st.cond;
-        if (back && same(st.unfinished, back.cond)) st.unfinished = '';
-        st.prev = changed ? st.cond : '';
-        st.cond = c;
-        st.start = created || back?.start || at;
-      } else if (!active && st.active) {
-        shelve(st, at);
-      }
-      st.active = active;
+      if (active !== null) apply(st, at, active, cond, created);
     }
     st.off += end;
+    if (st.codex) {
+      const row = codexGoal(input.session_id);
+      if (row !== undefined) apply(st, now, row?.status === 'active', row ? String(row.objective) : null, row ? Math.floor(Number(row.created_at_ms) / 1000) * 1000 : 0);
+    }
     fs.writeFileSync(cacheFile, JSON.stringify(st));
   } catch {}
   return st;

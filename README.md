@@ -16,7 +16,7 @@ An enhancement for `/goal` in [Claude Code](https://claude.com/claude-code) and 
 | | `/goal`（原生） | retro（本插件） |
 |---|---|---|
 | 一直干到完成、判断是否达成 | ✅ | — |
-| 暂停、清除、恢复会话后保留 | ✅ `/goal clear`（Codex：`/goal pause`） | — |
+| 暂停、清除、恢复会话后保留 | ✅ `/goal clear`（Codex 也可以 `/goal pause`） | — |
 | 等后台任务时唤醒 | ✅ 仅 Claude Code，自带检查（默认 30 分钟；可选地改成 10 分钟，见安装） | — |
 | 主 agent 只调度，子代理执行并回报发现和想法 | — | ✅ skill 规则 + 统一的执行与回报模板 |
 | 定期复盘 | — | ✅ 60 分钟 / 4 个结果 / 40 次调用，先到先触发；忽略的话每 10 次调用再提醒，一轮结束时再拦一次 |
@@ -45,15 +45,16 @@ retro 只在会话有活跃的 `/goal` 时生效，目标结束就自动停，�
   - `idea-scout`：从差距分解、假设审计、外部经验、换个问法、从零开始这五个角度找想法，只提不拍板，限 40 分钟。
   - 两者都只能在 `.retro/probes/` 下做轻量探测，交付时由脚本核对这一轮是否仍然有效。交付后，主 agent 可以继续追问。
 - **提醒 hook**（`scripts/retro-nudge.mjs`）：
-  - Claude Code 注册 PostToolUse、Stop、SubagentStop 三个事件；Codex 只注册 PostToolUse。
-  - 从会话记录里读出当前有没有活跃的 `/goal`，有才工作。
+  - Claude Code 和 Codex 都注册 PostToolUse、Stop、SubagentStop 三个事件。
+  - 从会话记录里读出当前有没有活跃的 `/goal`，有才工作。Codex 的会话记录只记用户设置、暂停、恢复目标，agent 自己标记完成、额度用完、`/goal clear` 都不记，所以 Codex 以它的目标数据库 `~/.codex/goals_1.sqlite` 为准（只读，用 Node 22 自带的 `node:sqlite`）。
   - 负责复盘提醒、后台名额登记、停滞检测。
   - 检测 `/goal` 被替换的情况，提醒 agent 把原目标告诉用户。这也包括误用 `/goal resume` 的情况：Claude Code 没有这个子命令，这样设会成为一个字面上叫 resume 的新目标。
 - **辅助脚本**（`scripts/retro.mjs`）：
   - `done`：标记复盘完成；
   - `inbox`：列出上次复盘以来交回的内容；
   - `spawned`、`finish`、`abort`：后台子代理用来标记启动、交付结果、放弃这一轮；
-  - `status`：给进度台用的进度快照。
+  - `status`：给进度台用的进度快照，Claude Code 和 Codex 的会话记录都能读；
+  - `tell`：进度台把用户的话放进转达箱，主 agent 下一次调用工具时由 hook 交给它。
 - **进度台 skill**（`skills/retro-status`）：在另一个会话里只读地回答“现在进度怎样”，把用户的指令转给主 agent。
 
 ## 安装
@@ -77,7 +78,7 @@ node retro-skill/install.mjs
 只装其中一个就加 `--claude` 或 `--codex`；想先看会改什么，就加 `--dry-run`。
 
 安装后：
-- **Codex**：如果 hooks.json 被改过，要在 Codex 里运行 `/hooks` 审核并信任这个 hook。Codex 不运行没被信任的 hook，而且每次修改 hooks.json 后都要重新信任。
+- **Codex**：安装脚本新加了 hook 条目时（会提示是哪几个），要在 Codex 里运行 `/hooks` 信任它们，Codex 不运行没被信任的条目。已经信任过的条目不会被改动，也不用重新信任；Codex 只校验条目本身，不校验脚本内容，所以以后升级脚本也不用重新信任。
 - **Claude Code**：如果 `~/.claude/agents/` 是这次新建的，已经在运行的会话要重启一次才能看到子代理。
 - **（可选）** 在 `~/.claude/settings.json` 的 `env` 里加上 `"CLAUDE_CODE_GOAL_CHECKIN_MINUTES": "10"`，让 `/goal` 等后台任务时第一次检查提前到 10 分钟，默认是 30 分钟。这需要 Claude Code v2.1.234 以上。
 - **（可选）** 在 `~/.claude/CLAUDE.md` 或 `~/.codex/AGENTS.md` 加上下面的[常驻规则](#常驻规则)。
@@ -124,9 +125,10 @@ hook 和脚本都把 worktree 里的路径换算到主 checkout，hook 给出的
 
 ## 已知限制
 
-- **依赖没有公开文档的会话记录格式**：Claude Code 的 `goal_status` 和 `Goal cleared` 记录，Codex 的 `thread_goal_updated` 事件。格式一变，hook 会安静地失效，不会报错。
-- **Codex 里 `/goal clear` 不写进会话记录**，hook 看不到。要停 retro，请用 `/goal pause`。
-- **Codex 只有 PostToolUse**：没有“一轮结束时再拦一次”的兜底，结果数只能从 `report.md` 统计；进度台的会话摘要暂时只支持 Claude Code。
+- **依赖没有公开文档的内部格式**：Claude Code 的 `goal_status` 和 `Goal cleared` 记录，Codex 的 `thread_goal_updated` 事件和目标数据库。格式一变，hook 会安静地失效，不会报错。
+- **Codex 的 hook 只在代码单元里的工具之后触发**：Codex 用代码模式时，`exec` 单元和 `wait` 本身不触发 hook，主 agent 长时间等待时，提醒要等到下一次工具调用或这一轮结束。
+- **Codex 同时最多 3 个子代理**（默认值，含后台评审或侦察）。子代理交回的结论只在主 agent 活动时送到，不会把空闲的主 agent 叫醒；`/goal` 会自己开下一轮，所以不会卡住。
+- **进度台转达到 Codex 有延迟**：Codex 没有会话间消息，转达靠 `retro.mjs tell` 加 hook，主 agent 下一次调用工具时才收到。
 - **agent 卡在一次工具调用中间时**（例如权限弹窗正等你确认），没有任何机制能唤醒它。用 Claude Code 的自动模式可以避免这种阻塞。
 - **token 开销明显**：评审和侦察都用最高思考强度。hook 只在主会话有动静时检查，主 agent 长时间空闲时不会登记新的一轮。
 - **结束时可能多一轮**：Stop hook 拦截和 `/goal` 判定达成同时发生时，两者怎么合并没有文档说明，可能会多跑一轮。

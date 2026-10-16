@@ -20,7 +20,7 @@ function setup(name, { goalAgo = 5, cond = 'tests pass', extra = [], sid: sidArg
   const transcript = path.join(proj, 'transcript.jsonl');
   const lines = goalAgo == null ? [] : [goalLine(cond, Date.now() - goalAgo * MIN)];
   fs.writeFileSync(transcript, [...lines, ...extra].map(l => JSON.stringify(l)).join('\n') + '\n');
-  const env = { ...process.env, TEMP: tmp, TMP: tmp, TMPDIR: tmp, CLAUDE_PROJECT_DIR: proj };
+  const env = { ...process.env, TEMP: tmp, TMP: tmp, TMPDIR: tmp, CLAUDE_PROJECT_DIR: proj, CODEX_HOME: path.join(tmp, 'codex-home') };
   delete env.RETRO_TIME_SCALE;
   const sid = sidArg || 'sess-' + name;
   const input = (o = {}) => ({ session_id: sid, transcript_path: transcript, cwd: proj, hook_event_name: 'PostToolUse', tool_name: 'Bash', ...o });
@@ -532,6 +532,111 @@ await test('parallel first calls record the goal once', async () => {
   const t = setup('goalonce');
   await Promise.all(Array.from({ length: 8 }, () => t.hookAsync()));
   assert.equal(fs.readFileSync(t.retro('log.tsv'), 'utf8').split('\n').filter(l => /\tgoal\t/.test(l)).length, 1);
+});
+
+const codexGoal = (objective, createdAt, status = 'active') => ({ timestamp: iso(Date.now()), type: 'event_msg', payload: { type: 'thread_goal_updated', goal: { objective, status, createdAt } } });
+const codexMeta = (id, source = 'vscode') => ({ timestamp: iso(Date.now()), type: 'session_meta', payload: { session_id: id, id, source, base_instructions: { text: 'x' } } });
+
+await test('Codex: a subagent thread is ignored even if its rollout carries the goal', () => {
+  const created = Math.floor((Date.now() - 61 * MIN) / 1000);
+  const child = codexMeta('kid', { subagent: { thread_spawn: { parent_thread_id: 'main', agent_role: 'worker' } } });
+  const t = setup('codexchild', { goalAgo: null, extra: [child, codexGoal('codex goal', created)] });
+  assert.equal(t.hook(), null);
+  assert.ok(!fs.existsSync(t.retro('slot')));
+});
+
+await test('Codex: the goal database overrules the rollout (completed or cleared goes quiet); without it the rollout counts', async () => {
+  process.removeAllListeners('warning');
+  const { DatabaseSync } = await import('node:sqlite');
+  const created = Math.floor((Date.now() - 61 * MIN) / 1000);
+  const t = setup('codexdb', { goalAgo: null, extra: [codexMeta('sess-codexdb'), codexGoal('codex goal', created)] });
+  const home = t.env.CODEX_HOME;
+  fs.mkdirSync(home, { recursive: true });
+  const db = new DatabaseSync(path.join(home, 'goals_1.sqlite'));
+  db.exec('CREATE TABLE thread_goals (thread_id TEXT PRIMARY KEY, goal_id TEXT, objective TEXT, status TEXT, created_at_ms INTEGER, updated_at_ms INTEGER)');
+  db.prepare('INSERT INTO thread_goals VALUES (?, ?, ?, ?, ?, ?)').run(t.sid, 'g1', 'codex goal', 'active', created * 1000 + 123, Date.now());
+  const goalFile = path.join(t.tmp, `claude-retro-${t.sid}.goal`);
+  const state = () => JSON.parse(fs.readFileSync(goalFile, 'utf8'));
+  const r = t.text(t.hook());
+  assert.ok(state().active); assert.equal(state().start, created * 1000);
+  assert.match(r, /spawn_agent/); assert.match(r, /fork_turns 设为 "none"/); assert.match(r, /复盘到期/);
+  db.prepare('UPDATE thread_goals SET status = ? WHERE thread_id = ?').run('complete', t.sid);
+  assert.equal(t.hook(), null); assert.ok(!state().active);
+  db.prepare('UPDATE thread_goals SET status = ? WHERE thread_id = ?').run('active', t.sid);
+  assert.ok(t.hook() !== undefined && state().active);
+  db.prepare('DELETE FROM thread_goals WHERE thread_id = ?').run(t.sid); // /goal clear
+  assert.equal(t.hook(), null); assert.ok(!state().active);
+  db.close();
+  const u = setup('codexnodb', { goalAgo: null, extra: [codexMeta('sess-codexnodb'), codexGoal('codex goal', created)] });
+  u.hook();
+  assert.ok(JSON.parse(fs.readFileSync(path.join(u.tmp, `claude-retro-${u.sid}.goal`), 'utf8')).active);
+});
+
+await test('Codex: status reads the main rollout and finds child rollouts by parent thread id', () => {
+  const t = setup('codexstatus', { goalAgo: null });
+  const d = new Date(), pad = n => String(n).padStart(2, '0');
+  const old = path.join(t.proj, '.codex', 'sessions', '2026', '07', '22'); // a resumed thread: its own rollout is old
+  const day = path.join(t.proj, '.codex', 'sessions', String(d.getFullYear()), pad(d.getMonth() + 1), pad(d.getDate()));
+  fs.mkdirSync(old, { recursive: true }); fs.mkdirSync(day, { recursive: true });
+  const main = path.join(old, 'rollout-main.jsonl'), kid = path.join(day, 'rollout-kid.jsonl');
+  const guardian = { timestamp: iso(Date.now()), type: 'session_meta', payload: { id: 'g', parent_thread_id: 'main-id', source: { subagent: { other: 'guardian' } } } };
+  fs.writeFileSync(path.join(day, 'rollout-guardian.jsonl'), JSON.stringify(guardian) + '\n');
+  const msg = (role, text) => ({ timestamp: iso(Date.now()), type: 'response_item', payload: { type: 'message', role, content: [{ type: role === 'assistant' ? 'output_text' : 'input_text', text }] } });
+  const lines = [codexMeta('main-id'), codexGoal('codex goal', Math.floor(Date.now() / 1000) - 60), msg('user', '进度怎样？'), msg('assistant', '派出两个执行者'),
+    { timestamp: iso(Date.now()), type: 'response_item', payload: { type: 'custom_tool_call', name: 'exec', input: 'text(await tools.exec_command({cmd:"node eval.mjs --seeds 1-100"}))' } }];
+  fs.writeFileSync(main, lines.map(l => JSON.stringify(l)).join('\n') + '\n');
+  fs.writeFileSync(kid, [codexMeta('kid-id', { subagent: { thread_spawn: { parent_thread_id: 'main-id', agent_path: '/root/try_expectimax', agent_role: 'worker' } } }), msg('assistant', '深度 3 跑完')].map(l => JSON.stringify(l)).join('\n') + '\n');
+  fs.mkdirSync(t.retro('sessions'), { recursive: true });
+  fs.writeFileSync(t.retro('sessions/main-id.json'), JSON.stringify({ session_id: 'main-id', transcript_path: main, goal: 'codex goal', goal_start: iso(Date.now() - MIN) }));
+  const out = t.cli('status').stdout;
+  for (const s of ['派出两个执行者', '进度怎样', 'exec（node eval.mjs --seeds 1-100）', 'try_expectimax（worker', '深度 3 跑完']) assert.ok(out.includes(s), `missing ${s}\n${out}`);
+  assert.ok(!out.includes('rollout-guardian'), 'guardian listed as a subagent');
+});
+
+await test('Codex: a cache from before Codex detection is rebuilt; an objective edited in place is the same goal', async () => {
+  process.removeAllListeners('warning');
+  const { DatabaseSync } = await import('node:sqlite');
+  const created = Math.floor((Date.now() - 30 * MIN) / 1000);
+  const t = setup('codexcache', { goalAgo: null, extra: [codexMeta('sess-codexcache'), codexGoal('win 50 games', created)] });
+  fs.mkdirSync(t.env.CODEX_HOME, { recursive: true });
+  const db = new DatabaseSync(path.join(t.env.CODEX_HOME, 'goals_1.sqlite'));
+  db.exec('CREATE TABLE thread_goals (thread_id TEXT PRIMARY KEY, objective TEXT, status TEXT, created_at_ms INTEGER)');
+  db.prepare('INSERT INTO thread_goals VALUES (?, ?, ?, ?)').run(t.sid, 'win 50 games', 'complete', created * 1000);
+  db.close();
+  const size = fs.statSync(t.transcript).size;
+  fs.writeFileSync(path.join(t.tmp, `claude-retro-${t.sid}.goal`), JSON.stringify({ path: t.transcript, off: size, active: true, start: created * 1000, cond: 'win 50 games', past: [] }));
+  assert.equal(t.hook(), null); // rebuilt: seen as Codex, so the completed row counts
+  const u = setup('codexedit', { goalAgo: null, extra: [codexMeta('sess-codexedit'), codexGoal('win 50 games', created)] });
+  u.hook();
+  u.addTranscript(codexGoal('win 50 games, then write a report', created));
+  assert.doesNotMatch(u.text(u.hook()), /原目标/);
+  assert.ok(!JSON.parse(fs.readFileSync(path.join(u.tmp, `claude-retro-${u.sid}.goal`), 'utf8')).unfinished);
+});
+
+await test('tell goes only to the session whose goal is active; none active means it is refused', () => {
+  const t = setup('tellnone', { goalAgo: null });
+  assert.equal(t.cli('tell', 'hello').status, 2);
+  const a = setup('tell2', { sid: 'A' }), b = setup('tell2', { sid: 'B' }); // same project and temp dir
+  a.hook(); b.hook();
+  const bCache = path.join(b.tmp, 'claude-retro-B.goal');
+  fs.writeFileSync(bCache, JSON.stringify({ ...JSON.parse(fs.readFileSync(bCache, 'utf8')), active: false })); // B's goal ended
+  assert.equal(a.cli('tell', '换个评估函数').status, 0);
+  assert.equal(JSON.parse(fs.readFileSync(a.retro('user-inbox.jsonl'), 'utf8')).to, 'A');
+  fs.unlinkSync(bCache); // B active again, but the message is for A
+  assert.doesNotMatch(b.text(b.hook()), /换个评估函数/);
+  assert.match(a.text(a.hook()), /换个评估函数/);
+  assert.equal(fs.readFileSync(a.retro('user-inbox.jsonl'), 'utf8'), '');
+});
+
+await test('tell: the user\'s words reach the main agent once, at its next tool call, and are kept', () => {
+  const t = setup('tell');
+  t.hook();
+  assert.match(t.cli('tell', '先别调参，试试换评估函数').stdout, /下一次调用工具时/);
+  const r = t.text(t.hook());
+  assert.match(r, /进度台/); assert.match(r, /先别调参，试试换评估函数/);
+  assert.doesNotMatch(t.text(t.hook()), /进度台/);
+  assert.match(fs.readFileSync(t.retro('user-said.md'), 'utf8'), /换评估函数/);
+  assert.match(fs.readFileSync(t.retro('log.tsv'), 'utf8'), /\ttold\t/);
 });
 
 await test('hook stays fast on a 60 MB transcript (first scan, then cached)', () => {

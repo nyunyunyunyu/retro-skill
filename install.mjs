@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Installs retro for Claude Code and/or Codex: copies the skills and agents and registers the hook.
 //   node install.mjs [--claude] [--codex] [--dry-run]     (no flag: every tool whose config dir exists)
-// Existing settings are kept; the hook entries are added only if missing, and settings.json is backed up first.
-// Codex's hooks.json is only touched when the retro entry is missing, because every edit needs re-trusting in /hooks.
+// Existing settings are kept; the hook entries are added only if missing, and the file is backed up first.
+// In Codex, each added entry needs trusting once in /hooks; entries already trusted stay trusted.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -85,14 +85,19 @@ if (want('codex')) {
     if (!dry) { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, f.replace(/\.md$/, '.toml')), toml); }
     say(`agent ${f.replace(/\.md$/, '.toml')} -> ${dir}`);
   }
+  // Codex trusts each entry by a hash of its event, matcher and handler (not the script's contents), so entries
+  // already there are never rewritten: only missing events are appended, and only those need trusting in /hooks.
   const file = path.join(home, '.codex', 'hooks.json'), h = readJson(file);
-  if (!h) {
-    say(`hook not added to ${file}`);
-  } else if (hasRetro(h.hooks?.PostToolUse)) {
-    say(`hook already in ${file}`);
-  } else {
-    ((h.hooks ||= {}).PostToolUse ||= []).push({ hooks: [{ type: 'command', command: 'node "$HOME/.agents/skills/retro/scripts/retro-nudge.mjs"', commandWindows: `node ${slash(path.join(home, '.agents', 'skills', 'retro', 'scripts', 'retro-nudge.mjs'))}`, timeout: 10 }] });
+  const added = [];
+  for (const ev of h ? ['PostToolUse', 'Stop', 'SubagentStop'] : []) {
+    if (hasRetro(h.hooks?.[ev])) continue;
+    ((h.hooks ||= {})[ev] ||= []).push({ hooks: [{ type: 'command', command: 'node "$HOME/.agents/skills/retro/scripts/retro-nudge.mjs"', commandWindows: `node "${slash(path.join(home, '.agents', 'skills', 'retro', 'scripts', 'retro-nudge.mjs'))}"`, timeout: 10 }] });
+    added.push(ev);
+  }
+  if (!h) say(`hooks not added to ${file}`);
+  else if (!added.length) say(`hooks already in ${file}`);
+  else {
     writeJson(file, h);
-    say(`hook PostToolUse added to ${file} — run /hooks in Codex to trust it`);
+    say(`hooks ${added.join(', ')} added to ${file} — open /hooks in Codex and trust them; until then Codex skips them`);
   }
 }

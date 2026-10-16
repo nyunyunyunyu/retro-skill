@@ -9,12 +9,13 @@
 //   finish <start> <file>  a review/scout subagent hands in its report (file, or - for stdin)
 //   abort <start>          the main agent couldn't start the subagent; frees the slot
 //   status                 progress digest for the progress desk (read-only)
+//   tell <text>            the progress desk passes on what the user said; delivered at the main agent's next tool call
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  C, EXIT_BUSY, EXIT_GONE, dir, ensureDir, iso, lastRetro, limitOf, locked, log, mainCheckout, mtime, openIdeas, read,
-  readSlot, reports, sessions, writeSlot,
+  C, EXIT_BUSY, EXIT_GONE, dir, ensureDir, goalCache, iso, lastRetro, lastWrite, limitOf, locked, log, mainCheckout,
+  mtime, openIdeas, read, readSlot, reports, sessions, writeSlot,
 } from './lib.mjs';
 
 const args = process.argv.slice(2);
@@ -29,8 +30,8 @@ const ago = t => (t ? `${clock(t)}（${Math.max(0, Math.round((now - t) / 60e3))
 const fail = (msg, code = 1) => { console.log(msg); process.exit(code); };
 const busy = () => fail('状态文件被其他进程占用：等几秒后重试同一条命令。', EXIT_BUSY);
 
-const commands = { done, inbox, spawned, finish, abort, status, root: () => console.log(root) };
-if (!commands[cmd]) fail('用法：node retro.mjs <done|inbox|spawned <start>|finish <start> <file>|abort <start>|status> [--root <项目>]');
+const commands = { done, inbox, spawned, finish, abort, status, tell, root: () => console.log(root) };
+if (!commands[cmd]) fail('用法：node retro.mjs <done|inbox|spawned <start>|finish <start> <file>|abort <start>|status|tell <话>> [--root <项目>]');
 commands[cmd]();
 
 // Same mapping as the hook: a worktree path stands for the same place in the main checkout.
@@ -130,6 +131,20 @@ function finish() {
   console.log(`已交付：${r}`);
 }
 
+// The progress desk passes on what the user said, addressed to the most recently active session whose goal the hook
+// last saw active; the hook hands it over at that session's next tool call.
+function tell() {
+  const text = (rest[0] === '-' ? fs.readFileSync(0, 'utf8') : rest.join(' ')).trim().replace(/\s*\n\s*/g, ' ');
+  if (!text) fail('用法：tell <用户的原话>（或 tell - 从标准输入读）');
+  const target = sessions(root).find(s => goalCache(s.session_id)?.active);
+  if (!target) fail('没有找到目标还在进行的主会话（目标可能已结束或暂停），转达不了：请用户直接在主会话里说。', EXIT_GONE);
+  const line = JSON.stringify({ at: iso(now), to: target.session_id, text }) + '\n';
+  if (!locked(root, () => { fs.appendFileSync(path.join(dir(root), 'user-inbox.jsonl'), line); return true; }, 50)) busy();
+  log(root, '', 'tell', text);
+  const idle = Math.round((now - target.active) / 60e3);
+  console.log(`已放进转达箱，交给目标是「${clip(target.goal, 40)}」的主会话：它下一次调用工具时会收到，送达后 .retro/log.tsv 里会出现 told 事件。${idle >= 10 ? `注意：这个会话已经 ${idle} 分钟没有活动，可能在长时间等待，也可能卡住了。` : ''}`);
+}
+
 function abort() {
   const start = rest[0] || fail('缺少开始时间');
   const r = locked(root, s => {
@@ -150,7 +165,9 @@ function status() {
   if (all.length > 1) out.push(`有 ${all.length} 个会话在这里设过 /goal：${all.map(s => `「${clip(s.goal, 40)}」（最后活动 ${ago(s.active)}）`).join('；')}。下面看最近活动的那个。`);
   const ms = all[0] || {};
   if (ms.goal) out.push(`目标：${ms.goal}（开始于 ${ago(Date.parse(ms.goal_start))}）`);
-  if (ms.transcript_path) out.push(...mainAgent(ms.transcript_path), ...subagents(ms.transcript_path));
+  const cache = ms.session_id ? goalCache(ms.session_id) : null;
+  if (cache) out.push(`目标状态：hook 最后一次看到时${cache.active ? '进行中' : '已结束或暂停'}。`);
+  if (ms.transcript_path) out.push(...mainAgent(ms.transcript_path), ...subagents(ms));
   const R = lastRetro(root);
   const sid = String(ms.session_id || '').replace(/[^\w-]/g, '_');
   const lines = read(path.join(os.tmpdir(), `claude-retro-${sid}.log`)).split('\n').filter(Boolean);
@@ -177,52 +194,100 @@ function status() {
   console.log(out.join('\n'));
 }
 
-// Recent activity of the main agent, from the tail of its transcript (Claude Code format).
+// Recent activity of the main agent, from the tail of its transcript (Claude Code or Codex format).
 function mainAgent(transcript) {
   if (!mtime(transcript)) return [`主会话记录找不到：${transcript}`];
-  if (/[\\/]\.codex[\\/]/.test(transcript)) return [`主会话是 Codex，记录摘要暂不支持；记录在 ${transcript}`];
   const texts = [], tools = [];
   let user = '';
   for (const o of tail(transcript, 3e6)) {
+    const at = `[${clock(Date.parse(o.timestamp))}] `;
+    if (o.type === 'response_item') { // Codex
+      const p = o.payload || {};
+      const said = (p.content || []).filter(b => /^(output|input)_text$/.test(b.type)).map(b => b.text).join(' ');
+      if (p.type === 'message' && p.role === 'assistant' && said.trim()) texts.push(at + clip(said, 300));
+      if (p.type === 'message' && p.role === 'user' && said.trim() && !/^\s*(<|# AGENTS\.md)/.test(said)) user = at + clip(said, 200);
+      if (p.type === 'custom_tool_call' || p.type === 'function_call') {
+        const raw = String(p.input ?? p.arguments ?? '');
+        const cmd = raw.match(/\bcmd\W{0,3}:\s*\\?"((?:[^"\\]|\\.)*)/)?.[1];
+        tools.push(`${p.name}（${clip(cmd ?? raw, 60)}）`);
+      }
+      continue;
+    }
     const c = o.message?.content;
     if (o.type === 'assistant' && Array.isArray(c)) {
       for (const b of c) {
-        if (b.type === 'text' && b.text.trim()) texts.push(`[${clock(Date.parse(o.timestamp))}] ${clip(b.text, 300)}`);
+        if (b.type === 'text' && b.text.trim()) texts.push(at + clip(b.text, 300));
         if (b.type === 'tool_use') tools.push(`${b.name}${describe(b.input)}`);
       }
     }
     if (o.type === 'user' && !o.isMeta) {
       const t = typeof c === 'string' ? c : Array.isArray(c) ? c.filter(b => b.type === 'text').map(b => b.text).join(' ') : '';
-      if (t.trim() && !t.trim().startsWith('<')) user = `[${clock(Date.parse(o.timestamp))}] ${clip(t, 200)}`;
+      if (t.trim() && !t.trim().startsWith('<')) user = at + clip(t, 200);
     }
   }
   return [
-    `\n## 主 agent（最后活动 ${ago(mtime(transcript))}）`,
+    `\n## 主 agent（最后活动 ${ago(lastWrite(transcript))}）`,
     user && `用户最后说：${user}`,
     `最近的话：\n${texts.slice(-3).join('\n') || '（无）'}`,
     `最近的工具调用：${tools.slice(-8).join('；') || '（无）'}`,
   ].filter(Boolean);
 }
 
-function subagents(transcript) {
-  const d = transcript.replace(/\.jsonl$/, '') + path.sep + 'subagents';
-  let files = [];
-  try { files = fs.readdirSync(d).filter(f => /^agent-.*\.jsonl$/.test(f)); } catch { return []; }
-  const list = files.map(f => ({ f: path.join(d, f), t: mtime(path.join(d, f)) })).sort((a, b) => b.t - a.t).slice(0, 6);
-  const out = [`\n## 子代理（最近活动的 ${list.length} 个）`];
-  for (const { f, t } of list) {
-    let meta = {};
-    try { meta = JSON.parse(read(f.replace(/\.jsonl$/, '.meta.json'))); } catch {}
-    let last = '';
-    for (const o of tail(f, 4e5)) {
-      if (o.type === 'assistant' && Array.isArray(o.message?.content)) {
-        for (const b of o.message.content) if (b.type === 'text' && b.text.trim()) last = b.text;
+// Subagents of the main session. Claude Code keeps them in <transcript>/subagents/agent-*.jsonl with a .meta.json.
+// Codex writes each as its own rollout in sessions/YYYY/MM/DD (local date) whose first record names the parent
+// thread; a resumed thread's children can be months after its own rollout, so look from the day before the goal
+// started (at most a week back) to today. Codex's approval reviewers (guardians) also name the parent; skip them.
+function subagents({ transcript_path: transcript, session_id: sessionId, goal_start }) {
+  let list = [];
+  if (/[\\/]\.codex[\\/]/.test(transcript)) {
+    const base = path.resolve(path.dirname(transcript), '..', '..', '..');
+    const day = new Date(Math.max(Date.parse(goal_start) || now, now - 7 * 864e5) - 864e5);
+    day.setHours(0, 0, 0, 0);
+    for (; day.getTime() <= now; day.setDate(day.getDate() + 1)) {
+      const d = path.join(base, String(day.getFullYear()), String(day.getMonth() + 1).padStart(2, '0'), String(day.getDate()).padStart(2, '0'));
+      let names = [];
+      try { names = fs.readdirSync(d).filter(f => f.endsWith('.jsonl')); } catch {}
+      for (const n of names) {
+        const f = path.join(d, n), head = headOf(f, 8192);
+        if (!head.includes('"thread_spawn"') || !head.includes(`"parent_thread_id":"${sessionId}"`)) continue;
+        const pick = k => head.match(new RegExp(`"${k}":"([^"]*)"`))?.[1];
+        list.push({ f, t: lastWrite(f), name: path.basename(pick('agent_path') || n), type: pick('agent_role') || '?' });
       }
     }
+  } else {
+    const d = transcript.replace(/\.jsonl$/, '') + path.sep + 'subagents';
+    let files = [];
+    try { files = fs.readdirSync(d).filter(f => /^agent-.*\.jsonl$/.test(f)); } catch {}
+    list = files.map(n => {
+      const f = path.join(d, n);
+      let meta = {};
+      try { meta = JSON.parse(read(f.replace(/\.jsonl$/, '.meta.json'))); } catch {}
+      return { f, t: mtime(f), name: meta.description || n, type: meta.agentType || '?', stopped: meta.stoppedByUser };
+    });
+  }
+  if (!list.length) return [];
+  list = list.sort((a, b) => b.t - a.t).slice(0, 6);
+  const out = [`\n## 子代理（最近活动的 ${list.length} 个）`];
+  for (const { f, t, name, type, stopped } of list) {
+    let last = '';
+    for (const o of tail(f, 4e5)) {
+      const c = o.type === 'assistant' ? o.message?.content : o.type === 'response_item' && o.payload?.role === 'assistant' ? o.payload.content : null;
+      for (const b of Array.isArray(c) ? c : []) if (/^(text|output_text)$/.test(b.type) && b.text.trim()) last = b.text;
+    }
     const state = now - t < 3 * 60e3 ? '活动中' : `最后活动 ${ago(t)}`;
-    out.push(`- ${meta.description || path.basename(f)}（${meta.agentType || '?'}，${state}${meta.stoppedByUser ? '，被停止' : ''}）：${clip(last, 200) || '（还没有输出）'}`);
+    out.push(`- ${name}（${type}，${state}${stopped ? '，被停止' : ''}）：${clip(last, 200) || '（还没有输出）'}`);
   }
   return out;
+}
+
+function headOf(file, bytes) {
+  try {
+    const fd = fs.openSync(file, 'r');
+    const buf = Buffer.alloc(bytes);
+    const n = fs.readSync(fd, buf, 0, bytes, 0);
+    fs.closeSync(fd);
+    return buf.toString('utf8', 0, n);
+  } catch { return ''; }
 }
 
 function tail(file, bytes) {
