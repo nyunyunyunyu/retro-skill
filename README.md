@@ -127,7 +127,7 @@ hook 和脚本都把 worktree 里的路径换算到主 checkout，hook 给出的
 
 - **依赖没有公开文档的内部格式**：Claude Code 的 `goal_status` 和 `Goal cleared` 记录，Codex 的 `thread_goal_updated` 事件和目标数据库。格式一变，hook 会安静地失效，不会报错。
 - **Codex 的 hook 只在代码单元里的工具之后触发**：Codex 用代码模式时，`exec` 单元和 `wait` 本身不触发 hook，主 agent 长时间等待时，提醒要等到下一次工具调用或这一轮结束。
-- **Codex 同时最多 3 个子代理**（默认值，含后台评审或侦察）。子代理交回的结论只在主 agent 活动时送到，不会把空闲的主 agent 叫醒；`/goal` 会自己开下一轮，所以不会卡住。
+- **Codex 默认同时最多 3 个子代理**（含后台评审或侦察）。要更多，在 `~/.codex/config.toml` 里加 `[agents]` 和 `max_concurrent_threads_per_session = N`，N 是子代理数，不含主线程。子代理交回的结论只在主 agent 活动时送到，不会把空闲的主 agent 叫醒；`/goal` 会自己开下一轮，所以不会卡住。
 - **进度台转达到 Codex 有延迟**：Codex 没有会话间消息，转达靠 `retro.mjs tell` 加 hook，主 agent 下一次调用工具时才收到。
 - **agent 卡在一次工具调用中间时**（例如权限弹窗正等你确认），没有任何机制能唤醒它。用 Claude Code 的自动模式可以避免这种阻塞。
 - **token 开销明显**：评审和侦察都用最高思考强度。hook 只在主会话有动静时检查，主 agent 长时间空闲时不会登记新的一轮。
