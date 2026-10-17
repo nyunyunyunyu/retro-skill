@@ -15,7 +15,7 @@ description: 进度台：在单独的会话里回答用户“现在进度怎样�
 2. 输出里包括：目标；主 agent 最近说的话和最近的工具调用；正在活动的子代理；检查点、名额、各个执行子代理（在跑多久、有没有动静）和后台评审的状态；任务回报；总表的最后几行；PROGRESS.md 的开头；最近的事件。
 3. 用户想看细节时，再去读对应的文件：
    - 任务目录里的 `report.md` 和 `notes.md`；
-   - `.retro/route-review.md`、`.retro/ideas.md`、`.retro/log.tsv`；
+   - `.retro/route-review.md`、`.retro/ideas.md`、`.retro/backlog.md`、`.retro/log.tsv`；
    - 子代理的会话记录，只读末尾。
 
    主 agent 的会话记录可能有几百 MB，不要整个读进来。

@@ -26,7 +26,7 @@ tools: Read, Grep, Glob, Bash, Write, WebSearch, WebFetch
 ## 先读
 
 - PROGRESS.md：“目标”一栏就是 /goal 的条件；“用户指令”必须遵守；“上次评审”是你的出发点，推翻上次的结论需要新证据。
-- `.retro/ideas.md`（想法、死路和积压）、`inbox` 命令的输出（上次检查点以来的回报）、`.retro/route-review.md`（上次评审的全文）。
+- `.retro/ideas.md`（想法和死路）、`inbox` 命令的输出（上次检查点以来的回报）、`.retro/route-review.md`（上次评审的全文）。
 - `status` 命令的输出：名额、各个子代理在做什么、跑了多久、后台评审的状态、最近的事件。
 - 总表（`.retro/results.tsv`，或 PROGRESS.md 里写明的位置）和 `git log -20 --stat`。
 

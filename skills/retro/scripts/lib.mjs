@@ -4,7 +4,7 @@
 //   retro-done       ISO time of the last finished checkpoint, written by `retro.mjs done`
 //   log.tsv          append-only event log (time, session, event, detail), for the progress desk and later analysis
 //   sessions/<id>.json   sessions that hold an active /goal here, for the progress desk
-//   tasks/<task>/report.md   executor reports; ideas.md, results.tsv, route-review.md, reviews/ are written by agents
+//   tasks/<task>/report.md   executor reports; ideas.md, backlog.md, results.tsv, route-review.md, reviews/ are written by agents
 //   user-inbox.jsonl what the user said at the progress desk, until the hook hands it over; then kept in user-said.md
 // Per session, in the system temp dir (claude-retro-<session>.*): the goal cache, what the hook said when (.said),
 // the last main tool call (.call) and Stop block (.blocked), and the subagent tracker (.agents/, see trackedAgents).
@@ -55,9 +55,9 @@ export const mtime = f => { try { return fs.statSync(f).mtimeMs; } catch { retur
 export const read = f => { try { return fs.readFileSync(f, 'utf8'); } catch { return ''; } };
 
 // Files the scripts and agents generate; kept out of git so worktrees don't carry stale copies.
-const GENERATED = ['slot', 'slot.lock', 'slots', 'retro-done', 'log.tsv', 'sessions/', 'tasks/', 'reviews/', 'probes/', 'ideas.md', 'results.tsv', 'route-review.md', 'user-inbox.jsonl', 'user-said.md'];
+const GENERATED = ['slot', 'slot.lock', 'slots', 'retro-done', 'log.tsv', 'sessions/', 'tasks/', 'reviews/', 'probes/', 'ideas.md', 'backlog.md', 'results.tsv', 'route-review.md', 'user-inbox.jsonl', 'user-said.md'];
 // A new .retro/ ignores everything. An existing one (some projects commit parts of it) gets a .gitignore for the
-// generated files only, unless it already has one.
+// generated files only, unless it already has one. A list we wrote earlier picks up names added since.
 export function ensureDir(root) {
   const d = dir(root);
   if (!fs.existsSync(d)) {
@@ -65,6 +65,10 @@ export function ensureDir(root) {
     fs.writeFileSync(path.join(d, '.gitignore'), '*\n');
   } else if (!fs.existsSync(path.join(d, '.gitignore'))) {
     fs.writeFileSync(path.join(d, '.gitignore'), GENERATED.join('\n') + '\n');
+  } else {
+    const gi = path.join(d, '.gitignore'), raw = read(gi), have = raw.split(/\r?\n/).filter(Boolean);
+    const add = GENERATED.filter(g => !have.includes(g));
+    if (add.length && have.length && have.every(l => GENERATED.includes(l))) fs.appendFileSync(gi, (raw.endsWith('\n') ? '' : '\n') + add.join('\n') + '\n');
   }
   return d;
 }

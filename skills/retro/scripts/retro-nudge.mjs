@@ -66,7 +66,7 @@ const tool = goal.codex ? 'Codex' : 'Claude Code';
 
 if (event === 'SessionStart') {
   if (input.source === 'compact') {
-    process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: `上下文刚被压缩。你在用 retro skill 推进 /goal「${goal.cond}」。接着做之前，先重读 ${SKILL} 的第 2 节“主循环”和第 3 节“委派和回报”，再读 PROGRESS.md，并运行 ${cmd('status')} 看各个子代理在做什么，然后回到主循环。` } }));
+    process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: `上下文刚被压缩。你在用 retro skill 推进 /goal「${goal.cond}」。接着做之前，先重读 ${SKILL} 的第 2 到 4 节（主循环、委派和回报、验证），再读 PROGRESS.md，并运行 ${cmd('status')} 看各个子代理在做什么，然后回到主循环。` } }));
   }
   process.exit(0);
 }

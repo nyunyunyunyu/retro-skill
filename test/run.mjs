@@ -485,7 +485,19 @@ await test('an existing .retro/ without .gitignore gets one for generated files 
   fs.mkdirSync(t.retro('checkpoints'), { recursive: true });
   t.hook();
   const gi = fs.readFileSync(t.retro('.gitignore'), 'utf8');
-  assert.match(gi, /^slot$/m); assert.match(gi, /^sessions\/$/m); assert.doesNotMatch(gi, /^\*$/m);
+  assert.match(gi, /^slot$/m); assert.match(gi, /^sessions\/$/m); assert.match(gi, /^backlog\.md$/m); assert.doesNotMatch(gi, /^\*$/m);
+});
+
+await test('a generated-files .gitignore picks up new names; a project-owned one is left alone', () => {
+  const t = setup('oldignore');
+  fs.mkdirSync(t.retro(''), { recursive: true });
+  fs.writeFileSync(t.retro('.gitignore'), 'slot\nideas.md\n');
+  t.hook();
+  const gi = fs.readFileSync(t.retro('.gitignore'), 'utf8');
+  assert.ok(gi.startsWith('slot\nideas.md\n')); assert.match(gi, /^backlog\.md$/m); assert.equal(gi.match(/^slot$/gm).length, 1);
+  fs.writeFileSync(t.retro('.gitignore'), 'slot\nmy-notes/\n');
+  t.hook();
+  assert.equal(fs.readFileSync(t.retro('.gitignore'), 'utf8'), 'slot\nmy-notes/\n');
 });
 
 await test('inbox starts from the goal start and caps its size', () => {
