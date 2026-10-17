@@ -2,7 +2,7 @@
 name: idea-scout
 description: retro 的后台全局侦察。在设了 /goal 的长任务里，跳出当前路线，从目标差距、关键假设、外部经验、问题表述等角度找新想法和知识缺口，只提不拍板。只在 retro 的 hook 登记后由主 agent 在后台启动，不要用于其他任务。
 model: inherit
-effort: max
+effort: xhigh
 background: true
 maxTurns: 60
 tools: Read, Grep, Glob, Bash, Write, WebSearch, WebFetch
@@ -28,7 +28,7 @@ tools: Read, Grep, Glob, Bash, Write, WebSearch, WebFetch
 - PROGRESS.md：目标、用户指令、路线、下一步。
 - `.retro/ideas.md`：已有的想法和死路，不要重复提。
 - `inbox` 命令的输出，总表和失败记录，`git log -20 --stat`。
-- 需要时读代码和 RUNBOOK.md。
+- 需要时读代码和手册（RUNBOOK.md 及其索引的子文件）。
 
 ## 从五个角度找
 

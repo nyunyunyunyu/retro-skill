@@ -13,7 +13,7 @@ const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'retro-test-'));
 const MIN = 60e3;
 let n = 0, failed = 0;
 
-function setup(name, { goalAgo = 5, cond = 'tests pass', extra = [], sid: sidArg } = {}) {
+function setup(name, { goalAgo = 5, cond = 'tests pass', extra = [], sid: sidArg, codexLimit = 12 } = {}) {
   const proj = path.join(TMP, name), tmp = path.join(TMP, name + '-tmp');
   fs.mkdirSync(proj, { recursive: true });
   fs.mkdirSync(tmp, { recursive: true });
@@ -22,6 +22,9 @@ function setup(name, { goalAgo = 5, cond = 'tests pass', extra = [], sid: sidArg
   fs.writeFileSync(transcript, [...lines, ...extra].map(l => JSON.stringify(l)).join('\n') + '\n');
   const env = { ...process.env, TEMP: tmp, TMP: tmp, TMPDIR: tmp, CLAUDE_PROJECT_DIR: proj, CODEX_HOME: path.join(tmp, 'codex-home') };
   delete env.RETRO_TIME_SCALE;
+  delete env.CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS;
+  fs.mkdirSync(env.CODEX_HOME, { recursive: true });
+  if (codexLimit) fs.writeFileSync(path.join(env.CODEX_HOME, 'config.toml'), `model = "x"\n\n[agents]\nmax_concurrent_threads_per_session = ${codexLimit}\n`);
   const sid = sidArg || 'sess-' + name;
   const input = (o = {}) => ({ session_id: sid, transcript_path: transcript, cwd: proj, hook_event_name: 'PostToolUse', tool_name: 'Bash', ...o });
   const hook = (o, e = {}) => {
@@ -41,11 +44,18 @@ function setup(name, { goalAgo = 5, cond = 'tests pass', extra = [], sid: sidArg
   const retro = p => path.join(proj, '.retro', p);
   const slot = () => Object.fromEntries([...fs.readFileSync(retro('slot'), 'utf8').matchAll(/(\w+)=(\S+)/g)].map(m => [m[1], m[2]]));
   const addTranscript = (...ls) => fs.appendFileSync(transcript, ls.map(l => JSON.stringify(l)).join('\n') + '\n');
-  const logFile = path.join(tmp, `claude-retro-${sid}.log`);
-  return { proj, tmp, sid, transcript, hook, hookAsync, cli, text, retro, slot, addTranscript, logFile, env };
+  const state = ext => path.join(tmp, `claude-retro-${sid}.${ext}`);
+  // Pretend each message kind was last said `mins` minutes earlier than recorded.
+  const age = mins => { const m = JSON.parse(fs.readFileSync(state('said'), 'utf8')); for (const k in m) m[k] -= mins * MIN; fs.writeFileSync(state('said'), JSON.stringify(m)); };
+  const sub = (id, o = {}) => hook({ agent_id: id, agent_type: 'general-purpose', ...o });
+  const agentFile = (id, ext = 'json') => path.join(tmp, `claude-retro-${sid}.agents`, `${id}.${ext}`);
+  const setTime = (f, mins) => { const t = (Date.now() - mins * MIN) / 1000; fs.utimesSync(f, t, t); };
+  return { proj, tmp, sid, transcript, hook, hookAsync, cli, text, retro, slot, addTranscript, state, age, sub, agentFile, setTime, env };
 }
 const goalLine = (cond, t, extra = {}) => ({ type: 'attachment', timestamp: new Date(t).toISOString(), attachment: { type: 'goal_status', met: false, sentinel: true, condition: cond, ...extra } });
 const iso = t => new Date(t).toISOString();
+const codexGoal = (objective, createdAt, status = 'active') => ({ timestamp: iso(Date.now()), type: 'event_msg', payload: { type: 'thread_goal_updated', goal: { objective, status, createdAt } } });
+const codexMeta = (id, source = 'vscode') => ({ timestamp: iso(Date.now()), type: 'session_meta', payload: { session_id: id, id, source, base_instructions: { text: 'x' } } });
 
 async function test(name, fn) {
   n++;
@@ -55,7 +65,9 @@ async function test(name, fn) {
 await test('no goal: silent, nothing written', () => {
   const t = setup('nogoal', { goalAgo: null });
   assert.equal(t.hook(), null);
-  assert.ok(!fs.existsSync(t.logFile));
+  assert.equal(t.sub('a1'), null);
+  assert.ok(!fs.existsSync(t.state('call')));
+  assert.ok(!fs.existsSync(t.agentFile('a1')), 'a subagent is tracked without an active goal');
   assert.ok(!fs.existsSync(t.retro('slot')));
 });
 
@@ -71,71 +83,157 @@ await test('first call of a goal reserves a scout; .retro is self-ignored; sessi
   assert.equal(t.text(t.hook()), ''); // call 2: nothing
 });
 
-await test('unspawned slot is re-nudged every 10 calls; spawned stops it; retro due at call 40 then every 10', () => {
+await test('unlaunched reservation: reminded 10 min later, not on every call; launching stops it', () => {
   const t = setup('calls');
-  const out = [];
-  for (let i = 1; i <= 52; i++) {
-    out.push(t.text(t.hook()));
-    if (i === 25) {
-      const r = t.cli('spawned', t.slot().start);
-      assert.equal(r.status, 0, r.stdout);
-    }
-  }
-  assert.match(out[9], /还没有启动/); assert.match(out[19], /还没有启动/);
-  assert.doesNotMatch(out[29], /还没有启动/);
-  const retroAt = out.map((x, i) => (/复盘到期/.test(x) ? i + 1 : 0)).filter(Boolean);
-  assert.deepEqual(retroAt, [40, 50]);
-  assert.equal(t.slot().spawned != null, true);
+  assert.match(t.text(t.hook()), /已为你登记/);
+  for (let i = 0; i < 5; i++) assert.doesNotMatch(t.text(t.hook()), /还没有启动/);
+  t.age(11);
+  assert.match(t.text(t.hook()), /还没有启动/);
+  assert.doesNotMatch(t.text(t.hook()), /还没有启动/);
+  assert.equal(t.cli('spawned', t.slot().start).status, 0);
+  t.age(11);
+  assert.doesNotMatch(t.text(t.hook()), /还没有启动/);
 });
 
-await test('retro done stops nudges; spawned with a wrong start is refused', () => {
-  const t = setup('done');
-  for (let i = 0; i < 40; i++) t.hook();
-  assert.equal(t.cli('done').status, 0);
-  for (let i = 0; i < 15; i++) assert.doesNotMatch(t.text(t.hook()), /复盘到期/);
-  assert.equal(t.cli('spawned', '2000-01-01T00:00:00.000Z').status, 2);
-  assert.match(fs.readFileSync(t.retro('log.tsv'), 'utf8'), /retro-done/);
-});
-
-await test('time-based retro: goal started 61 min ago -> nudged on first call', () => {
+await test('checkpoint: due at 60 min, repeated every 10 min until done; calls and results never trigger it', () => {
   const t = setup('time', { goalAgo: 61 });
-  assert.match(t.text(t.hook()), /复盘到期（距上次复盘或目标开始 61 分钟/);
-});
-
-await test('results-based retro: 4 subagents back (btw, empty type and slot agents not counted)', () => {
-  const t = setup('results');
-  t.hook(); // reserve scout
-  for (const agent_type of ['', 'route-reviewer', 'idea-scout']) t.hook({ hook_event_name: 'SubagentStop', agent_id: 'x', agent_type });
-  assert.doesNotMatch(t.text(t.hook()), /复盘到期/);
-  for (let i = 0; i < 3; i++) t.hook({ hook_event_name: 'SubagentStop', agent_id: 'a' + i, agent_type: 'general-purpose' });
-  assert.doesNotMatch(t.text(t.hook()), /复盘到期/);
-  t.hook({ hook_event_name: 'SubagentStop', agent_id: 'a9', agent_type: 'general-purpose' });
-  assert.match(t.text(t.hook()), /交回 4 个结果/);
-});
-
-await test('report-based retro: 4 task reports written since the goal started (scout reports excluded)', () => {
-  const t = setup('reports');
-  t.hook();
-  for (const task of ['a', 'b', 'c', 'scout-1']) {
-    fs.mkdirSync(t.retro(`tasks/${task}`), { recursive: true });
-    fs.writeFileSync(t.retro(`tasks/${task}/report.md`), '结果：x');
-  }
-  assert.doesNotMatch(t.text(t.hook()), /复盘到期/);
-  fs.mkdirSync(t.retro('tasks/d'), { recursive: true });
-  fs.writeFileSync(t.retro('tasks/d/report.md'), '结果：y');
-  assert.match(t.text(t.hook()), /交回 4 个结果/);
+  assert.match(t.text(t.hook()), /检查点到期（距上次检查点或目标开始 61 分钟/);
+  assert.doesNotMatch(t.text(t.hook()), /检查点到期/);
+  t.age(11);
+  assert.match(t.text(t.hook()), /检查点到期/);
+  assert.equal(t.cli('done').status, 0);
+  t.age(11);
+  assert.doesNotMatch(t.text(t.hook()), /检查点到期/);
+  assert.match(fs.readFileSync(t.retro('log.tsv'), 'utf8'), /checkpoint-due[\s\S]*checkpoint-done/);
+  assert.equal(t.cli('spawned', '2000-01-01T00:00:00.000Z').status, 2);
+  const u = setup('busy', { goalAgo: 30 });
+  for (let i = 0; i < 50; i++) u.hook();
+  for (let i = 0; i < 6; i++) u.hook({ hook_event_name: 'SubagentStop', agent_id: 'a' + i, agent_type: 'general-purpose' });
+  assert.doesNotMatch(u.text(u.hook()), /检查点到期/);
 });
 
 await test('Stop blocks while due, again only after a tool call; stop_hook_active (always true under /goal) is ignored', () => {
   const t = setup('stop', { goalAgo: 61 });
-  t.hook(); t.cli('spawned', t.slot().start);
+  t.hook(); t.cli('spawned', t.slot().start); t.cli('slots', '2', 'x');
   const r = t.hook({ hook_event_name: 'Stop', stop_hook_active: true });
-  assert.equal(r.decision, 'block'); assert.match(r.reason, /复盘到期/);
+  assert.equal(r.decision, 'block'); assert.match(r.reason, /检查点到期/);
   assert.equal(t.hook({ hook_event_name: 'Stop', stop_hook_active: true }), null); // no tool call since: no loop
-  t.hook();
-  assert.equal(t.hook({ hook_event_name: 'Stop', stop_hook_active: true }).decision, 'block');
+  assert.doesNotMatch(t.text(t.hook()), /检查点到期/); // said at the Stop, so not again at the next call
+  const again = t.hook({ hook_event_name: 'Stop', stop_hook_active: true }); // still due when ending the turn: said again
+  assert.equal(again.decision, 'block'); assert.match(again.reason, /检查点到期/);
   t.cli('done'); t.hook();
-  assert.equal(t.hook({ hook_event_name: 'Stop', stop_hook_active: true }), null);
+  assert.doesNotMatch(t.text(t.hook({ hook_event_name: 'Stop', stop_hook_active: true })), /检查点到期/);
+});
+
+await test('SessionStart after a compaction re-points the main agent at the main loop; other starts and no goal: silent', () => {
+  const t = setup('compact', { goalAgo: 30 });
+  const r = t.hook({ hook_event_name: 'SessionStart', source: 'compact' });
+  assert.equal(r.hookSpecificOutput.hookEventName, 'SessionStart');
+  assert.match(r.hookSpecificOutput.additionalContext, /主循环/); assert.match(r.hookSpecificOutput.additionalContext, /status/);
+  assert.equal(t.hook({ hook_event_name: 'SessionStart', source: 'startup' }), null);
+  assert.ok(!fs.existsSync(t.retro('slot')), 'a SessionStart reserved something');
+  const u = setup('compactnogoal', { goalAgo: null });
+  assert.equal(u.hook({ hook_event_name: 'SessionStart', source: 'compact' }), null);
+});
+
+await test('slots: reminded to record them 10 min into a goal; idle slots reported after 5 min, naming who runs', () => {
+  const t = setup('slots', { goalAgo: 11 });
+  assert.match(t.text(t.hook()), /还没有记下这个目标的名额/);
+  const u = setup('slotsearly', { goalAgo: 5 });
+  assert.doesNotMatch(u.text(u.hook()), /名额/);
+  assert.match(t.cli('slots', '2', 'one GPU').stdout, /已记下名额 2 个/);
+  assert.doesNotMatch(t.text(t.hook()), /名额空着/); // just set: grace
+  const set = JSON.parse(fs.readFileSync(t.retro('slots'), 'utf8'));
+  fs.writeFileSync(t.retro('slots'), JSON.stringify({ ...set, at: iso(Date.now() - 6 * MIN) }));
+  assert.match(t.text(t.hook()), /名额是 2 个，现在在跑的执行子代理只有 0 个/);
+  const meta = t.transcript.replace(/\.jsonl$/, '') + '/subagents';
+  fs.mkdirSync(meta, { recursive: true });
+  fs.writeFileSync(path.join(meta, 'agent-a1.meta.json'), JSON.stringify({ agentType: 'general-purpose', description: 'try expectimax' }));
+  t.sub('a1'); t.sub('a2');
+  t.age(11);
+  assert.doesNotMatch(t.text(t.hook()), /名额空着/);
+  t.hook({ hook_event_name: 'SubagentStop', agent_id: 'a2', agent_type: 'general-purpose' });
+  t.age(11);
+  assert.doesNotMatch(t.text(t.hook()), /名额空着/); // freed just now: grace
+  t.setTime(t.agentFile('a2', 'stop'), 6);
+  assert.match(t.text(t.hook()), /只有 1 个（try expectimax）/);
+  assert.match(t.cli('status').stdout, /名额：2 个（one GPU[\s\S]*在跑 1 个）：try expectimax（在跑/);
+});
+
+await test('tracker: a segment past an hour and a silent subagent are reported once; a follow-up starts a new segment', () => {
+  const t = setup('tracker', { goalAgo: 90 });
+  t.hook(); t.cli('slots', '3', 'x'); t.cli('done');
+  t.sub('long'); t.sub('quiet');
+  const h = JSON.parse(fs.readFileSync(t.agentFile('long'), 'utf8'));
+  fs.writeFileSync(t.agentFile('long'), JSON.stringify({ ...h, seg: Date.now() - 61 * MIN }));
+  fs.writeFileSync(t.agentFile('quiet'), JSON.stringify({ ...h, seg: Date.now() - 30 * MIN }));
+  t.setTime(t.agentFile('quiet'), 25);
+  const r = t.text(t.hook());
+  assert.match(r, /「long」（general-purpose）这一段已经连续跑了 61 分钟/);
+  assert.match(r, /「quiet」（general-purpose）已经 25 分钟没有调用工具/);
+  const r2 = t.text(t.hook());
+  assert.doesNotMatch(r2, /连续跑了|没有调用工具/);
+  t.hook({ hook_event_name: 'SubagentStop', agent_id: 'long', agent_type: 'general-purpose' });
+  t.sub('long'); // a follow-up
+  assert.ok(Date.now() - JSON.parse(fs.readFileSync(t.agentFile('long'), 'utf8')).seg < MIN);
+  assert.ok(!fs.existsSync(t.agentFile('long', 'stop')));
+  // The review/scout, internal agents and Codex guardians are not tracked.
+  for (const agent_type of ['', 'route-reviewer', 'idea-scout', 'guardian']) t.sub('x' + agent_type, { agent_type });
+  assert.deepEqual(fs.readdirSync(path.dirname(t.agentFile('long'))).filter(f => f.startsWith('x')), []);
+});
+
+await test('idle slots: a launch restarts the grace; a Stop is not blocked again for it within 10 min', () => {
+  const t = setup('idlelaunch', { goalAgo: 30 });
+  t.hook(); t.cli('spawned', t.slot().start);
+  const set = { n: 2, at: iso(Date.now() - 6 * MIN), why: 'x' };
+  fs.writeFileSync(t.retro('slots'), JSON.stringify(set));
+  // Launching an executor: it is tracked only from its first tool call, so neither this call nor the Stop says idle.
+  assert.doesNotMatch(t.text(t.hook({ tool_name: 'Agent', tool_input: { subagent_type: 'general-purpose', prompt: 'x', run_in_background: true } })), /名额空着/);
+  assert.doesNotMatch(t.text(t.hook({ hook_event_name: 'Stop' })), /名额空着/);
+  fs.writeFileSync(t.state('launch'), String(Date.now() - 6 * MIN));
+  assert.match(t.text(t.hook()), /名额空着/);
+  assert.equal(t.hook({ hook_event_name: 'Stop' }), null); // said 0 min ago: not urgent, so the Stop isn't blocked for it
+});
+
+await test('tracker: events other than tool calls and stops (a child SessionStart) do not restart a stopped agent', () => {
+  const t = setup('trackev', { goalAgo: 10 });
+  t.hook();
+  t.sub('k'); t.hook({ hook_event_name: 'SubagentStop', agent_id: 'k', agent_type: 'general-purpose' });
+  t.hook({ hook_event_name: 'SessionStart', source: 'compact', agent_id: 'k', agent_type: 'general-purpose' });
+  t.hook({ hook_event_name: 'Stop', agent_id: 'k', agent_type: 'general-purpose' });
+  assert.ok(fs.existsSync(t.agentFile('k', 'stop')));
+});
+
+await test('request: one left over from an earlier goal is ignored; the new goal gets its scout', () => {
+  const t = setup('requestold', { goalAgo: 2 });
+  fs.mkdirSync(t.retro(''), { recursive: true });
+  fs.writeFileSync(t.retro('slot'), `state=done type=review start=${iso(Date.now() - 30 * MIN)} by=x want=review wantAt=${iso(Date.now() - 20 * MIN)}\n`);
+  assert.match(t.text(t.hook()), /已为你登记一次后台侦察/);
+});
+
+await test('request: a review is reserved at the next call; while one runs, right after it ends', () => {
+  const t = setup('request', { goalAgo: 30 });
+  t.hook();
+  const scout = t.slot().start;
+  assert.match(t.cli('request', 'review').stdout, /它结束后/);
+  assert.doesNotMatch(t.text(t.hook()), /按你的请求/);
+  fs.writeFileSync(path.join(t.tmp, 'r.md'), '想法：A');
+  assert.equal(t.cli('finish', scout, path.join(t.tmp, 'r.md')).status, 0);
+  const r = t.text(t.hook());
+  assert.match(r, /后台评审（按你的请求）/);
+  assert.equal(t.slot().type, 'review'); assert.ok(!t.slot().want);
+  assert.equal(t.cli('request', 'nonsense').status, 1);
+});
+
+await test('harness limit: too few subagents allowed stops the run (Codex default 3, Claude Code env var)', () => {
+  const created = Math.floor((Date.now() - 5 * MIN) / 1000);
+  const t = setup('limitcodex', { goalAgo: null, codexLimit: 0, extra: [codexMeta('sess-limitcodex'), codexGoal('codex goal', created)] });
+  const r = t.text(t.hook());
+  assert.match(r, /Codex 现在同时只能开 3 个子代理/); assert.match(r, /至少 5/);
+  assert.ok(!fs.existsSync(t.retro('slot')), 'a scout was reserved anyway');
+  const u = setup('limitclaude');
+  assert.match(u.text(u.hook({}, { CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: '4' })), /Claude Code 现在同时只能开 4 个子代理/);
+  assert.match(u.text(u.hook({}, { CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: '5' })), /已为你登记/);
 });
 
 await test('a Stop that may not speak changes no state', () => {
@@ -152,10 +250,12 @@ await test('Stop also reminds about an unspawned slot', () => {
   assert.equal(r.decision, 'block'); assert.match(r.reason, /还没有启动/);
 });
 
-await test('subagent tool calls are ignored', () => {
+await test('subagent tool calls get no messages and only feed the tracker', () => {
   const t = setup('sub', { goalAgo: 61 });
-  assert.equal(t.hook({ agent_id: 'abc', agent_type: 'general-purpose' }), null);
-  assert.ok(!fs.existsSync(t.logFile));
+  t.hook();
+  assert.equal(t.sub('abc'), null);
+  assert.equal(t.hook({ hook_event_name: 'SubagentStop', agent_id: 'abc', agent_type: 'general-purpose' }), null);
+  assert.ok(fs.existsSync(t.agentFile('abc')) && fs.existsSync(t.agentFile('abc', 'stop')));
 });
 
 await test('overdue review is voided; owner told once to stop it', () => {
@@ -246,14 +346,11 @@ await test('scout finish goes to tasks/scout-*/report.md', () => {
   assert.equal(dirs.length, 1); assert.match(dirs[0], /^scout-/);
 });
 
-await test('parallel calls: exactly one retro nudge at the threshold and one reservation', async () => {
-  const t = setup('parallel');
-  const base = Date.now() - 60e3;
-  fs.writeFileSync(t.logFile, Array.from({ length: 35 }, (_, i) => `${base + i} 1${i}`).join('\n') + '\n');
+await test('parallel calls: exactly one checkpoint reminder and one reservation', async () => {
+  const t = setup('parallel', { goalAgo: 61 });
   const rs = await Promise.all(Array.from({ length: 10 }, () => t.hookAsync()));
-  assert.equal(rs.filter(r => /复盘到期/.test(t.text(r))).length, 1);
+  assert.equal(rs.filter(r => /检查点到期/.test(t.text(r))).length, 1);
   assert.equal(rs.filter(r => /已为你登记/.test(t.text(r))).length, 1);
-  assert.equal(fs.readFileSync(t.logFile, 'utf8').split('\n').filter(Boolean).length, 45);
 });
 
 await test('goal replaced while unfinished -> one note; same goal re-recorded on compaction keeps its start', () => {
@@ -290,11 +387,12 @@ await test('Codex goal events: active with createdAt as start, paused = inactive
   const created = Math.floor((Date.now() - 61 * MIN) / 1000);
   const ev = status => ({ timestamp: iso(Date.now()), type: 'event_msg', payload: { type: 'thread_goal_updated', goal: { objective: 'codex goal', status, createdAt: created } } });
   const t = setup('codex', { goalAgo: null, extra: [ev('active')] });
-  assert.match(t.text(t.hook()), /复盘到期（距上次复盘或目标开始 61 分钟/);
+  assert.match(t.text(t.hook()), /检查点到期（距上次检查点或目标开始 61 分钟/);
   t.addTranscript(ev('paused'));
   assert.equal(t.hook(), null);
   t.addTranscript(ev('active'));
-  assert.match(JSON.stringify(t.hook() || {}), /复盘到期|^\{\}$/); // resumed: same goal, same start
+  t.age(11);
+  assert.match(t.text(t.hook()), /检查点到期（距上次检查点或目标开始 61 分钟/); // resumed: same goal, same start
 });
 
 await test('PROGRESS.md over 4 KB is flagged in the retro nudge and by done', () => {
@@ -352,13 +450,6 @@ await test('finish past the deadline is refused; a busy lock exits 3, not 2', ()
   fs.writeFileSync(t.retro('slot'), `state=running type=review start=${start} by=x\n`);
   fs.writeFileSync(t.retro('slot.lock'), '');
   assert.equal(t.cli('spawned', start).status, 3);
-});
-
-await test('follow-ups to the same subagent count as one result', () => {
-  const t = setup('dedupe');
-  t.hook();
-  for (let i = 0; i < 4; i++) t.hook({ hook_event_name: 'SubagentStop', agent_id: 'same', agent_type: 'general-purpose' });
-  assert.doesNotMatch(t.text(t.hook()), /复盘到期/);
 });
 
 await test('extending the goal text keeps the same goal (no note, same start, no new scout)', () => {
@@ -446,13 +537,21 @@ await test('install.mjs: BOM is fine, JSONC is refused untouched, CRLF agents co
   fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
   fs.mkdirSync(path.join(home, '.codex'), { recursive: true });
   const env = { ...process.env, USERPROFILE: home, HOME: home };
+  delete env.CODEX_HOME; delete env.CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS;
   const settings = path.join(home, '.claude', 'settings.json');
   fs.writeFileSync(settings, '﻿{"model":"x","permissions":{"allow":["Bash"]}}');
   let r = spawnSync(process.execPath, [path.join(repo, 'install.mjs')], { env, encoding: 'utf8' });
   assert.equal(r.status, 0, r.stderr);
   const s = JSON.parse(fs.readFileSync(settings, 'utf8'));
   assert.equal(s.model, 'x'); assert.ok(s.hooks.Stop && s.hooks.SubagentStop && s.hooks.PostToolUse);
-  assert.ok(fs.existsSync(path.join(home, '.codex', 'agents', 'idea-scout.toml')));
+  assert.equal(s.hooks.SessionStart[0].matcher, 'compact');
+  const codexHooks = JSON.parse(fs.readFileSync(path.join(home, '.codex', 'hooks.json'), 'utf8')).hooks;
+  assert.deepEqual(Object.keys(codexHooks).sort(), ['PostToolUse', 'SessionStart', 'Stop', 'SubagentStop']);
+  assert.equal(codexHooks.SessionStart[0].matcher, 'compact');
+  assert.match(fs.readFileSync(path.join(home, '.codex', 'agents', 'idea-scout.toml'), 'utf8'), /model_reasoning_effort = "xhigh"/);
+  assert.match(r.stdout, /WARNING: Codex lets a session run only 3 subagents/);
+  fs.writeFileSync(path.join(home, '.codex', 'config.toml'), '[agents]\nmax_concurrent_threads_per_session = 12\n');
+  assert.doesNotMatch(spawnSync(process.execPath, [path.join(repo, 'install.mjs')], { env, encoding: 'utf8' }).stdout, /WARNING/);
   const jsonc = '{ // comment\n "model": "y", }';
   fs.writeFileSync(settings, jsonc);
   fs.rmSync(path.join(home, '.codex', 'agents'), { recursive: true });
@@ -534,8 +633,6 @@ await test('parallel first calls record the goal once', async () => {
   assert.equal(fs.readFileSync(t.retro('log.tsv'), 'utf8').split('\n').filter(l => /\tgoal\t/.test(l)).length, 1);
 });
 
-const codexGoal = (objective, createdAt, status = 'active') => ({ timestamp: iso(Date.now()), type: 'event_msg', payload: { type: 'thread_goal_updated', goal: { objective, status, createdAt } } });
-const codexMeta = (id, source = 'vscode') => ({ timestamp: iso(Date.now()), type: 'session_meta', payload: { session_id: id, id, source, base_instructions: { text: 'x' } } });
 
 await test('Codex: a subagent thread is ignored even if its rollout carries the goal', () => {
   const created = Math.floor((Date.now() - 61 * MIN) / 1000);
@@ -559,7 +656,7 @@ await test('Codex: the goal database overrules the rollout (completed or cleared
   const state = () => JSON.parse(fs.readFileSync(goalFile, 'utf8'));
   const r = t.text(t.hook());
   assert.ok(state().active); assert.equal(state().start, created * 1000);
-  assert.match(r, /spawn_agent/); assert.match(r, /fork_turns 设为 "none"/); assert.match(r, /复盘到期/);
+  assert.match(r, /spawn_agent/); assert.match(r, /fork_turns 设为 "none"/); assert.match(r, /检查点到期/);
   db.prepare('UPDATE thread_goals SET status = ? WHERE thread_id = ?').run('complete', t.sid);
   assert.equal(t.hook(), null); assert.ok(!state().active);
   db.prepare('UPDATE thread_goals SET status = ? WHERE thread_id = ?').run('active', t.sid);

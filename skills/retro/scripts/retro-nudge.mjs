@@ -1,24 +1,32 @@
 #!/usr/bin/env node
-// Hook for Claude Code and Codex (PostToolUse, Stop, SubagentStop) that enhances /goal. It only acts while the session
-// has an active /goal, read from the session transcript (Claude Code: goal_status attachments and "Goal cleared"
-// records; Codex: thread_goal_updated events, overruled by its goal database). These are internal formats; if they
-// change, it goes quiet.
+// Hook for Claude Code and Codex (PostToolUse, Stop, SubagentStop, SessionStart) that enhances /goal. It only acts
+// while the session has an active /goal, read from the session transcript (Claude Code: goal_status attachments and
+// "Goal cleared" records; Codex: thread_goal_updated events, overruled by its goal database). These are internal
+// formats; if they change, it goes quiet.
 //
-// Retro: due once, since max(goal start, last `retro.mjs done`), 60 min have passed, 4 results came back (distinct
-// subagents finishing, or new task reports) or the main agent made 40 tool calls. Then it nudges on the first main
-// tool call and every 10 after, and blocks the main agent's Stop (once per stretch of tool calls) until marked done.
-// Background slot: one route review or idea scout at a time per project, state in .retro/slot. Only this hook reserves
-// it (under an exclusive lock): at goal start (a scout), then hourly; a scout when none ran for 4 h or the idea pool
-// runs low, otherwise a review. If nothing new came back in the past hour it reserves nothing and reports a stall.
-// A reservation must be launched within 20 min; the review/scout then has 20/40 min. Any session voids overdue ones.
+// It speaks to the main agent at its tool calls and at a Stop (blocking it once per stretch of tool calls). At tool
+// calls each kind of message is said at most once per 10 minutes, or once, recorded in <tmp>/claude-retro-<session>.said:
+// - Checkpoint: due 60 min after max(goal start, last `retro.mjs done`), repeated until marked done. Time is the only
+//   trigger: the main agent handles each report as it arrives, so counting calls or results adds nothing.
+// - Subagent tracker: each subagent tool call touches <tmp>/claude-retro-<session>.agents/<agent>.json and SubagentStop
+//   marks it stopped. From that: slots left idle (against the count set with `retro.mjs slots`), a segment past an
+//   hour, a subagent silent for 20 min.
+// - Background slot: one route review or idea scout at a time per project, state in .retro/slot. Only this hook
+//   reserves it (under an exclusive lock): at goal start (a scout), then hourly; a scout when none ran for 4 h or the
+//   idea pool runs low, otherwise a review; or right away after `retro.mjs request`. If nothing new came back in the
+//   past hour it reserves nothing and reports a stall. A reservation must be launched within 20 min; the review/scout
+//   then has 20/40 min. Any session voids overdue ones.
+// - Harness limit: too few subagents allowed for the minimum slots stops the run until the user raises it.
+// After a compaction (SessionStart "compact") it tells the main agent to re-read the main loop.
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  C, SLOT_AGENTS, ensureDir, iso, lastRetro, limitOf, locked, log, mainCheckout, newestResult, openIdeas, progressGoal,
-  read, readSlot, reports, sessions, writeSlot,
+  C, SLOT_AGENTS, agentName, agentsDir, ensureDir, goalAgents, harnessLimit, iso, lastRetro, limitOf, locked, log,
+  mainCheckout, newestResult, openIdeas, progressGoal, read, readSlot, readSlots, safe, sessions, trackedAgents, withLock,
+  writeSlot,
 } from './lib.mjs';
 
 const now = Date.now();
@@ -29,83 +37,133 @@ const event = input.hook_event_name || 'PostToolUse';
 const debug = path.join(os.tmpdir(), 'claude-retro-debug');
 if (fs.existsSync(debug)) {
   try {
-    const { session_id, agent_id, agent_type, stop_hook_active, tool_name, background_tasks, cwd, transcript_path } = input;
+    const { session_id, agent_id, agent_type, stop_hook_active, tool_name, source, cwd, transcript_path } = input;
     const toolKeys = input.tool_input && typeof input.tool_input === 'object' ? Object.keys(input.tool_input) : typeof input.tool_input;
-    fs.appendFileSync(debug + '.log', JSON.stringify({ t: iso(now), event, session_id, agent_id, agent_type, stop_hook_active, tool_name, background_tasks, cwd, transcript_path, keys: Object.keys(input), toolKeys }) + '\n');
+    fs.appendFileSync(debug + '.log', JSON.stringify({ t: iso(now), event, session_id, agent_id, agent_type, stop_hook_active, tool_name, source, cwd, transcript_path, keys: Object.keys(input), toolKeys }) + '\n');
   } catch {}
 }
-if (!['PostToolUse', 'Stop', 'SubagentStop'].includes(event) || typeof input.transcript_path !== 'string') process.exit(0);
+if (!['PostToolUse', 'Stop', 'SubagentStop', 'SessionStart'].includes(event) || typeof input.transcript_path !== 'string') process.exit(0);
 
-const sid = String(input.session_id).replace(/[^\w-]/g, '_');
+const sid = safe(input.session_id);
 const base = path.join(os.tmpdir(), `claude-retro-${sid}`);
-const me = `${now} ${process.pid}`;
-const ts = l => parseInt(l, 10);
 const RESUME = /^\s*\/?(resume|continue|restart|unpause|go on|恢复|继续)\s*[.!。！]?\s*$/i;
 
-if (event === 'SubagentStop') {
-  // A subagent finished: a result, keyed by agent id so follow-ups to the same agent count once. Skip the
-  // review/scout agents, internal ones (/btw, prompt suggestions) that report an empty agent_type, and Codex's
-  // approval reviewers.
-  if (input.agent_type && !SLOT_AGENTS.has(input.agent_type) && !/guardian/i.test(input.agent_type)) {
-    try { fs.appendFileSync(base + '.log', `${me} r ${String(input.agent_id || process.pid).replace(/\s/g, '')}\n`); } catch {}
-  }
+// A subagent's tool call or stop (they share the session id; a message here would reach the subagent, not the main
+// agent): only recorded for the tracker.
+if (event === 'SubagentStop' || input.agent_id) {
+  try { track(); } catch {}
   process.exit(0);
 }
-// Tool calls inside a subagent share the session id; a nudge there would reach the subagent, not the main agent.
-if (input.agent_id) process.exit(0);
 
 const goal = goalState(input.transcript_path, base + '.goal');
 if (!goal.active || goal.child) process.exit(0);
 
-const stopping = event === 'Stop';
 const root = mainCheckout(process.env.CLAUDE_PROJECT_DIR || input.cwd || process.cwd());
 const CLI = fileURLToPath(new URL('./retro.mjs', import.meta.url)).replace(/\\/g, '/');
 const SKILL = fileURLToPath(new URL('../SKILL.md', import.meta.url)).replace(/\\/g, '/');
 const cmd = sub => `\`node "${CLI}" ${sub} --root "${root.replace(/\\/g, '/')}"\``;
-const notes = [];
+const tool = goal.codex ? 'Codex' : 'Claude Code';
 
-// One line per main tool call ("<ms> <pid>") and per result ("<ms> <pid> r <agent>"), appended so parallel calls
-// don't lose counts. A tool call counts only up to its own line, so parallel calls neither skip nor duplicate a nudge.
-let lines = [];
-try {
-  if (!stopping) fs.appendFileSync(base + '.log', me + '\n');
-  lines = read(base + '.log').split('\n').filter(Boolean);
-} catch {}
-const isResult = l => / r( |$)/.test(l);
-const calls = lines.filter(l => !isResult(l));
-const upTo = stopping ? calls : calls.slice(0, calls.lastIndexOf(me) + 1);
-const resultLines = lines.filter(isResult);
+if (event === 'SessionStart') {
+  if (input.source === 'compact') {
+    process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: `上下文刚被压缩。你在用 retro skill 推进 /goal「${goal.cond}」。接着做之前，先重读 ${SKILL} 的第 2 节“主循环”和第 3 节“委派和回报”，再读 PROGRESS.md，并运行 ${cmd('status')} 看各个子代理在做什么，然后回到主循环。` } }));
+  }
+  process.exit(0);
+}
+
+const stopping = event === 'Stop';
+const notes = [];
 
 // /goal blocks every unfinished Stop, so stop_hook_active stays true for the whole run and can't tell turns apart.
 // Speak at a Stop only if the main agent made a tool call since this hook last blocked; otherwise change nothing.
 const lastBlock = read(base + '.blocked').trim();
-if (stopping && lastBlock !== '' && calls.length <= Number(lastBlock)) process.exit(0);
+if (stopping && lastBlock !== '' && (Number(read(base + '.call')) || 0) <= Number(lastBlock)) process.exit(0);
+if (!stopping) try { fs.writeFileSync(base + '.call', String(now)); } catch {}
 
 try { if (!stopping) launched(); } catch {}
 try { userInbox(); } catch {}
 try { goalNote(); } catch {}
 try { sessionFile(); } catch {}
-try { retroNudge(); } catch {}
-try { slot(); } catch {}
+let enough = true;
+try { enough = harness(); } catch {}
+if (enough) {
+  try { checkpoint(); } catch {}
+  try { slot(); } catch {}
+  try { watch(); } catch {}
+}
 
 if (notes.length) {
   const text = notes.join('\n');
   if (stopping) {
-    try { fs.writeFileSync(base + '.blocked', String(calls.length)); } catch {}
+    try { fs.writeFileSync(base + '.blocked', String(now)); } catch {}
     process.stdout.write(JSON.stringify({ decision: 'block', reason: text }));
   } else {
     process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: text } }));
   }
 }
 
-// The main agent just launched the reserved review/scout: mark it started, so a Stop right after isn't told otherwise.
-// Only an exact agent name counts: Claude Code's Agent (formerly Task) tool names it in subagent_type; another spawn
-// tool (Codex) in some field. Todo tools (TaskCreate…) and prompts that merely mention the name don't.
+// What was said when. claim(key, ok) says yes, and records it, only if ok(last time said) — checked again under a
+// lock, so parallel tool calls don't both say it. A busy lock means "not now": a later call says it instead.
+function saidMap() { try { return JSON.parse(read(base + '.said')) || {}; } catch { return {}; } }
+function claim(key, ok) {
+  if (!ok(saidMap()[key])) return false;
+  return withLock(base + '.said.lock', () => {
+    const m = saidMap();
+    if (!ok(m[key])) return false;
+    m[key] = now;
+    for (const k of Object.keys(m)) if (now - m[k] > 864e5) delete m[k];
+    fs.writeFileSync(base + '.said', JSON.stringify(m));
+    return true;
+  }) === true;
+}
+// Due since `due`: say it, then again once 10 minutes have passed since it was last said. An urgent one (a due
+// checkpoint, an unlaunched reservation) is also said at every Stop the hook may speak at: ending the turn with it
+// still pending is when it matters most, and the Stop rule above keeps that from looping.
+function timely(key, due, urgent = false) {
+  return now >= due && claim(key, last => (stopping && urgent) || !(last >= due && now - last < C.REPEAT));
+}
+function once(key) { return claim(key, last => !last); }
+
+// A subagent's tool call, or its stop. Only executors are tracked: not the review/scout (the slot times those), not
+// Codex's approval reviewers, and not Claude Code's internal agents (/btw, prompt suggestions), which have no
+// agent_type. Nothing is written unless the main agent's goal was last seen active.
+function track() {
+  if (event !== 'PostToolUse' && event !== 'SubagentStop') return;
+  const type = String(input.agent_type || '');
+  if (!type || SLOT_AGENTS.has(type) || /guardian/i.test(type)) return;
+  let cache = null;
+  try { cache = JSON.parse(read(base + '.goal')); } catch {}
+  if (!cache?.active) return;
+  const d = agentsDir(input.session_id), id = safe(input.agent_id || 'unknown');
+  const f = path.join(d, `${id}.json`), stop = path.join(d, `${id}.stop`);
+  const header = () => JSON.stringify({ type, seg: now, tp: input.agent_transcript_path || input.transcript_path });
+  fs.mkdirSync(d, { recursive: true });
+  if (event === 'SubagentStop') {
+    if (!fs.existsSync(f)) fs.writeFileSync(f, header());
+    fs.writeFileSync(stop, '');
+  } else if (fs.existsSync(stop) || !fs.existsSync(f)) {
+    // Its first tool call, or the first since it stopped (a follow-up): a new segment starts.
+    fs.writeFileSync(f, header());
+    try { fs.unlinkSync(stop); } catch {}
+  } else {
+    fs.utimesSync(f, new Date(now), new Date(now));
+  }
+}
+
+// The main agent just launched a subagent. An executor: remember when, since it is tracked only from its first tool
+// call and its slot shouldn't look idle meanwhile. The reserved review/scout: mark it started, so a Stop right after
+// isn't told otherwise. Only an exact agent name counts: Claude Code's Agent (formerly Task) tool names it in
+// subagent_type; another spawn tool (Codex) in some field. Todo tools (TaskCreate…) and prompts that merely mention
+// the name don't.
 function launched() {
   const ti = input.tool_input || {};
-  const tool = String(input.tool_name);
-  const named = /^(Agent|Task)$/.test(tool) ? [ti.subagent_type] : /spawn/i.test(tool) ? Object.values(ti) : [];
+  const name = String(input.tool_name);
+  const named = /^(Agent|Task)$/.test(name) ? [ti.subagent_type] : /spawn/i.test(name) ? Object.values(ti) : [];
   if (!named.length) return;
+  if (!named.some(v => SLOT_AGENTS.has(v))) {
+    fs.writeFileSync(base + '.launch', String(now));
+    return;
+  }
   const s = readSlot(root);
   if (s.state !== 'running' || s.spawned || s.by !== sid) return;
   if (!named.includes(s.type === 'scout' ? 'idea-scout' : 'route-reviewer')) return;
@@ -172,40 +230,63 @@ function goalNote() {
   }
 }
 
-function retroNudge() {
+// The harness must allow the background review/scout, two spare and at least MIN_SLOTS executors at once. If it
+// doesn't, nothing else is said: the main agent is to stop and ask the user to raise the limit.
+function harness() {
+  const max = harnessLimit(goal.codex, root);
+  if (max - C.RESERVE >= C.MIN_SLOTS) return true;
+  const need = C.RESERVE + C.MIN_SLOTS;
+  if (timely('harness', goal.start)) {
+    if (once(`harness-log ${goal.start}`)) log(root, sid, 'harness-limit', String(max));
+    notes.push(goal.codex
+      ? `Codex 现在同时只能开 ${max} 个子代理（~/.codex/config.toml 里 [agents] 的 max_concurrent_threads_per_session，没设时是 3）。扣掉后台评审和余量 ${C.RESERVE} 个，执行名额不到 ${C.MIN_SLOTS} 个，retro 跑不起来。不要开始派任务：在回复里请用户把它改成至少 ${need}（建议 12），改完重启 Codex 再恢复目标。在那之前不要做别的；同一个阻塞按 update_goal 的规则连续出现三轮后，把目标标成 blocked。`
+      : `Claude Code 现在同时只能开 ${max} 个子代理（环境变量 CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS）。扣掉后台评审和余量 ${C.RESERVE} 个，执行名额不到 ${C.MIN_SLOTS} 个，retro 跑不起来。不要开始派任务：在回复里请用户把它调到至少 ${need}（或者删掉这个设置，默认是 20），先用 /goal clear 暂停目标，重启 Claude Code 后再设回来。`);
+  }
+  return false;
+}
+
+function checkpoint() {
   const R = Math.max(goal.start, lastRetro(root));
-  // When each result first came back after R: per distinct subagent, and per new task report.
-  const first = new Map();
-  for (const l of resultLines) {
-    const [t, pid, , id] = l.split(' ');
-    const k = id || `${pid}:${t}`;
-    if (+t > R && !(first.get(k) <= +t)) first.set(k, +t);
-  }
-  const back = [...first.values()];
-  const rep = reports(root).filter(r => !r.scout && r.born > R).map(r => r.born);
-  const resultsAt = t => Math.max(back.filter(x => x <= t).length, rep.filter(x => x <= t).length);
-  const dueAt = (t, k) => k >= C.RETRO_CALLS || resultsAt(t) >= C.RETRO_RESULTS || t - R >= C.RETRO_AFTER;
-  const since = upTo.filter(l => ts(l) > R);
-  if (!dueAt(now, since.length)) return;
-  let nudge = stopping;
-  if (!stopping) {
-    // The first call at which it became due, then every REPEAT calls: decided by the log alone, so parallel calls agree.
-    const firstDue = since.findIndex((l, i) => dueAt(ts(l), i + 1));
-    const k = since.length - 1;
-    nudge = firstDue >= 0 && (k - firstDue) % C.REPEAT === 0;
-    if (nudge && k === firstDue) log(root, sid, 'retro-due', `${Math.round((now - R) / 60e3)}min ${resultsAt(now)}results ${since.length}calls`);
-  }
-  if (!nudge) return;
-  let text = `复盘到期（距上次复盘或目标开始 ${Math.round((now - R) / 60e3)} 分钟，期间交回 ${resultsAt(now)} 个结果，主会话 ${since.length} 次工具调用）。先做完手头这一步，不要打断正在进行的事；到下一个断点时按 retro skill（${SKILL}）复盘：先运行 ${cmd('inbox')} 收集交回的内容，最后运行 ${cmd('done')}，这个提醒随之停止。`;
+  const due = R + C.CHECKPOINT_EVERY;
+  const first = !(saidMap().checkpoint >= due);
+  if (!timely('checkpoint', due, true)) return;
+  const mins = Math.round((now - R) / 60e3);
+  if (first) log(root, sid, 'checkpoint-due', `${mins}min`);
+  let text = `检查点到期（距上次检查点或目标开始 ${mins} 分钟）。做完手头这一步后，按 retro skill（${SKILL}）第 2 节做检查点：先运行 ${cmd('inbox')}，最后运行 ${cmd('done')}。没做之前每 10 分钟提醒一次。`;
   const size = fs.existsSync(path.join(root, 'PROGRESS.md')) ? fs.statSync(path.join(root, 'PROGRESS.md')).size : 0;
-  if (size > C.PROGRESS_MAX) text += ` PROGRESS.md 现在 ${(size / 1024).toFixed(1)} KB，超过 4 KB：这次复盘先压缩它（命令和环境移到 RUNBOOK.md，过程细节移到任务笔记）。`;
+  if (size > C.PROGRESS_MAX) text += ` PROGRESS.md 现在 ${(size / 1024).toFixed(1)} KB，超过 4 KB：这次先压缩它（命令和环境移到手册，过程细节移到任务笔记）。`;
   notes.push(text);
+}
+
+// The subagent tracker, read for the main agent: segments past the limit, subagents gone silent, slots left idle.
+function watch() {
+  const { agents, running } = goalAgents(input.session_id, goal.start, now);
+  const min = t => Math.round((now - t) / 60e3);
+  for (const a of running) {
+    if (now - a.seg >= C.SEGMENT_MAX) {
+      if (once(`over ${a.id} ${a.seg}`)) notes.push(`子代理「${agentName(a)}」（${a.type}）这一段已经连续跑了 ${min(a.seg)} 分钟，超过一段 1 小时的上限，还没有交阶段回报。问它一次进展；没有说得过去的理由，就停掉它，按它任务目录里的 notes.md 另派。`);
+    } else if (now - a.last >= C.SILENT && once(`silent ${a.id} ${a.last}`)) {
+      notes.push(`子代理「${agentName(a)}」（${a.type}）已经 ${min(a.last)} 分钟没有调用工具。如果它在等一个长命令，就不用管；否则问它一次，没有回应就停掉换人。`);
+    }
+  }
+  const set = readSlots(root);
+  if (!set || set.at < goal.start) {
+    if (timely('slots', goal.start + C.SLOTS_BY)) notes.push(`还没有记下这个目标的名额。按 retro skill 第 3 节定下来（资源允许的数量、/goal 条件里写的上限、${tool} 的子代理上限 ${harnessLimit(goal.codex, root)} 减 ${C.RESERVE}，三者取最小），然后运行 ${cmd('slots <N> <理由>')}。hook 靠它检查名额有没有空着。`);
+    return;
+  }
+  if (running.length >= set.n) return;
+  // Idle since the last time a slot freed up (approximately, when several are idle), or since the last launch: a new
+  // executor shows up only at its first tool call.
+  const launch = Number(read(base + '.launch')) || 0;
+  const freed = Math.max(set.at, goal.start, launch, ...agents.map(a => a.stopAt || (a.active && now - a.last >= C.GONE ? a.last + C.GONE : 0)));
+  if (timely('idle', freed + C.IDLE_GRACE)) {
+    notes.push(`名额空着：这个目标的名额是 ${set.n} 个，现在在跑的执行子代理只有 ${running.length} 个${running.length ? `（${running.map(agentName).join('、')}）` : ''}。按主循环补位，从“下一步”或想法池派任务，别忘了探索。名额要变，就用 ${cmd('slots <N> <理由>')} 改。`);
+  }
 }
 
 function slot() {
   let s = readSlot(root);
   const mine = () => s.by === sid;
-  const repeat = stopping || (upTo.length > 0 && upTo.length % C.REPEAT === 0);
   const spawnText = (type, start) => {
     const name = type === 'scout' ? 'idea-scout' : 'route-reviewer';
     const how = goal.codex
@@ -213,7 +294,7 @@ function slot() {
       : `在后台启动 ${name} 子代理（Agent 工具，subagent_type 设为 ${name}，run_in_background 设为 true），提示写`;
     return `${how}：“${type === 'scout' ? '侦察本项目' : '评审本项目的路线'}。开始时间 ${start}；脚本 ${CLI}；项目 ${root.replace(/\\/g, '/')}”。`;
   };
-  const stopNote = '你启动的后台评审/侦察超过时间上限，已自动作废。能停就停掉它（Claude Code 用 TaskStop，Codex 用对应的停止子代理工具）；停不掉也没关系，它交结论时会发现已作废，不会写入。';
+  const stopNote = `你启动的后台评审/侦察超过时间上限，已自动作废。能停就停掉它（${goal.codex ? 'interrupt_agent' : 'TaskStop'}）；停不掉也没关系，它交结论时会发现已作废，不会写入。`;
   // Tell the owner once to stop a voided subagent it launched, then drop `spawned` so it isn't told again.
   const tellOwner = start => locked(root, t => {
     if (t.state !== 'aborted' || t.kv.start !== start || !t.spawned || t.by !== sid) return false;
@@ -238,7 +319,7 @@ function slot() {
       if (!stale) return;
       s = readSlot(root);
     } else {
-      if (!s.spawned && mine() && repeat) notes.push(`你登记的后台${s.type === 'scout' ? '侦察' : '评审'}还没有启动：${spawnText(s.type, s.kv.start)}已经启动过就不用管。`);
+      if (!s.spawned && mine() && timely(`launch ${s.kv.start}`, s.start, true)) notes.push(`你登记的后台${s.type === 'scout' ? '侦察' : '评审'}还没有启动：${spawnText(s.type, s.kv.start)}已经启动过就不用管。`);
       return;
     }
   }
@@ -246,12 +327,14 @@ function slot() {
     if (tellOwner(s.kv.start)) notes.push(stopNote);
     return;
   }
-  const resultTimes = resultLines.map(ts);
+  const finished = trackedAgents(input.session_id).map(a => a.stopAt).filter(Boolean);
   const plan = t => {
     if (t.state === 'running') return null;
+    // `retro.mjs request`, made during this goal
+    if ((t.kv.want === 'scout' || t.kv.want === 'review') && Date.parse(t.kv.wantAt) >= goal.start) return { type: t.kv.want, asked: true };
     const first = t.start < goal.start; // nothing reserved yet for this goal
     if (!first && now - t.start < C.SLOT_EVERY) return null;
-    if (!first && newestResult(root, resultTimes) < t.start) return { stall: true };
+    if (!first && newestResult(root, finished) < t.start) return { stall: true };
     const lastScout = t.lastScout >= goal.start ? t.lastScout : 0;
     const open = openIdeas(root);
     const scout = !lastScout || now - lastScout >= C.SCOUT_EVERY || (open !== null && open < C.OPEN_IDEAS_MIN && t.type !== 'scout');
@@ -269,10 +352,11 @@ function slot() {
   if (!got) return;
   if (got.stall) {
     log(root, sid, 'stall', '');
-    notes.push('过去 1 小时没有任何新结果（子代理交回、任务回报、总表、提交都没有），这一轮不做路线评审。先查原因：名额是不是空着、任务是不是太大又没有阶段回报、是不是在串行地等、资源是不是在排队；然后补上任务，并把原因写进下次复盘。');
+    notes.push('过去 1 小时没有任何新结果（子代理交回、任务回报、总表、提交都没有），这一轮不做路线评审。先查原因：名额是不是空着、任务是不是太大又没有阶段回报、是不是在串行地等、资源是不是在排队；然后补上任务，并把原因写进下次检查点。');
   } else {
-    log(root, sid, 'slot-reserved', `${got.type} ${got.start}`);
-    notes.push(`已为你登记一次后台${got.type === 'scout' ? '侦察' : '评审'}（同一项目同一时间只有一个）：到下一个断点时${spawnText(got.type, got.start)}要在 20 分钟内启动，不要等它，接着调度。`);
+    log(root, sid, 'slot-reserved', `${got.type} ${got.start}${got.asked ? ' requested' : ''}`);
+    claim(`launch ${got.start}`, () => true);
+    notes.push(`已为你登记一次后台${got.type === 'scout' ? '侦察' : '评审'}${got.asked ? '（按你的请求）' : ''}（同一项目同一时间只有一个）：到下一个断点时${spawnText(got.type, got.start)}要在 20 分钟内启动，不要等它，接着调度。`);
   }
 }
 

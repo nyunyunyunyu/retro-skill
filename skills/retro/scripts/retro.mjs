@@ -3,19 +3,20 @@
 // project is CLAUDE_PROJECT_DIR, else the nearest directory up from here holding .retro/, else the current directory;
 // inside a git worktree, the same place in the main checkout (so worktrees share one .retro/). Exit codes: 2 = slot
 // voided/replaced, 3 = busy.
-//   done                   mark a retro finished (stops the retro nudges until the next one is due)
-//   inbox                  what came back since the last retro: task reports, the latest review, ledger rows
+//   done                   mark a checkpoint finished (stops its reminders until the next one is due, 60 min later)
+//   inbox                  what came back since the last checkpoint: task reports, the latest review, ledger rows
+//   slots <n> [why]        the main agent records its executor slots for the goal; the hook checks for idle ones
+//   request review|scout   ask for a background review/scout now; the hook reserves it at the next tool call
 //   spawned <start>        a review/scout subagent marks itself started and learns its deadline
 //   finish <start> <file>  a review/scout subagent hands in its report (file, or - for stdin)
 //   abort <start>          the main agent couldn't start the subagent; frees the slot
 //   status                 progress digest for the progress desk (read-only)
 //   tell <text>            the progress desk passes on what the user said; delivered at the main agent's next tool call
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import {
-  C, EXIT_BUSY, EXIT_GONE, dir, ensureDir, goalCache, iso, lastRetro, lastWrite, limitOf, locked, log, mainCheckout,
-  mtime, openIdeas, read, readSlot, reports, sessions, writeSlot,
+  C, EXIT_BUSY, EXIT_GONE, agentName, dir, ensureDir, goalAgents, goalCache, harnessLimit, headOf, iso, lastRetro, lastWrite,
+  limitOf, locked, log, mainCheckout, mtime, openIdeas, read, readSlot, readSlots, reports, sessions, writeSlot,
 } from './lib.mjs';
 
 const args = process.argv.slice(2);
@@ -30,8 +31,8 @@ const ago = t => (t ? `${clock(t)}（${Math.max(0, Math.round((now - t) / 60e3))
 const fail = (msg, code = 1) => { console.log(msg); process.exit(code); };
 const busy = () => fail('状态文件被其他进程占用：等几秒后重试同一条命令。', EXIT_BUSY);
 
-const commands = { done, inbox, spawned, finish, abort, status, tell, root: () => console.log(root) };
-if (!commands[cmd]) fail('用法：node retro.mjs <done|inbox|spawned <start>|finish <start> <file>|abort <start>|status|tell <话>> [--root <项目>]');
+const commands = { done, inbox, slots, request, spawned, finish, abort, status, tell, root: () => console.log(root) };
+if (!commands[cmd]) fail('用法：node retro.mjs <done|inbox|slots <N> <理由>|request review|scout|spawned <start>|finish <start> <file>|abort <start>|status|tell <话>> [--root <项目>]');
 commands[cmd]();
 
 // Same mapping as the hook: a worktree path stands for the same place in the main checkout.
@@ -48,10 +49,10 @@ function findRoot(arg) {
 function done() {
   ensureDir(root);
   fs.writeFileSync(path.join(dir(root), 'retro-done'), iso(now) + '\n');
-  log(root, '', 'retro-done', '');
+  log(root, '', 'checkpoint-done', '');
   const size = mtime(path.join(root, 'PROGRESS.md')) ? fs.statSync(path.join(root, 'PROGRESS.md')).size : 0;
   const open = openIdeas(root);
-  const out = [`已记录复盘（${clock(now)}）。下次复盘：60 分钟后，或交回 ${C.RETRO_RESULTS} 个结果，或主会话 ${C.RETRO_CALLS} 次工具调用。`];
+  const out = [`已记录检查点（${clock(now)}）。下一个在 60 分钟后。`];
   if (!size) out.push(`${root} 下还没有 PROGRESS.md。`);
   else if (size > C.PROGRESS_MAX) out.push(`PROGRESS.md 有 ${(size / 1024).toFixed(1)} KB，超过 4 KB，请压缩。`);
   out.push(open === null ? '还没有想法池 .retro/ideas.md。' : `想法池里未验证的想法 ${open} 条${open < C.OPEN_IDEAS_MIN ? '，偏少' : ''}。`);
@@ -59,9 +60,9 @@ function done() {
 }
 
 function inbox() {
-  // Since the last retro, or since the goal of the session running it (the most recently active one) started.
+  // Since the last checkpoint, or since the goal of the session running it (the most recently active one) started.
   const R = Math.max(lastRetro(root), Date.parse(sessions(root)[0]?.goal_start) || 0);
-  console.log(`# 上次复盘以来交回的内容（上次复盘：${ago(lastRetro(root))}）`);
+  console.log(`# 上次检查点以来交回的内容（上次检查点：${ago(lastRetro(root))}）`);
   // The newest reports that fit, printed oldest first.
   const list = reports(root).filter(r => r.mtime > R);
   const shown = [];
@@ -82,6 +83,34 @@ function inbox() {
     console.log(`\n## 总表 ${path.relative(root, f)}（共 ${rows.length} 行，最后更新 ${clock(mtime(f))}），第一行和最后 5 行：\n${[rows[0], '…', ...rows.slice(-5)].join('\n')}`);
   }
   if (!list.length && mtime(review) <= R) console.log('\n没有新的任务回报或评审。');
+}
+
+// The executor slots the main agent chose for its goal. Checked against the harness limit of the session it most
+// likely belongs to (the most recently active one).
+function slots() {
+  const n = Number(rest[0]);
+  if (!Number.isInteger(n) || n < 1) fail('用法：slots <N> <理由>，N 是同时在跑的执行子代理数（不含后台评审）');
+  const why = rest.slice(1).join(' ').trim();
+  ensureDir(root);
+  fs.writeFileSync(path.join(dir(root), 'slots'), JSON.stringify({ n, at: iso(now), why }) + '\n');
+  log(root, '', 'slots', `${n} ${why}`);
+  const ms = sessions(root)[0];
+  const codex = ms ? !!goalCache(ms.session_id)?.codex : false;
+  const room = harnessLimit(codex, root) - C.RESERVE;
+  console.log(`已记下名额 ${n} 个。${n > room ? `注意：${codex ? 'Codex' : 'Claude Code'} 的子代理上限扣掉后台评审和余量后只剩 ${room} 个，超出的会启动失败。` : ''}`);
+}
+
+// Ask for a background review or scout now instead of at the hourly turn. Kept in the slot line until the hook
+// reserves it, right away or, while one is running, as soon as that one ends.
+function request() {
+  const type = rest[0];
+  if (type !== 'review' && type !== 'scout') fail('用法：request review|scout');
+  const r = locked(root, s => { writeSlot(root, { ...s.kv, want: type, wantAt: iso(now) }); return s.state; }, 50);
+  if (r === undefined) busy();
+  log(root, '', 'requested', type);
+  console.log(r === 'running'
+    ? '已记下请求。现在有一轮后台评审/侦察在跑，它结束后，你的下一次工具调用时 hook 会登记。'
+    : '已记下请求。你下一次调用工具时 hook 会登记，照提醒在后台启动。');
 }
 
 function spawned() {
@@ -168,17 +197,18 @@ function status() {
   const cache = ms.session_id ? goalCache(ms.session_id) : null;
   if (cache) out.push(`目标状态：hook 最后一次看到时${cache.active ? '进行中' : '已结束或暂停'}。`);
   if (ms.transcript_path) out.push(...mainAgent(ms.transcript_path), ...subagents(ms));
-  const R = lastRetro(root);
-  const sid = String(ms.session_id || '').replace(/[^\w-]/g, '_');
-  const lines = read(path.join(os.tmpdir(), `claude-retro-${sid}.log`)).split('\n').filter(Boolean);
-  const after = Math.max(R, Date.parse(ms.goal_start) || 0);
-  const isResult = l => / r( |$)/.test(l);
-  const calls = lines.filter(l => !isResult(l) && parseInt(l, 10) > after).length;
-  const back = new Set(lines.filter(l => isResult(l) && parseInt(l, 10) > after).map(l => l.split(' ')[3] || l)).size;
-  out.push(`\n## 复盘\n上次：${ago(R)}；之后主会话 ${calls} 次工具调用，交回 ${back} 个子代理结果。`);
+  const start = Date.parse(ms.goal_start) || 0;
+  out.push(`\n## 检查点和名额\n上次检查点：${ago(lastRetro(root))}`);
+  const set = readSlots(root);
+  out.push(`名额：${set && set.at >= start ? `${set.n} 个（${set.why || '没写理由'}，记于 ${ago(set.at)}）` : '这个目标还没记下'}`);
+  // From the hook's subagent tracker: executors of this goal, running ones first.
+  const { agents, running } = ms.session_id ? goalAgents(ms.session_id, start, now) : { agents: [], running: [] };
+  const mins = t => Math.round((now - t) / 60e3);
+  const state = a => running.includes(a) ? `在跑，这一段 ${mins(a.seg)} 分钟${now - a.last >= C.SILENT ? `，${mins(a.last)} 分钟没有调用工具` : ''}` : a.active ? `${mins(a.last)} 分钟没有动静，可能已被停掉` : `已交回（${clock(a.stopAt)}）`;
+  if (agents.length) out.push(`执行子代理（hook 记录，在跑 ${running.length} 个）：${[...running, ...agents.filter(a => !running.includes(a)).sort((a, b) => b.last - a.last).slice(0, 5)].map(a => `${agentName(a)}（${state(a)}）`).join('；')}`);
   const s = readSlot(root);
   const kind = { review: '路线评审', scout: '全局侦察', stall: '停滞提醒' }[s.type] || s.type;
-  out.push(`后台名额：${s.state === 'none' ? '还没用过' : `${kind} ${s.state}，登记于 ${ago(s.start)}${s.spawned ? `，启动于 ${ago(s.spawnedAt)}` : ''}`}`);
+  out.push(`后台评审：${s.state === 'none' ? '还没用过' : `${kind} ${s.state}，登记于 ${ago(s.start)}${s.spawned ? `，启动于 ${ago(s.spawnedAt)}` : ''}`}${s.kv.want ? `；已请求一次${s.kv.want === 'scout' ? '侦察' : '评审'}` : ''}`);
   const reps = reports(root);
   out.push(`\n## 任务回报（${reps.length} 份，最近 8 份）`);
   for (const r of reps.slice(0, 8)) out.push(`- ${r.task}（${ago(r.mtime)}）：${firstLine(read(r.file))}`);
@@ -278,16 +308,6 @@ function subagents({ transcript_path: transcript, session_id: sessionId, goal_st
     out.push(`- ${name}（${type}，${state}${stopped ? '，被停止' : ''}）：${clip(last, 200) || '（还没有输出）'}`);
   }
   return out;
-}
-
-function headOf(file, bytes) {
-  try {
-    const fd = fs.openSync(file, 'r');
-    const buf = Buffer.alloc(bytes);
-    const n = fs.readSync(fd, buf, 0, bytes, 0);
-    fs.closeSync(fd);
-    return buf.toString('utf8', 0, n);
-  } catch { return ''; }
 }
 
 function tail(file, bytes) {

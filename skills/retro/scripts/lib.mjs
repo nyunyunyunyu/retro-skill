@@ -1,10 +1,13 @@
 // Shared by the hook (retro-nudge.mjs) and the helper CLI (retro.mjs). All project state lives in <root>/.retro/:
 //   slot             one line, the background slot (route review or idea scout), "key=value ..." — see readSlot
-//   retro-done       ISO time of the last finished retro, written by `retro.mjs done`
+//   slots            the executor slots the main agent chose for its goal (`retro.mjs slots`), JSON {n, at, why}
+//   retro-done       ISO time of the last finished checkpoint, written by `retro.mjs done`
 //   log.tsv          append-only event log (time, session, event, detail), for the progress desk and later analysis
 //   sessions/<id>.json   sessions that hold an active /goal here, for the progress desk
 //   tasks/<task>/report.md   executor reports; ideas.md, results.tsv, route-review.md, reviews/ are written by agents
 //   user-inbox.jsonl what the user said at the progress desk, until the hook hands it over; then kept in user-said.md
+// Per session, in the system temp dir (claude-retro-<session>.*): the goal cache, what the hook said when (.said),
+// the last main tool call (.call) and Stop block (.blocked), and the subagent tracker (.agents/, see trackedAgents).
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -13,9 +16,13 @@ import path from 'node:path';
 const scale = Number(process.env.RETRO_TIME_SCALE) > 0 ? Number(process.env.RETRO_TIME_SCALE) : 1;
 const MIN = 60e3 * scale;
 export const C = {
-  RETRO_AFTER: 60 * MIN, RETRO_RESULTS: 4, RETRO_CALLS: 40, REPEAT: 10,
-  SLOT_EVERY: 60 * MIN, SCOUT_EVERY: 240 * MIN, LAUNCH_MAX: 20 * MIN, REVIEW_MAX: 20 * MIN, SCOUT_MAX: 40 * MIN,
-  GRACE: 2 * MIN, PROGRESS_MAX: 4096, OPEN_IDEAS_MIN: 3, LOCK_STALE: 60e3, SAME_GOAL_GAP: 12 * 60 * MIN,
+  CHECKPOINT_EVERY: 60 * MIN, REPEAT: 10 * MIN,
+  SLOT_EVERY: 60 * MIN, SCOUT_EVERY: 240 * MIN, LAUNCH_MAX: 20 * MIN, REVIEW_MAX: 20 * MIN, SCOUT_MAX: 40 * MIN, GRACE: 2 * MIN,
+  SEGMENT_MAX: 60 * MIN, SILENT: 20 * MIN, GONE: 60 * MIN, IDLE_GRACE: 5 * MIN, SLOTS_BY: 10 * MIN,
+  // Subagents the harness allows at once, minus RESERVE (the background review/scout and two spare), must leave
+  // MIN_SLOTS executors. Defaults: Codex 3 ([agents] max_concurrent_threads_per_session), Claude Code 20.
+  RESERVE: 3, MIN_SLOTS: 2, CODEX_LIMIT: 3, CLAUDE_LIMIT: 20,
+  PROGRESS_MAX: 4096, OPEN_IDEAS_MIN: 3, LOCK_STALE: 60e3, SAME_GOAL_GAP: 12 * 60 * MIN,
 };
 export const limitOf = type => (type === 'scout' ? C.SCOUT_MAX : C.REVIEW_MAX);
 // Agents whose finishing is not progress on the task itself.
@@ -43,11 +50,12 @@ export function mainCheckout(d) {
 
 export const dir = root => path.join(root, '.retro');
 export const iso = t => new Date(t).toISOString();
+export const safe = id => String(id).replace(/[^\w-]/g, '_');
 export const mtime = f => { try { return fs.statSync(f).mtimeMs; } catch { return 0; } };
 export const read = f => { try { return fs.readFileSync(f, 'utf8'); } catch { return ''; } };
 
 // Files the scripts and agents generate; kept out of git so worktrees don't carry stale copies.
-const GENERATED = ['slot', 'slot.lock', 'retro-done', 'log.tsv', 'sessions/', 'tasks/', 'reviews/', 'probes/', 'ideas.md', 'results.tsv', 'route-review.md', 'user-inbox.jsonl', 'user-said.md'];
+const GENERATED = ['slot', 'slot.lock', 'slots', 'retro-done', 'log.tsv', 'sessions/', 'tasks/', 'reviews/', 'probes/', 'ideas.md', 'results.tsv', 'route-review.md', 'user-inbox.jsonl', 'user-said.md'];
 // A new .retro/ ignores everything. An existing one (some projects commit parts of it) gets a .gitignore for the
 // generated files only, unless it already has one.
 export function ensureDir(root) {
@@ -79,8 +87,11 @@ export function writeSlot(root, kv) {
 
 // Run fn(slot) under an exclusive lock file, so concurrent runs (other sessions, parallel tool calls, the CLI) can't
 // interleave. Returns fn's result, or undefined when the lock stays busy; a lock older than LOCK_STALE is removed.
+// withLock does the same for any lock file.
 export function locked(root, fn, tries = 1) {
-  const lock = path.join(ensureDir(root), 'slot.lock');
+  return withLock(path.join(ensureDir(root), 'slot.lock'), () => fn(readSlot(root)), tries);
+}
+export function withLock(lock, fn, tries = 1) {
   for (let i = 0; i < tries; i++) {
     try {
       fs.closeSync(fs.openSync(lock, 'wx'));
@@ -89,7 +100,7 @@ export function locked(root, fn, tries = 1) {
       if (i + 1 < tries) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
       continue;
     }
-    try { return fn(readSlot(root)); } finally { try { fs.unlinkSync(lock); } catch {} }
+    try { return fn(); } finally { try { fs.unlinkSync(lock); } catch {} }
   }
   return undefined;
 }
@@ -104,8 +115,7 @@ export function log(root, session, event, detail = '') {
 
 export const lastRetro = root => Date.parse(read(path.join(dir(root), 'retro-done')).trim().split(/\s/)[0]) || 0;
 
-// Executor reports, newest first. `born` (creation time) counts a report once even when it is rewritten; `mtime`
-// shows activity. Scout reports (tasks/scout-*) are flagged, since they aren't task progress.
+// Executor reports, newest first. Scout reports (tasks/scout-*) are flagged, since they aren't task progress.
 export function reports(root) {
   const base = path.join(dir(root), 'tasks');
   let names = [];
@@ -115,7 +125,7 @@ export function reports(root) {
     const file = path.join(base, task, 'report.md');
     try {
       const s = fs.statSync(file);
-      out.push({ task, file, scout: task.startsWith('scout-'), mtime: s.mtimeMs, born: s.birthtimeMs > 0 ? Math.min(s.birthtimeMs, s.mtimeMs) : s.mtimeMs });
+      out.push({ task, file, scout: task.startsWith('scout-'), mtime: s.mtimeMs });
     } catch {}
   }
   return out.sort((a, b) => b.mtime - a.mtime);
@@ -129,8 +139,94 @@ export function openIdeas(root) {
 
 // The hook's cached goal state for a session ({active, cond, start, …} in the system temp dir), or null.
 export function goalCache(sessionId) {
-  const sid = String(sessionId).replace(/[^\w-]/g, '_');
-  try { return JSON.parse(fs.readFileSync(path.join(os.tmpdir(), `claude-retro-${sid}.goal`), 'utf8')); } catch { return null; }
+  try { return JSON.parse(fs.readFileSync(path.join(os.tmpdir(), `claude-retro-${safe(sessionId)}.goal`), 'utf8')); } catch { return null; }
+}
+
+// The executor slots chosen for the current goal ({n, at, why}), or null.
+export function readSlots(root) {
+  try {
+    const s = JSON.parse(read(path.join(dir(root), 'slots')));
+    return s.n > 0 ? { ...s, at: Date.parse(s.at) || 0 } : null;
+  } catch { return null; }
+}
+
+// How many subagents the harness lets a session run at once. Claude Code: CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS, else
+// 20. Codex: [agents] max_concurrent_threads_per_session in <CODEX_HOME>/config.toml, then the project's
+// .codex/config.toml (it counts subagents only), else 3.
+export function harnessLimit(codex, root) {
+  if (!codex) {
+    const n = parseInt(process.env.CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS, 10);
+    return n > 0 ? n : C.CLAUDE_LIMIT;
+  }
+  let n = null;
+  const home = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+  for (const f of [path.join(home, 'config.toml'), root && path.join(root, '.codex', 'config.toml')]) {
+    const v = f && tomlInt(read(f), 'agents', 'max_concurrent_threads_per_session');
+    if (v != null) n = v;
+  }
+  return n ?? C.CODEX_LIMIT;
+}
+// An integer from a TOML file: under [table], as table.key at the top level, or in an inline table
+// (table = { key = n }); quoted or not. Enough for one known key.
+function tomlInt(text, table, key) {
+  let cur = '';
+  const num = '"?(\\d+)"?';
+  for (const line of text.split(/\r?\n/)) {
+    const h = line.match(/^\s*\[\s*([^\]]+?)\s*\]\s*(#.*)?$/);
+    if (h) { cur = h[1]; continue; }
+    const m = line.match(new RegExp(`^\\s*([\\w.-]+)\\s*=\\s*${num}\\s*(#.*)?$`));
+    if (m && ((cur === table && m[1] === key) || (cur === '' && m[1] === `${table}.${key}`))) return Number(m[2]);
+    const inline = cur === '' && line.match(new RegExp(`^\\s*${table}\\s*=\\s*\\{[^}]*\\b${key}\\s*=\\s*${num}`));
+    if (inline) return Number(inline[1]);
+  }
+  return null;
+}
+
+// The subagent tracker the hook keeps per session: <tmp>/claude-retro-<session>.agents/<agent>.json holds
+// {type, seg (when its current segment started), tp (a transcript to name it by)} and its mtime is the agent's last
+// tool call; <agent>.stop exists while it is stopped (it finished its turn), its mtime being when.
+export const agentsDir = sessionId => path.join(os.tmpdir(), `claude-retro-${safe(sessionId)}.agents`);
+export function trackedAgents(sessionId) {
+  const d = agentsDir(sessionId);
+  let names = [];
+  try { names = fs.readdirSync(d).filter(f => f.endsWith('.json')); } catch {}
+  return names.map(f => {
+    const id = f.slice(0, -5);
+    let h = {};
+    try { h = JSON.parse(read(path.join(d, f))); } catch {}
+    const stopAt = mtime(path.join(d, `${id}.stop`));
+    return { id, type: h.type || '?', seg: h.seg || 0, tp: h.tp || '', last: mtime(path.join(d, f)), stopAt, active: !stopAt };
+  });
+}
+// The tracked executors of a goal that started at `since`, and which of them are running: not stopped, and heard from
+// within GONE (a subagent stopped without a SubagentStop looks like this). Entries idle for a day are removed.
+export function goalAgents(sessionId, since, now = Date.now()) {
+  const all = trackedAgents(sessionId);
+  for (const a of all) {
+    if (now - Math.max(a.last, a.stopAt) > 864e5) for (const ext of ['json', 'stop']) try { fs.unlinkSync(path.join(agentsDir(sessionId), `${a.id}.${ext}`)); } catch {}
+  }
+  const agents = all.filter(a => Math.max(a.seg, a.last, a.stopAt) >= since && now - Math.max(a.last, a.stopAt) <= 864e5);
+  return { agents, running: agents.filter(a => a.active && now - a.last < C.GONE) };
+}
+// A name the main agent knows the subagent by. Claude Code: the description in subagents/agent-<id>.meta.json next to
+// the main transcript. Codex: the agent path its rollout's first record names. Else the id.
+export function agentName(a) {
+  const tp = String(a.tp || '');
+  const own = /[\\/]subagents[\\/]agent-[^\\/]+\.jsonl$/.test(tp);
+  const meta = own ? tp.replace(/\.jsonl$/, '.meta.json') : path.join(tp.replace(/\.jsonl$/, ''), 'subagents', `agent-${a.id}.meta.json`);
+  try { const m = JSON.parse(read(meta)); if (m.description) return m.description; } catch {}
+  const p = headOf(tp, 8192).match(/"agent_path":"([^"]*)"/)?.[1];
+  return p ? path.basename(p) : a.id;
+}
+
+export function headOf(file, bytes) {
+  try {
+    const fd = fs.openSync(file, 'r');
+    const buf = Buffer.alloc(bytes);
+    const n = fs.readSync(fd, buf, 0, bytes, 0);
+    fs.closeSync(fd);
+    return buf.toString('utf8', 0, n);
+  } catch { return ''; }
 }
 
 // When a transcript was last written: its mtime, or the timestamp of its last record if later. Codex keeps its
@@ -159,7 +255,7 @@ export function sessions(root) {
 }
 
 // Newest sign of task progress in the project: a task report, a ledger row, a commit on any branch or worktree, or
-// one of `extra` (times subagents came back).
+// one of `extra` (times subagents finished).
 export function newestResult(root, extra = []) {
   return Math.max(0, ...extra, ...reports(root).filter(r => !r.scout).map(r => r.mtime),
     mtime(path.join(dir(root), 'results.tsv')), mtime(path.join(root, 'results.tsv')), gitActivity(root));
