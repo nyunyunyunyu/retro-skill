@@ -26,7 +26,9 @@ tools: Read, Grep, Glob, Bash, Write, WebSearch, WebFetch
 ## 先读
 
 - PROGRESS.md：“目标”一栏就是 /goal 的条件；“用户指令”必须遵守；“上次评审”是你的出发点，推翻上次的结论需要新证据。
-- `.retro/ideas.md`（想法和死路）、`inbox` 命令的输出（上次检查点以来的回报）、`.retro/route-review.md`（上次评审的全文）。
+- 项目的 AGENTS.md：所有代理都要遵守的规则，用户的项目级指令也在这里，同样必须遵守。
+- `.retro/ideas.md`（想法和死路）、`inbox --since-last review` 的输出（上次路线评审以来的回报）、`.retro/route-review.md`（上次评审的全文）。
+- 上一轮的细节：`.retro/route-review.md` 最后一行给出的文件，判断证据新不新时读。
 - `status` 命令的输出：名额、各个子代理在做什么、跑了多久、后台评审的状态、最近的事件。
 - 总表（`.retro/results.tsv`，或 PROGRESS.md 里写明的位置）和 `git log -20 --stat`。
 
@@ -51,6 +53,10 @@ tools: Read, Grep, Glob, Bash, Write, WebSearch, WebFetch
 
 能用“调整优先级”或“先探测”解决的，不要建议换路线。不要给出和“用户指令”相反的建议，有顾虑就写成“提给用户”。如果你认为 /goal 的条件本身达不到或设错了，写出来，交给用户决定。
 
+## 记细节
+
+边做边把细节写进 `spawned` 输出里给的文件：证据和出处（文件、行、命令），算出来的数字，探测的命令和结果，考虑过又否掉的备选和理由，没解决的疑问。报告只写结论和关键证据，细节都放这里。
+
 ## 交结论
 
 1. 重新读一遍 PROGRESS.md、总表和 git log。评审期间主线有了新进展的，据此修正结论。
@@ -68,6 +74,7 @@ tools: Read, Grep, Glob, Bash, Write, WebSearch, WebFetch
 建议的下一步（≤3）：…
 信息缺口 / 待用户决定：…
 什么情况会改变结论：…
+细节：<notes.md 的路径>
 ```
 
 ## 交付后的讨论

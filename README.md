@@ -1,11 +1,11 @@
 # retro-skill
 
-An enhancement for `/goal` in [Claude Code](https://claude.com/claude-code) and [Codex](https://github.com/openai/codex). `/goal` keeps the agent working until a condition is met; retro organizes that long run. The main agent only decides and delegates, in an explicit main loop. Subagents execute and report observations and ideas. A hook reminds the main agent of hourly checkpoints, watches slots and subagents, and schedules a background route review or idea scout every hour. Verification is kept proportional to what it protects. A separate session can answer progress questions without disturbing the run.
+An enhancement for `/goal` in [Claude Code](https://claude.com/claude-code) and [Codex](https://github.com/openai/codex). `/goal` keeps the agent working until a condition is met; retro organizes that long run. The main agent only decides and delegates, in an explicit main loop. Subagents execute and report observations and ideas. A hook reminds the main agent of a checkpoint at most hourly, when something came back, watches slots and subagents, and schedules a background route review or idea scout every hour. Verification is kept proportional to what it protects. A separate session can answer progress questions without disturbing the run.
 
 `/goal` 的增强插件。`/goal` 负责一直干到完成；retro 负责把这段长时间的工作组织好：
 - 主 agent 只决策和调度，按固定的主循环转，上下文留给方向；
 - 执行子代理干活，回报结果、观察和想法；
-- hook 每小时提醒一次检查点，盯着名额和子代理，每小时在后台安排一次路线评审或全局侦察；
+- hook 在有新结果时最多每小时提醒一次检查点，盯着名额和子代理，每小时在后台安排一次路线评审或全局侦察；
 - 验证和它保护的东西相称，不在验证上空耗；
 - 可以另开一个会话随时看进度，不打扰主 agent。
 
@@ -29,7 +29,7 @@ retro 只在会话有活跃的 `/goal` 时生效，目标结束就自动停。
 
 | 提醒 | 什么时候 | 重复 |
 |---|---|---|
-| 检查点到期 | 距上次检查点（`retro.mjs done`）或目标开始满 60 分钟 | 没做之前每 10 分钟一次；一轮结束时也拦一次 |
+| 检查点到期 | 距上次检查点（`retro.mjs done`）或目标开始满 60 分钟，并且这期间有新结果 | 没做之前每 10 分钟一次；一轮结束时也拦一次 |
 | 后台评审登记 | 目标开始时一次侦察；之后每小时一次，距上次侦察满 4 小时或想法池少于 3 条时侦察，否则路线评审；`retro.mjs request` 可以提前要 | 没启动就每 10 分钟提醒，一轮结束时也拦一次；20 分钟后作废 |
 | 停滞 | 到了每小时那一轮，而过去一小时没有任何新结果 | 代替那一轮评审 |
 | 记下名额 | 目标开始 10 分钟还没运行 `retro.mjs slots` | 每 10 分钟一次 |
@@ -80,10 +80,11 @@ node retro-skill/install.mjs
 - **retro skill**（`skills/retro/SKILL.md`）：主 agent 的规则：角色和用户输入、主循环和检查点、委派和回报、验证、路线评审、想法池和积压、迭代速度、等待授权、文件格式。
 - **执行模板**（`skills/retro/templates/executor.md`）：执行子代理怎么做、怎么验证、什么时候回报、回报格式。
 - **后台子代理**（思考强度 `xhigh`，只在 `.retro/probes/` 下做轻量探测，交付时由脚本核对这一轮仍然有效）：
+  - 报告之外，细节写在 `.retro/probes/` 下，报告最后一行给出路径。
   - `route-reviewer`：对照想法池给出结论：保持、调整优先级、先探测、换路线，默认保持；也看名额流动、迭代速度和验证占的时间。限 20 分钟。
   - `idea-scout`：从差距分解、假设审计、外部经验、换个问法、从零开始、复查死路六个角度找想法，只提不拍板。限 40 分钟。
 - **提醒 hook**（`scripts/retro-nudge.mjs`）：注册 PostToolUse、Stop、SubagentStop、SessionStart（只在压缩后）。从会话记录判断有没有活跃的 `/goal`（Codex 以目标数据库 `~/.codex/goals_1.sqlite` 为准），追踪子代理，检测 `/goal` 被替换或误用 `/goal resume`。
-- **辅助脚本**（`scripts/retro.mjs`）：`done` 标记检查点完成；`inbox` 列出上次检查点以来的回报；`slots` 记下名额；`request review|scout` 提前要一次后台评审；`status` 进度快照；`tell` 进度台转达用户的话；`spawned`、`finish`、`abort` 给后台子代理用。
+- **辅助脚本**（`scripts/retro.mjs`）：`done` 标记检查点完成；`inbox` 列出上次检查点以来的回报（后台子代理用 `--since-last review|scout` 看上一轮以来的）；`slots` 记下名额；`request review|scout` 提前要一次后台评审；`status` 进度快照；`tell` 进度台转达用户的话；`spawned`、`finish`、`abort` 给后台子代理用。
 - **进度台 skill**（`skills/retro-status`）：在另一个会话里只读地回答“现在进度怎样”，把用户的指令转给主 agent。
 
 ## Claude Code 和 Codex
@@ -109,6 +110,7 @@ node retro-skill/install.mjs
 | `.retro/results.tsv` | 评测脚本 | 影响决策的数字，一次评测一行 |
 | `.retro/tasks/<任务>/` | 执行子代理 | `report.md`、`notes.md`、原始数据 |
 | `.retro/route-review.md`、`reviews/`、`tasks/scout-*/` | 后台子代理，经由脚本写入 | 评审和侦察报告 |
+| `.retro/probes/` | 后台子代理 | 探测脚本，评审和侦察的细节 |
 | `.retro/` 里的其他文件 | hook 和脚本 | 状态和事件日志，不要手改 |
 
 `.retro/` 不进 git，所有分支和 worktree 共用一份。hook 新建 `.retro/` 时放一个忽略全部内容的 `.gitignore`；已有的 `.retro/` 没有 `.gitignore` 时，只忽略脚本和代理生成的文件。每个会话的提醒记录和子代理追踪放在系统临时目录（`claude-retro-<会话>.*`）。
@@ -133,7 +135,7 @@ node retro-skill/install.mjs
 
 ## 设计取舍
 
-- **检查点只按时间触发**：主 agent 只调度时，回报数和调用次数都不反映该不该整理。按调用次数触发在 Codex 里尤其不准，试运行里 6 分钟就触发了。
+- **检查点按时间触发，没有新结果就不触发**：主 agent 只调度时，回报数和调用次数都不反映该不该整理，按调用次数触发在 Codex 试运行里 6 分钟就触发了。没有新结果时没东西可整理，名额空着和停滞另有提醒。
 - **检查点不改路线**：换路线交给后台的路线评审，并且要满足门槛，以免频繁换路线。
 - **检查点用 `retro.mjs done` 显式标记**：旧版把任何一次写 PROGRESS.md 都算完成，实测一天写了 58 次，提醒从来触发不了。
 - **提醒按种类限频**：同一种最多 10 分钟一次。只有到期的检查点和没启动的评审在一轮结束时还会拦一次；名额空着之类的不拦，否则主 agent 有意少开名额时每一轮都会被拦。

@@ -26,8 +26,9 @@ tools: Read, Grep, Glob, Bash, Write, WebSearch, WebFetch
 ## 先读
 
 - PROGRESS.md：目标、用户指令、路线、下一步。
+- 项目的 AGENTS.md：所有代理都要遵守的规则，用户的项目级指令也在这里。
 - `.retro/ideas.md`：已有的想法和死路。已有的不要重复提，死路要复查（第 6 个角度）。
-- `inbox` 命令的输出，总表和失败记录，`git log -20 --stat`。
+- `inbox --since-last scout` 的输出（上次侦察以来的回报），总表和失败记录，`git log -20 --stat`。
 - 需要时读代码和手册（RUNBOOK.md 及其索引的子文件）。
 
 ## 从六个角度找
@@ -46,6 +47,10 @@ tools: Read, Grep, Glob, Bash, Write, WebSearch, WebFetch
 - 只能写 `.retro/probes/` 下的文件。
 - 不改主线的任何文件，不写 PROGRESS.md 和 ideas.md。不碰正在跑的评测依赖的文件，不装软件，不改配置，不跑重负载，不抢别人在用的 GPU、CPU 或实例。
 
+## 记细节
+
+边做边把细节写进 `spawned` 输出里给的文件：证据和出处（文件、行、命令、链接），算出来的数字，探测的命令和结果，考虑过又放弃的想法和理由，没解决的疑问。报告只写想法和关键证据，细节都放这里。
+
 ## 交付
 
 把报告写进 `.retro/probes/` 下的一个文件，然后运行 `finish <开始时间> <文件>`。退出码是 3 就等几秒重试。退出码是 2，说明这一轮已作废：什么都不写，直接结束。成功后把同样的内容回复给主 agent，然后保持可以被追问。
@@ -60,6 +65,7 @@ tools: Read, Grep, Glob, Bash, Write, WebSearch, WebFetch
 复查死路：查了 N 条；重提的见想法第几条；标了可疑但仍不成立的：…（证据）
 知识缺口：问题 — 答案会怎样改变优先级 — 最便宜的查法
 最危险的假设：… — 怎么检验
+细节：<notes.md 的路径>
 ```
 
 ## 交付后的讨论

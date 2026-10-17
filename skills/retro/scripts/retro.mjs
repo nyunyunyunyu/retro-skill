@@ -3,8 +3,10 @@
 // project is CLAUDE_PROJECT_DIR, else the nearest directory up from here holding .retro/, else the current directory;
 // inside a git worktree, the same place in the main checkout (so worktrees share one .retro/). Exit codes: 2 = slot
 // voided/replaced, 3 = busy.
-//   done                   mark a checkpoint finished (stops its reminders until the next one is due, 60 min later)
-//   inbox                  what came back since the last checkpoint: task reports, the latest review, ledger rows
+//   done                   mark a checkpoint finished; the next is due 60 min later, once something came back. Its
+//                          window starts where this checkpoint's inbox looked, so reports landing meanwhile count next time
+//   inbox [--since-last review|scout]   what came back since the last checkpoint (or since the previous route
+//                          review / scout started, for the background agents): task reports, the latest review, ledger rows
 //   slots <n> [why]        the main agent records its executor slots for the goal; the hook checks for idle ones
 //   request review|scout   ask for a background review/scout now; the hook reserves it at the next tool call
 //   spawned <start>        a review/scout subagent marks itself started and learns its deadline
@@ -32,7 +34,7 @@ const fail = (msg, code = 1) => { console.log(msg); process.exit(code); };
 const busy = () => fail('状态文件被其他进程占用：等几秒后重试同一条命令。', EXIT_BUSY);
 
 const commands = { done, inbox, slots, request, spawned, finish, abort, status, tell, root: () => console.log(root) };
-if (!commands[cmd]) fail('用法：node retro.mjs <done|inbox|slots <N> <理由>|request review|scout|spawned <start>|finish <start> <file>|abort <start>|status|tell <话>> [--root <项目>]');
+if (!commands[cmd]) fail('用法：node retro.mjs <done|inbox [--since-last review|scout]|slots <N> <理由>|request review|scout|spawned <start>|finish <start> <file>|abort <start>|status|tell <话>> [--root <项目>]');
 commands[cmd]();
 
 // Same mapping as the hook: a worktree path stands for the same place in the main checkout.
@@ -48,11 +50,12 @@ function findRoot(arg) {
 
 function done() {
   ensureDir(root);
-  fs.writeFileSync(path.join(dir(root), 'retro-done'), iso(now) + '\n');
+  const looked = Date.parse(read(path.join(dir(root), 'inbox-at')).trim()) || 0;
+  fs.writeFileSync(path.join(dir(root), 'retro-done'), iso(looked > lastRetro(root) ? Math.min(looked, now) : now) + '\n');
   log(root, '', 'checkpoint-done', '');
   const size = mtime(path.join(root, 'PROGRESS.md')) ? fs.statSync(path.join(root, 'PROGRESS.md')).size : 0;
   const open = openIdeas(root);
-  const out = [`已记录检查点（${clock(now)}）。下一个在 60 分钟后。`];
+  const out = [`已记录检查点（${clock(now)}）。下一个最早在 60 分钟后，期间有新结果才会提醒。`];
   if (!size) out.push(`${root} 下还没有 PROGRESS.md。`);
   else if (size > C.PROGRESS_MAX) out.push(`PROGRESS.md 有 ${(size / 1024).toFixed(1)} KB，超过 4 KB，请压缩。`);
   out.push(open === null ? '还没有想法池 .retro/ideas.md。' : `想法池里未验证的想法 ${open} 条${open < C.OPEN_IDEAS_MIN ? '，偏少' : ''}。`);
@@ -61,8 +64,18 @@ function done() {
 
 function inbox() {
   // Since the last checkpoint, or since the goal of the session running it (the most recently active one) started.
-  const R = Math.max(lastRetro(root), Date.parse(sessions(root)[0]?.goal_start) || 0);
-  console.log(`# 上次检查点以来交回的内容（上次检查点：${ago(lastRetro(root))}）`);
+  // A background agent asks for everything since its previous round, which the last checkpoint may have cut short.
+  const review = path.join(dir(root), 'route-review.md');
+  const si = rest.indexOf('--since-last'), kind = si >= 0 ? rest[si + 1] : null;
+  if (si >= 0 && kind !== 'review' && kind !== 'scout') fail('用法：inbox [--since-last review|scout]');
+  // From when the previous round started, since it read its inbox then.
+  const scoutStart = r => Date.parse(r.task.slice(6).replace(/^(\d{4})(\d\d)(\d\d)T(\d\d)(\d\d)$/, '$1-$2-$3T$4:$5:00Z')) || r.mtime;
+  const from = kind === 'review' ? Date.parse(read(review).match(/<!-- route-review start=(\S+)/)?.[1]) || mtime(review)
+    : kind === 'scout' ? Math.max(0, ...reports(root).filter(r => r.scout).map(scoutStart))
+    : lastRetro(root);
+  const R = Math.max(from, Date.parse(sessions(root)[0]?.goal_start) || 0);
+  if (!kind) { ensureDir(root); fs.writeFileSync(path.join(dir(root), 'inbox-at'), iso(now) + '\n'); }
+  console.log(`# ${{ review: '上次路线评审', scout: '上次侦察' }[kind] || '上次检查点'}以来交回的内容（从 ${ago(R)} 起）`);
   // The newest reports that fit, printed oldest first.
   const list = reports(root).filter(r => r.mtime > R);
   const shown = [];
@@ -75,7 +88,6 @@ function inbox() {
   }
   for (const { r, body } of shown) console.log(`\n## ${r.scout ? '侦察' : '任务'} ${r.task}（${clock(r.mtime)}）\n${body}`);
   if (list.length > shown.length) console.log(`\n（更早的 ${list.length - shown.length} 份回报超出长度没有列出，需要时直接读 .retro/tasks/*/report.md）`);
-  const review = path.join(dir(root), 'route-review.md');
   if (mtime(review) > R) console.log(`\n## 路线评审（${clock(mtime(review))}）\n${clip(read(review), 2000)}`);
   for (const f of [path.join(dir(root), 'results.tsv'), path.join(root, 'results.tsv')]) {
     if (mtime(f) <= R) continue;
@@ -119,12 +131,14 @@ function spawned() {
     if (s.state !== 'running' || s.kv.start !== start) return 'gone';
     const at = s.spawned ? s.spawnedAt : now;
     if (!s.spawned) writeSlot(root, { ...s.kv, spawned: iso(now) });
-    return at + limitOf(s.type);
+    return { end: at + limitOf(s.type), type: s.type };
   }, 50);
   if (r === 'gone') fail('这一轮已作废、已完成或不是这个开始时间：不要继续，也不要写任何文件，直接结束。', EXIT_GONE);
   if (r === undefined) busy();
   log(root, '', 'spawned', start);
-  console.log(`已标记启动。限时到 ${clock(r)}（${iso(r)}），超过就会作废。`);
+  const notes = path.join(dir(root), 'probes', `${r.type}-${start.replace(/[-:]/g, '').slice(0, 13)}`, 'notes.md');
+  fs.mkdirSync(path.dirname(notes), { recursive: true });
+  console.log(`已标记启动。限时到 ${clock(r.end)}（${iso(r.end)}），超过就会作废。细节边做边写进 ${notes.replace(/\\/g, '/')}。`);
 }
 
 function finish() {

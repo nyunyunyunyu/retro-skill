@@ -6,8 +6,9 @@
 //
 // It speaks to the main agent at its tool calls and at a Stop (blocking it once per stretch of tool calls). At tool
 // calls each kind of message is said at most once per 10 minutes, or once, recorded in <tmp>/claude-retro-<session>.said:
-// - Checkpoint: due 60 min after max(goal start, last `retro.mjs done`), repeated until marked done. Time is the only
-//   trigger: the main agent handles each report as it arrives, so counting calls or results adds nothing.
+// - Checkpoint: due 60 min after max(goal start, last `retro.mjs done`) once something came back since (a task report,
+//   a ledger row, a commit, a subagent stop), repeated until marked done. Calls and result counts never trigger it;
+//   with nothing new, the stall and idle-slot notes speak instead.
 // - Subagent tracker: each subagent tool call touches <tmp>/claude-retro-<session>.agents/<agent>.json and SubagentStop
 //   marks it stopped. From that: slots left idle (against the count set with `retro.mjs slots`), a segment past an
 //   hour, a subagent silent for 20 min.
@@ -248,6 +249,8 @@ function harness() {
 function checkpoint() {
   const R = Math.max(goal.start, lastRetro(root));
   const due = R + C.CHECKPOINT_EVERY;
+  // Only once something came back since the last one: with nothing to sort, the stall and idle-slot notes speak instead.
+  if (now < due || newestResult(root, trackedAgents(input.session_id).map(a => a.stopAt).filter(Boolean)) <= R) return;
   const first = !(saidMap().checkpoint >= due);
   if (!timely('checkpoint', due, true)) return;
   const mins = Math.round((now - R) / 60e3);

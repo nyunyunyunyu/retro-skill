@@ -50,7 +50,9 @@ function setup(name, { goalAgo = 5, cond = 'tests pass', extra = [], sid: sidArg
   const sub = (id, o = {}) => hook({ agent_id: id, agent_type: 'general-purpose', ...o });
   const agentFile = (id, ext = 'json') => path.join(tmp, `claude-retro-${sid}.agents`, `${id}.${ext}`);
   const setTime = (f, mins) => { const t = (Date.now() - mins * MIN) / 1000; fs.utimesSync(f, t, t); };
-  return { proj, tmp, sid, transcript, hook, hookAsync, cli, text, retro, slot, addTranscript, state, age, sub, agentFile, setTime, env };
+  // A new row in the project's ledger: something came back.
+  const fresh = () => fs.appendFileSync(path.join(proj, 'results.tsv'), 'row\n');
+  return { proj, tmp, sid, transcript, hook, hookAsync, cli, text, retro, slot, addTranscript, state, age, sub, agentFile, setTime, fresh, env };
 }
 const goalLine = (cond, t, extra = {}) => ({ type: 'attachment', timestamp: new Date(t).toISOString(), attachment: { type: 'goal_status', met: false, sentinel: true, condition: cond, ...extra } });
 const iso = t => new Date(t).toISOString();
@@ -95,8 +97,10 @@ await test('unlaunched reservation: reminded 10 min later, not on every call; la
   assert.doesNotMatch(t.text(t.hook()), /还没有启动/);
 });
 
-await test('checkpoint: due at 60 min, repeated every 10 min until done; calls and results never trigger it', () => {
+await test('checkpoint: due at 60 min once something came back, repeated every 10 min until done; calls alone never trigger it', () => {
   const t = setup('time', { goalAgo: 61 });
+  assert.doesNotMatch(t.text(t.hook()), /检查点到期/); // nothing came back yet
+  t.fresh();
   assert.match(t.text(t.hook()), /检查点到期（距上次检查点或目标开始 61 分钟/);
   assert.doesNotMatch(t.text(t.hook()), /检查点到期/);
   t.age(11);
@@ -115,6 +119,8 @@ await test('checkpoint: due at 60 min, repeated every 10 min until done; calls a
 await test('Stop blocks while due, again only after a tool call; stop_hook_active (always true under /goal) is ignored', () => {
   const t = setup('stop', { goalAgo: 61 });
   t.hook(); t.cli('spawned', t.slot().start); t.cli('slots', '2', 'x');
+  assert.doesNotMatch(t.text(t.hook({ hook_event_name: 'Stop', stop_hook_active: true })), /检查点到期/); // nothing came back yet
+  t.fresh();
   const r = t.hook({ hook_event_name: 'Stop', stop_hook_active: true });
   assert.equal(r.decision, 'block'); assert.match(r.reason, /检查点到期/);
   assert.equal(t.hook({ hook_event_name: 'Stop', stop_hook_active: true }), null); // no tool call since: no loop
@@ -348,6 +354,7 @@ await test('scout finish goes to tasks/scout-*/report.md', () => {
 
 await test('parallel calls: exactly one checkpoint reminder and one reservation', async () => {
   const t = setup('parallel', { goalAgo: 61 });
+  t.fresh();
   const rs = await Promise.all(Array.from({ length: 10 }, () => t.hookAsync()));
   assert.equal(rs.filter(r => /检查点到期/.test(t.text(r))).length, 1);
   assert.equal(rs.filter(r => /已为你登记/.test(t.text(r))).length, 1);
@@ -387,6 +394,7 @@ await test('Codex goal events: active with createdAt as start, paused = inactive
   const created = Math.floor((Date.now() - 61 * MIN) / 1000);
   const ev = status => ({ timestamp: iso(Date.now()), type: 'event_msg', payload: { type: 'thread_goal_updated', goal: { objective: 'codex goal', status, createdAt: created } } });
   const t = setup('codex', { goalAgo: null, extra: [ev('active')] });
+  t.fresh();
   assert.match(t.text(t.hook()), /检查点到期（距上次检查点或目标开始 61 分钟/);
   t.addTranscript(ev('paused'));
   assert.equal(t.hook(), null);
@@ -397,6 +405,7 @@ await test('Codex goal events: active with createdAt as start, paused = inactive
 
 await test('PROGRESS.md over 4 KB is flagged in the retro nudge and by done', () => {
   const t = setup('big', { goalAgo: 61 });
+  t.fresh();
   fs.writeFileSync(path.join(t.proj, 'PROGRESS.md'), 'x'.repeat(5000));
   assert.match(t.text(t.hook()), /超过 4 KB/);
   assert.match(t.cli('done').stdout, /超过 4 KB/);
@@ -498,6 +507,53 @@ await test('a generated-files .gitignore picks up new names; a project-owned one
   fs.writeFileSync(t.retro('.gitignore'), 'slot\nmy-notes/\n');
   t.hook();
   assert.equal(fs.readFileSync(t.retro('.gitignore'), 'utf8'), 'slot\nmy-notes/\n');
+});
+
+await test('inbox --since-last review|scout: a background agent sees everything since its previous round', () => {
+  const t = setup('inboxsince', { goalAgo: 120 });
+  t.hook();
+  const rep = (name, mins) => {
+    fs.mkdirSync(t.retro(`tasks/${name}`), { recursive: true });
+    fs.writeFileSync(t.retro(`tasks/${name}/report.md`), `结果：${name}`);
+    t.setTime(t.retro(`tasks/${name}/report.md`), mins);
+  };
+  const stamp = mins => iso(Date.now() - mins * MIN).replace(/[-:]/g, '').slice(0, 13);
+  // minutes ago: old task 90; previous review started 70, handed in 60; a task during it 65; scout started 58, handed in 45; mid 50
+  rep('old', 90); rep('during', 65); rep(`scout-${stamp(58)}`, 45); rep('mid', 50);
+  fs.writeFileSync(t.retro('route-review.md'), `<!-- route-review start=${iso(Date.now() - 70 * MIN)} end=x -->\n# 路线评审\n`);
+  t.setTime(t.retro('route-review.md'), 60);
+  t.cli('inbox'); t.cli('done'); // a checkpoint just now leaves the plain inbox empty
+  assert.doesNotMatch(t.cli('inbox').stdout, /结果：mid/);
+  const r = t.cli('inbox', '--since-last', 'review').stdout;
+  assert.match(r, /上次路线评审以来/);
+  for (const name of ['during', 'mid', 'scout-']) assert.match(r, new RegExp('结果：' + name));
+  assert.doesNotMatch(r, /结果：old/);
+  const s = t.cli('inbox', '--since-last', 'scout').stdout;
+  assert.match(s, /结果：mid/); assert.doesNotMatch(s, /结果：during/); assert.doesNotMatch(s, /结果：old/);
+  assert.notEqual(t.cli('inbox', '--since-last', 'x').status, 0);
+  // no review yet: from the goal start
+  const u = setup('inboxsince0', { goalAgo: 30 });
+  u.hook();
+  fs.mkdirSync(u.retro('tasks/a'), { recursive: true }); fs.writeFileSync(u.retro('tasks/a/report.md'), '结果：a');
+  assert.match(u.cli('inbox', '--since-last', 'review').stdout, /结果：a/);
+});
+
+await test('a report landing between the checkpoint\'s inbox and done counts next time', () => {
+  const t = setup('gap', { goalAgo: 61 });
+  t.fresh(); t.hook();
+  t.cli('inbox');
+  fs.writeFileSync(t.retro('inbox-at'), iso(Date.now() - 5 * MIN) + '\n'); // inbox ran 5 min ago
+  fs.mkdirSync(t.retro('tasks/late'), { recursive: true }); fs.writeFileSync(t.retro('tasks/late/report.md'), '结果：late');
+  t.setTime(t.retro('tasks/late/report.md'), 2);
+  t.cli('done');
+  assert.match(t.cli('inbox').stdout, /结果：late/);
+});
+
+await test('a subagent handing back counts as something new for the checkpoint', () => {
+  const t = setup('subdone', { goalAgo: 61 });
+  assert.doesNotMatch(t.text(t.hook()), /检查点到期/);
+  t.sub('a1'); t.hook({ hook_event_name: 'SubagentStop', agent_id: 'a1', agent_type: 'general-purpose' });
+  assert.match(t.text(t.hook()), /检查点到期/);
 });
 
 await test('inbox starts from the goal start and caps its size', () => {
@@ -659,6 +715,7 @@ await test('Codex: the goal database overrules the rollout (completed or cleared
   const { DatabaseSync } = await import('node:sqlite');
   const created = Math.floor((Date.now() - 61 * MIN) / 1000);
   const t = setup('codexdb', { goalAgo: null, extra: [codexMeta('sess-codexdb'), codexGoal('codex goal', created)] });
+  t.fresh();
   const home = t.env.CODEX_HOME;
   fs.mkdirSync(home, { recursive: true });
   const db = new DatabaseSync(path.join(home, 'goals_1.sqlite'));

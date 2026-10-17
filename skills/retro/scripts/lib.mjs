@@ -1,7 +1,9 @@
 // Shared by the hook (retro-nudge.mjs) and the helper CLI (retro.mjs). All project state lives in <root>/.retro/:
 //   slot             one line, the background slot (route review or idea scout), "key=value ..." — see readSlot
 //   slots            the executor slots the main agent chose for its goal (`retro.mjs slots`), JSON {n, at, why}
-//   retro-done       ISO time of the last finished checkpoint, written by `retro.mjs done`
+//   retro-done       ISO time the last finished checkpoint's window ends, written by `retro.mjs done`
+//   inbox-at         when the main agent last ran `retro.mjs inbox`
+//   probes/          background agents' probe scripts and the notes behind their reports
 //   log.tsv          append-only event log (time, session, event, detail), for the progress desk and later analysis
 //   sessions/<id>.json   sessions that hold an active /goal here, for the progress desk
 //   tasks/<task>/report.md   executor reports; ideas.md, backlog.md, results.tsv, route-review.md, reviews/ are written by agents
@@ -55,7 +57,7 @@ export const mtime = f => { try { return fs.statSync(f).mtimeMs; } catch { retur
 export const read = f => { try { return fs.readFileSync(f, 'utf8'); } catch { return ''; } };
 
 // Files the scripts and agents generate; kept out of git so worktrees don't carry stale copies.
-const GENERATED = ['slot', 'slot.lock', 'slots', 'retro-done', 'log.tsv', 'sessions/', 'tasks/', 'reviews/', 'probes/', 'ideas.md', 'backlog.md', 'results.tsv', 'route-review.md', 'user-inbox.jsonl', 'user-said.md'];
+const GENERATED = ['slot', 'slot.lock', 'slots', 'retro-done', 'inbox-at', 'log.tsv', 'sessions/', 'tasks/', 'reviews/', 'probes/', 'ideas.md', 'backlog.md', 'results.tsv', 'route-review.md', 'user-inbox.jsonl', 'user-said.md'];
 // A new .retro/ ignores everything. An existing one (some projects commit parts of it) gets a .gitignore for the
 // generated files only, unless it already has one. A list we wrote earlier picks up names added since.
 export function ensureDir(root) {
