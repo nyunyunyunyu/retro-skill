@@ -60,6 +60,7 @@ const goal = goalState(input.transcript_path, base + '.goal');
 if (!goal.active || goal.child) process.exit(0);
 
 const root = mainCheckout(process.env.CLAUDE_PROJECT_DIR || input.cwd || process.cwd());
+if (read(base + '.root') !== root) try { fs.writeFileSync(base + '.root', root); } catch {}
 const CLI = fileURLToPath(new URL('./retro.mjs', import.meta.url)).replace(/\\/g, '/');
 const SKILL = fileURLToPath(new URL('../SKILL.md', import.meta.url)).replace(/\\/g, '/');
 const cmd = sub => `\`node "${CLI}" ${sub} --root "${root.replace(/\\/g, '/')}"\``;
@@ -139,13 +140,23 @@ function track() {
   const f = path.join(d, `${id}.json`), stop = path.join(d, `${id}.stop`);
   const header = () => JSON.stringify({ type, seg: now, tp: input.agent_transcript_path || input.transcript_path });
   fs.mkdirSync(d, { recursive: true });
+  // The main session's project: a subagent's cwd may be a worktree, a subfolder or a fresh clone.
+  const where = () => read(base + '.root') || mainCheckout(process.env.CLAUDE_PROJECT_DIR || input.cwd || process.cwd());
   if (event === 'SubagentStop') {
     if (!fs.existsSync(f)) fs.writeFileSync(f, header());
+    if (!fs.existsSync(stop)) log(where(), sid, 'agent-stop', id);
     fs.writeFileSync(stop, '');
   } else if (fs.existsSync(stop) || !fs.existsSync(f)) {
-    // Its first tool call, or the first since it stopped (a follow-up): a new segment starts.
-    fs.writeFileSync(f, header());
-    try { fs.unlinkSync(stop); } catch {}
+    // Its first tool call, or the first since it stopped (a follow-up): a new segment starts. Parallel calls race here;
+    // only the one that creates the file or removes the stop marker logs the start.
+    let mine = false;
+    if (fs.existsSync(stop)) {
+      fs.writeFileSync(f, header());
+      try { fs.unlinkSync(stop); mine = true; } catch {}
+    } else {
+      try { fs.writeFileSync(f, header(), { flag: 'wx' }); mine = true; } catch {}
+    }
+    if (mine) log(where(), sid, 'agent-start', `${id} ${type}`);
   } else {
     fs.utimesSync(f, new Date(now), new Date(now));
   }
@@ -255,7 +266,7 @@ function checkpoint() {
   if (!timely('checkpoint', due, true)) return;
   const mins = Math.round((now - R) / 60e3);
   if (first) log(root, sid, 'checkpoint-due', `${mins}min`);
-  let text = `检查点到期（距上次检查点或目标开始 ${mins} 分钟）。做完手头这一步后，按 retro skill（${SKILL}）第 2 节做检查点：先运行 ${cmd('inbox')}，最后运行 ${cmd('done')}。没做之前每 10 分钟提醒一次。`;
+  let text = `检查点到期（距上次检查点或目标开始 ${mins} 分钟）。做完手头这一步后，按 retro skill（${SKILL}）第 2 节做检查点：先运行 ${cmd('inbox')}，最后运行 ${cmd('done "抽查 <任务>：一致"')}（对不上就写“不一致：<哪里>”）。没做之前每 10 分钟提醒一次。`;
   const size = fs.existsSync(path.join(root, 'PROGRESS.md')) ? fs.statSync(path.join(root, 'PROGRESS.md')).size : 0;
   if (size > C.PROGRESS_MAX) text += ` PROGRESS.md 现在 ${(size / 1024).toFixed(1)} KB，超过 4 KB：这次先压缩它（命令和环境移到手册，过程细节移到任务笔记）。`;
   notes.push(text);

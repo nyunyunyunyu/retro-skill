@@ -13,6 +13,7 @@
 //   finish <start> <file>  a review/scout subagent hands in its report (file, or - for stdin)
 //   abort <start>          the main agent couldn't start the subagent; frees the slot
 //   status                 progress digest for the progress desk (read-only)
+//   metrics [--since <ISO>]   process metrics since the goal started, for analysis after a run (read-only)
 //   tell <text>            the progress desk passes on what the user said; delivered at the main agent's next tool call
 import fs from 'node:fs';
 import path from 'node:path';
@@ -33,8 +34,8 @@ const ago = t => (t ? `${clock(t)}（${Math.max(0, Math.round((now - t) / 60e3))
 const fail = (msg, code = 1) => { console.log(msg); process.exit(code); };
 const busy = () => fail('状态文件被其他进程占用：等几秒后重试同一条命令。', EXIT_BUSY);
 
-const commands = { done, inbox, slots, request, spawned, finish, abort, status, tell, root: () => console.log(root) };
-if (!commands[cmd]) fail('用法：node retro.mjs <done|inbox [--since-last review|scout]|slots <N> <理由>|request review|scout|spawned <start>|finish <start> <file>|abort <start>|status|tell <话>> [--root <项目>]');
+const commands = { done, inbox, slots, request, spawned, finish, abort, status, metrics, tell, root: () => console.log(root) };
+if (!commands[cmd]) fail('用法：node retro.mjs <done|inbox [--since-last review|scout]|slots <N> <理由>|request review|scout|spawned <start>|finish <start> <file>|abort <start>|status|metrics [--since <ISO>]|tell <话>> [--root <项目>]');
 commands[cmd]();
 
 // Same mapping as the hook: a worktree path stands for the same place in the main checkout.
@@ -52,10 +53,12 @@ function done() {
   ensureDir(root);
   const looked = Date.parse(read(path.join(dir(root), 'inbox-at')).trim()) || 0;
   fs.writeFileSync(path.join(dir(root), 'retro-done'), iso(looked > lastRetro(root) ? Math.min(looked, now) : now) + '\n');
-  log(root, '', 'checkpoint-done', '');
+  log(root, '', 'checkpoint-done', rest.join(' ').trim());
+  log(root, '', 'snapshot', snapshot());
   const size = mtime(path.join(root, 'PROGRESS.md')) ? fs.statSync(path.join(root, 'PROGRESS.md')).size : 0;
   const open = openIdeas(root);
   const out = [`已记录检查点（${clock(now)}）。下一个最早在 60 分钟后，期间有新结果才会提醒。`];
+  if (!/抽查/.test(rest.join(' '))) out.push('这次没有写抽查结果：下次检查点记得抽查一份回报，用 done "抽查 <任务>：一致" 记下。');
   if (!size) out.push(`${root} 下还没有 PROGRESS.md。`);
   else if (size > C.PROGRESS_MAX) out.push(`PROGRESS.md 有 ${(size / 1024).toFixed(1)} KB，超过 4 KB，请压缩。`);
   out.push(open === null ? '还没有想法池 .retro/ideas.md。' : `想法池里未验证的想法 ${open} 条${open < C.OPEN_IDEAS_MIN ? '，偏少' : ''}。`);
@@ -123,6 +126,89 @@ function request() {
   console.log(r === 'running'
     ? '已记下请求。现在有一轮后台评审/侦察在跑，它结束后，你的下一次工具调用时 hook 会登记。'
     : '已记下请求。你下一次调用工具时 hook 会登记，照提醒在后台启动。');
+}
+
+// What the idea pool, backlog and PROGRESS.md look like at a checkpoint, for metrics later (they get rewritten).
+function snapshot() {
+  const ideas = read(path.join(dir(root), 'ideas.md'));
+  const dead = (ideas.split(/^#{2,}\s*死路.*$/m)[1] || '').split(/^#{1,}\s/m)[0].split(/\r?\n/).filter(l => /^[-*]\s/.test(l));
+  const backlog = read(path.join(dir(root), 'backlog.md')).split('\n').filter(l => /^\s*[-*]\s/.test(l)).length;
+  const size = mtime(path.join(root, 'PROGRESS.md')) ? fs.statSync(path.join(root, 'PROGRESS.md')).size : 0;
+  return `想法 ${openIdeas(root) ?? 0} 死路 ${dead.length} 可疑 ${dead.filter(l => /可疑/.test(l)).length} 积压 ${backlog} PROGRESS ${(size / 1024).toFixed(1)}KB`;
+}
+
+// Process metrics since the goal started, from log.tsv, the review archive and the task reports. What needs judgment
+// (were decisions overturned, did briefs need clarifying) is left to whoever reads this.
+function metrics() {
+  // From the earliest start of this goal across its sessions; to now while it runs, else to the last event.
+  const all = sessions(root), ms = all[0];
+  const starts = all.filter(s => ms && s.goal === ms.goal).map(s => Date.parse(s.goal_start)).filter(Boolean);
+  const si = rest.indexOf('--since');
+  const since = (si >= 0 && Date.parse(rest[si + 1])) || (starts.length ? Math.min(...starts) : 0);
+  const rows = read(path.join(dir(root), 'log.tsv')).split('\n').filter(Boolean)
+    .map(l => { const [t, s, ev, d = ''] = l.split('\t'); return { t: Date.parse(t), s, ev, d }; })
+    .filter(r => r.t >= since).sort((a, b) => a.t - b.t);
+  const live = !!(ms && goalCache(ms.session_id)?.active);
+  const end = live ? now : rows.at(-1)?.t || now;
+  // Labels as agents write them: plain, bold, bulleted; full-width or ASCII colon.
+  const label = name => `\\**${name}\\**\\s*[：:]\\s*\\**\\s*`;
+  const has = (t, re) => new RegExp(re, 'm').test(t);
+  const count = ev => rows.filter(r => r.ev === ev).length;
+  const min = ms => Math.round(ms / 60e3);
+  const stats = xs => (xs.length ? `平均 ${min(xs.reduce((a, b) => a + b, 0) / xs.length)} 分钟，最长 ${min(Math.max(...xs))} 分钟` : '无数据');
+  const tally = (texts, re) => {
+    const m = {};
+    for (const t of texts) { const v = t.match(re)?.[1] || '没写'; m[v] = (m[v] || 0) + 1; }
+    return Object.entries(m).map(([k, v]) => `${k} ${v}`).join('，') || '无';
+  };
+  const out = [`# 运行指标（${since ? new Date(since).toLocaleString('zh-CN', { hour12: false }) : '日志开头'} 起，到 ${new Date(end).toLocaleString('zh-CN', { hour12: false })}${live ? '，目标还在进行' : ''}）`];
+
+  const lag = [];
+  let due = null;
+  for (const r of rows) {
+    if (r.ev === 'checkpoint-due' && due === null) due = r.t;
+    if (r.ev === 'checkpoint-done') { if (due !== null) lag.push(r.t - due); due = null; }
+  }
+  const checks = rows.filter(r => r.ev === 'checkpoint-done' && /抽查/.test(r.d));
+  out.push(`\n## 检查点\n完成 ${count('checkpoint-done')} 次；从提醒到完成 ${stats(lag)}${due !== null && live ? '；现在有一个到期还没做' : ''}。抽查 ${checks.length} 次，不一致 ${checks.filter(r => /抽查[^：:]*[：:]\s*不一致/.test(r.d)).length} 次。`);
+
+  const reserved = rows.filter(r => r.ev === 'slot-reserved');
+  const startLag = reserved.map(r => rows.find(x => x.ev === 'spawned' && x.d === r.d.split(' ')[1])?.t - r.t).filter(x => x >= 0);
+  const reviews = (() => { try { return fs.readdirSync(path.join(dir(root), 'reviews')); } catch { return []; } })()
+    .map(n => read(path.join(dir(root), 'reviews', n)))
+    .filter(t => (Date.parse(t.match(/start=(\S+)/)?.[1]) || 0) >= since);
+  out.push(`\n## 后台评审\n登记 ${reserved.length} 次（评审 ${reserved.filter(r => r.d.startsWith('review')).length}，侦察 ${reserved.filter(r => r.d.startsWith('scout')).length}，按请求 ${reserved.filter(r => /requested/.test(r.d)).length}）；启动 ${count('spawned')}，交付 ${count('finished')}，放弃 ${count('aborted')}，超时作废 ${rows.filter(r => /^slot-(timeout|unlaunched|stale)$/.test(r.ev)).length}；从登记到启动 ${stats(startLag)}。停滞 ${count('stall')} 次。`);
+  out.push(`路线评审存档 ${reviews.length} 份。结论：${tally(reviews, new RegExp(label('结论') + '(保持|调整优先级|先探测|换路线)'))}。上轮建议：${tally(reviews, new RegExp(label('上轮建议') + '(部分采纳|未采纳|采纳|未记录)'))}。判断依据有意见的 ${reviews.filter(t => has(t, label('判断依据') + '(?![（(]?无)[^\\s*]')).length} 份。`);
+
+  const segs = [];
+  for (const r of rows.filter(x => x.ev === 'agent-start')) {
+    const id = r.d.split(' ')[0];
+    const end = rows.find(x => x.t >= r.t && x !== r && x.d.split(' ')[0] === id && (x.ev === 'agent-stop' || x.ev === 'agent-start'));
+    segs.push({ id, s: r.t, e: end?.ev === 'agent-stop' ? end.t : null });
+  }
+  const done = segs.filter(g => g.e !== null);
+  const lines = [`\n## 执行子代理\n${segs.length} 段，${new Set(segs.map(g => g.id)).size} 个子代理；交回的 ${done.length} 段 ${stats(done.map(g => g.e - g.s))}${segs.length > done.length ? `；${segs.length - done.length} 段没有交回记录，不计入下面的利用率` : ''}。`];
+  const slotRows = rows.filter(r => r.ev === 'slots');
+  if (slotRows.length) {
+    const t0 = slotRows[0].t, points = [...new Set([t0, end, ...done.flatMap(g => [g.s, g.e]), ...slotRows.map(r => r.t)])].filter(t => t >= t0 && t <= end).sort((a, b) => a - b);
+    let used = 0, cap = 0;
+    for (let i = 0; i + 1 < points.length; i++) {
+      const a = points[i], span = points[i + 1] - a;
+      const n = Number(slotRows.filter(r => r.t <= a).at(-1).d.split(' ')[0]) || 0;
+      used += span * done.filter(g => g.s <= a && g.e > a).length;
+      cap += span * n;
+    }
+    lines.push(`名额利用率（交回的段在跑的时间 ÷ 名额 × 时间）：${cap ? Math.round(100 * used / cap) : 0}%。`);
+  }
+  out.push(lines.join(''));
+
+  const texts = reports(root).filter(r => !r.scout && r.mtime >= since).map(r => read(r.file));
+  out.push(`\n## 任务回报\n${texts.length} 份；标“推翻前提”的 ${texts.filter(t => has(t, '(^|[：:])\\s*([-*]\\s+)?\\**推翻前提\\**\\s*[：:—-]')).length} 份；核实：一致 ${texts.filter(t => has(t, label('核实') + '一致')).length}，不一致 ${texts.filter(t => has(t, label('核实') + '不一致')).length}。`);
+
+  const snaps = rows.filter(r => r.ev === 'snapshot');
+  if (snaps.length) out.push(`\n## 想法池和积压（检查点时的快照）\n第一次：${snaps[0].d}\n最近一次：${snaps.at(-1).d}`);
+  out.push('\n## 需要判断的\n主 agent 的决定被推翻了几次、任务说明是否要反复澄清、PROGRESS.md 是否和实际一致：派一个子代理读这份输出、.retro/reviews/、任务回报和 git log 来判断。');
+  console.log(out.join('\n'));
 }
 
 function spawned() {

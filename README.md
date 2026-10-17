@@ -84,7 +84,7 @@ node retro-skill/install.mjs
   - `route-reviewer`：对照想法池给出结论：保持、调整优先级、先探测、换路线，默认保持；也看名额流动、迭代速度和验证占的时间。限 20 分钟。
   - `idea-scout`：从差距分解、假设审计、外部经验、换个问法、从零开始、复查死路六个角度找想法，只提不拍板。限 40 分钟。
 - **提醒 hook**（`scripts/retro-nudge.mjs`）：注册 PostToolUse、Stop、SubagentStop、SessionStart（只在压缩后）。从会话记录判断有没有活跃的 `/goal`（Codex 以目标数据库 `~/.codex/goals_1.sqlite` 为准），追踪子代理，检测 `/goal` 被替换或误用 `/goal resume`。
-- **辅助脚本**（`scripts/retro.mjs`）：`done` 标记检查点完成；`inbox` 列出上次检查点以来的回报（后台子代理用 `--since-last review|scout` 看上一轮以来的）；`slots` 记下名额；`request review|scout` 提前要一次后台评审；`status` 进度快照；`tell` 进度台转达用户的话；`spawned`、`finish`、`abort` 给后台子代理用。
+- **辅助脚本**（`scripts/retro.mjs`）：`done` 标记检查点完成；`inbox` 列出上次检查点以来的回报（后台子代理用 `--since-last review|scout` 看上一轮以来的）；`slots` 记下名额；`request review|scout` 提前要一次后台评审；`status` 进度快照；`metrics [--since <时间>]` 整个运行的统计，供事后分析；`tell` 进度台转达用户的话；`spawned`、`finish`、`abort` 给后台子代理用。
 - **进度台 skill**（`skills/retro-status`）：在另一个会话里只读地回答“现在进度怎样”，把用户的指令转给主 agent。
 
 ## Claude Code 和 Codex
@@ -152,6 +152,8 @@ node retro-skill/install.mjs
 - **积压单独一个文件**：后台评审每小时都读想法池，不急的问题放在一起会让它越来越长。积压在里程碑和目标达成前由子代理重评。
 - **死路写重试条件，由侦察复查**：判定死路的评测可能有 bug，失败也可能只是当时条件不够，好想法不该永远被埋掉。
 - **后台子代理用 `xhigh` 而不是 `max`**：每小时都要跑，`xhigh` 够用，开销小得多。
+- **主 agent 先摸底再定路线，并且会被检查**：主 agent 只看摘要，最容易出问题的是第一条路线拍脑袋、凭自评的回报下结论、压缩后理解缩水。所以目标开始时先派摸底任务，PROGRESS.md 维护一行定量的差距，检查点抽查一份回报的原始证据，路线评审顺带检查主 agent 关键决定的依据。
+- **指标事后算，不放进 hook**：`retro.mjs metrics` 从事件日志、评审存档和任务回报里算检查点、后台评审、名额利用率、核实结果等。主 agent 的决定被推翻了几次、任务说明是否要反复澄清这类要理解语义的，结束后派一个子代理读这些材料判断。
 - **不做“连续失败”提醒**：grep 没匹配、diff 有差异这类正常的非零退出太多，误报会让 agent 连重要的提醒一起忽略。
 
 ## 从旧版升级

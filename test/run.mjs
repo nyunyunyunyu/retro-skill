@@ -556,6 +556,92 @@ await test('a subagent handing back counts as something new for the checkpoint',
   assert.match(t.text(t.hook()), /检查点到期/);
 });
 
+await test('done logs the spot check and a snapshot of the pool, dead ends and backlog', () => {
+  const t = setup('snapshot', { goalAgo: 61 });
+  t.hook();
+  fs.writeFileSync(t.retro('ideas.md'), '## 想法\n- [ ] a\n## 死路\n- b — 原因 — 重试条件\n- c — 原因 — 重试条件 可疑\n');
+  fs.writeFileSync(t.retro('backlog.md'), '- x — 来源 — 低 — 改一行\n');
+  t.cli('done', '抽查 t1：不一致：数字对不上');
+  const log = fs.readFileSync(t.retro('log.tsv'), 'utf8');
+  assert.match(log, /checkpoint-done\t抽查 t1：不一致：数字对不上/);
+  assert.match(log, /snapshot\t想法 1 死路 2 可疑 1 积压 1/);
+});
+
+await test('executor segments are logged when they start and stop', () => {
+  const t = setup('agentlog', { goalAgo: 5 });
+  t.hook();
+  t.sub('a1'); t.sub('a1');
+  t.hook({ hook_event_name: 'SubagentStop', agent_id: 'a1', agent_type: 'general-purpose' });
+  const log = fs.readFileSync(t.retro('log.tsv'), 'utf8');
+  assert.equal(log.match(/agent-start\ta1 general-purpose/g).length, 1);
+  assert.match(log, /agent-stop\ta1/);
+});
+
+await test('metrics: checkpoints, background reviews, executor segments, slot use, reports', () => {
+  const t = setup('metrics', { goalAgo: 120 });
+  t.hook();
+  const at = mins => iso(Date.now() - mins * MIN);
+  const row = (mins, ev, d = '') => fs.appendFileSync(t.retro('log.tsv'), `${at(mins)}\t-\t${ev}\t${d}\n`);
+  const start = at(90);
+  row(100, 'slots', '2 两个实例');
+  row(100, 'agent-start', 'a1 general-purpose'); row(100, 'agent-start', 'a2 general-purpose');
+  row(90, 'slot-reserved', `review ${start}`); row(85, 'spawned', start); row(75, 'finished', start);
+  row(70, 'agent-stop', 'a2');
+  row(60, 'checkpoint-due', '61min'); row(50, 'checkpoint-done', '抽查 a1：一致');
+  row(40, 'agent-stop', 'a1');
+  fs.mkdirSync(t.retro('reviews'), { recursive: true });
+  fs.writeFileSync(t.retro('reviews/r1.md'), `<!-- route-review start=${start} end=x -->\n结论：保持\n判断依据：无\n上轮建议：未记录\n`);
+  for (const [name, body] of [['v', '结果：核实：一致'], ['p', '结果：做了 X\n观察：推翻前提：Y 不成立']]) {
+    fs.mkdirSync(t.retro(`tasks/${name}`), { recursive: true }); fs.writeFileSync(t.retro(`tasks/${name}/report.md`), body);
+  }
+  const out = t.cli('metrics').stdout;
+  assert.match(out, /完成 1 次；从提醒到完成 平均 10 分钟/);
+  assert.match(out, /抽查 1 次，不一致 0 次/);
+  assert.match(out, /从登记到启动 平均 5 分钟/);
+  assert.match(out, /结论：保持 1/); assert.match(out, /上轮建议：未记录 1/); assert.match(out, /判断依据有意见的 0 份/);
+  assert.match(out, /2 段，2 个子代理/);
+  assert.match(out, /名额利用率.*：45%/);
+  assert.match(out, /标“推翻前提”的 1 份；核实：一致 1，不一致 0/);
+});
+
+await test('segment logging: parallel first calls log one start; follow-ups log again; a subfolder cwd logs to the main project', async () => {
+  const t = setup('agentrace', { goalAgo: 5 });
+  t.hook();
+  await Promise.all([1, 2, 3, 4].map(() => t.hookAsync({ agent_id: 'p1', agent_type: 'general-purpose' })));
+  const stopP1 = () => t.hook({ hook_event_name: 'SubagentStop', agent_id: 'p1', agent_type: 'general-purpose' });
+  stopP1(); t.sub('p1'); stopP1();
+  const sub = path.join(t.proj, 'sub');
+  fs.mkdirSync(sub, { recursive: true });
+  t.hook({ agent_id: 'c1', agent_type: 'worker', cwd: sub }, { CLAUDE_PROJECT_DIR: '' });
+  const log = fs.readFileSync(t.retro('log.tsv'), 'utf8');
+  assert.equal(log.match(/agent-start\tp1 /g).length, 2);
+  assert.equal(log.match(/agent-stop\tp1/g).length, 2);
+  assert.match(log, /agent-start\tc1 worker/);
+  assert.ok(!fs.existsSync(path.join(sub, '.retro')));
+});
+
+await test('metrics after the run: the window ends at the last event; labels in bold or bullets still count', () => {
+  const t = setup('metricsdone', { goalAgo: null });
+  const at = mins => iso(Date.now() - mins * MIN);
+  fs.mkdirSync(t.retro('sessions'), { recursive: true });
+  fs.writeFileSync(t.retro('sessions/old.json'), JSON.stringify({ session_id: 'old', transcript_path: path.join(t.proj, 'none.jsonl'), goal: 'g', goal_start: at(600) }));
+  const row = (mins, ev, d = '') => fs.appendFileSync(t.retro('log.tsv'), `${at(mins)}\t-\t${ev}\t${d}\n`);
+  row(600, 'slots', '2 x'); row(600, 'agent-start', 'a1 w'); row(600, 'agent-start', 'a2 w');
+  row(480, 'agent-stop', 'a1'); row(480, 'agent-stop', 'a2');
+  row(520, 'checkpoint-due', '61min'); row(515, 'checkpoint-done', '抽查 a1：一致，没有发现不一致');
+  fs.mkdirSync(t.retro('reviews'), { recursive: true });
+  fs.writeFileSync(t.retro('reviews/r.md'), `<!-- route-review start=${at(500)} end=x -->\n**结论**：换路线\n**判断依据**：（无）\n上轮建议: 部分采纳\n`);
+  for (const [name, body] of [['b', '观察：\n- 推翻前提：A 不成立'], ['c', '观察：推翻前提的可能性不大'], ['d', '**核实**：不一致']]) {
+    fs.mkdirSync(t.retro(`tasks/${name}`), { recursive: true }); fs.writeFileSync(t.retro(`tasks/${name}/report.md`), body);
+  }
+  const out = t.cli('metrics').stdout;
+  assert.match(out, /名额利用率.*：100%/);
+  assert.doesNotMatch(out, /目标还在进行/);
+  assert.match(out, /抽查 1 次，不一致 0 次/);
+  assert.match(out, /结论：换路线 1/); assert.match(out, /上轮建议：部分采纳 1/); assert.match(out, /判断依据有意见的 0 份/);
+  assert.match(out, /标“推翻前提”的 1 份；核实：一致 0，不一致 1/);
+});
+
 await test('inbox starts from the goal start and caps its size', () => {
   const t = setup('inbox', { goalAgo: 10 });
   t.hook();
