@@ -15,16 +15,20 @@
 //   status                 progress digest for the progress desk (read-only)
 //   metrics [--since <ISO>]   process metrics since the goal started, for analysis after a run (read-only)
 //   tell <text>            the progress desk passes on what the user said; delivered at the main agent's next tool call
+//   watch [--session <id>] runs in the background (Claude Code) and exits, waking the main agent, when an executor is
+//                          silent, stuck or past its hour (the hook then says what to do), when the goal stops, or when
+//                          nothing has run for a while. One per session; default the latest one
 //   worker start <id> [desc] [--pid <n>] [--type <t>] | beat <id> | stop <id>
 //                          a driver registers an executor another harness runs (codex-worker.mjs does this itself), so
 //                          the hook counts it in the slots and the checkpoint sees it hand back. --pid: the driver's
 //                          process; when it is gone the worker counts as stopped (without one: silent for an hour)
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
-  C, EXIT_BUSY, EXIT_GONE, agentName, dir, ensureDir, goalAgents, goalCache, harnessLimit, headOf, iso, lastRetro, lastWrite,
-  limitOf, locked, log, mainCheckout, mtime, openIdeas, read, readSlot, readSlots, reports, safe, sessions, workerBeat,
-  workerStart, workerStop, writeSlot,
+  C, EXIT_BUSY, EXIT_GONE, WATCH_TICK, activity, agentName, alive, dir, ensureDir, executorNotes, goalAgents, goalCache,
+  harnessLimit, headOf, iso, lastRetro, lastWrite, limitOf, locked, log, mainCheckout, mtime, openIdeas, read, readSlot,
+  readSlots, reports, safe, sessions, tailRecords, watchFile, workerBeat, workerStart, workerStop, writeSlot,
 } from './lib.mjs';
 
 const args = process.argv.slice(2);
@@ -39,8 +43,8 @@ const ago = t => (t ? `${clock(t)}（${Math.max(0, Math.round((now - t) / 60e3))
 const fail = (msg, code = 1) => { console.log(msg); process.exit(code); };
 const busy = () => fail('状态文件被其他进程占用：等几秒后重试同一条命令。', EXIT_BUSY);
 
-const commands = { done, inbox, slots, request, spawned, finish, abort, status, metrics, tell, worker, root: () => console.log(root) };
-if (!commands[cmd]) fail('用法：node retro.mjs <done|inbox [--since-last review|scout]|slots <N> <理由>|request review|scout|spawned <start>|finish <start> <file>|abort <start>|status|metrics [--since <ISO>]|tell <话>|worker start|beat|stop <id>> [--root <项目>]');
+const commands = { done, inbox, slots, request, spawned, finish, abort, status, metrics, tell, watch, worker, root: () => console.log(root) };
+if (!commands[cmd]) fail('用法：node retro.mjs <done|inbox [--since-last review|scout]|slots <N> <理由>|request review|scout|spawned <start>|finish <start> <file>|abort <start>|status|metrics [--since <ISO>]|tell <话>|watch [--session <id>]|worker start|beat|stop <id>> [--root <项目>]');
 commands[cmd]();
 
 // Same mapping as the hook: a worktree path stands for the same place in the main checkout.
@@ -292,6 +296,42 @@ function abort() {
   console.log('已释放这一轮。');
 }
 
+// Polls the tracker until an executor needs the main agent (lib executorNotes), then exits: Claude Code delivers a
+// background command's exit as a new turn, the one way to wake a main agent that ended its turn. It shows the main
+// agent only that the command ended, not its output, so the hook says what to do at the next tool call or Stop.
+async function watch() {
+  const si = rest.indexOf('--session'), want = si >= 0 ? rest[si + 1] : null;
+  const all = sessions(root), s = want ? all.find(x => x.session_id === want) : all[0];
+  if (!s) fail(want ? `这个项目里没有会话 ${want} 的记录。` : '没有记录到在这个项目里跑 /goal 的会话。');
+  const sid = s.session_id, file = watchFile(sid);
+  const scripts = path.dirname(fileURLToPath(import.meta.url)).replace(/\\/g, '/'), at = `--root "${root.replace(/\\/g, '/')}"`;
+  const wcmd = sub => `\`node "${scripts}/codex-worker.mjs" ${sub} ${at}\``;
+  let out, missing = 0;
+  for (;;) {
+    const t = Date.now(), holder = Number(read(file)) || 0;
+    if (holder && holder !== process.pid && alive(holder) && t - mtime(file) < 3 * WATCH_TICK) { out = `已经有一个 watch 在跑（进程 ${holder}），这个退出，不用再开。`; break; }
+    fs.writeFileSync(file, String(process.pid));
+    // The hook rewrites the cache at every main-agent event: one caught mid-write reads as null.
+    const cache = goalCache(sid);
+    if (cache && !cache.active) { out = '目标已经结束或暂停，watch 退出。'; break; }
+    missing = cache ? 0 : missing + 1;
+    if (missing > 3) { out = '读不到这个会话的目标状态，watch 退出。'; break; }
+    const { running } = cache ? goalAgents(sid, cache.start, t, root) : { running: [] };
+    const due = cache ? executorNotes(running, { now: t, sessionId: sid, root, codex: !!cache.codex, wcmd, wake: true }) : [];
+    if (due.length) {
+      try { fs.writeFileSync(file.replace(/\.watch$/, '.woke'), String(Date.now())); } catch {}
+      out = `有执行者要处理：${[...new Set(due.map(n => n.who))].join('、')}。你下一次调用工具或结束这一轮时，hook 会说明怎么做。`;
+      break;
+    }
+    // A new executor shows up only at its first tool call.
+    const launch = Number(read(file.replace(/\.watch$/, '.launch'))) || 0;
+    if (cache && !running.length && t - launch >= C.IDLE_GRACE) { out = '没有在跑的执行者了，watch 退出。下次派了任务、结束这一轮之前再开。'; break; }
+    await new Promise(r => setTimeout(r, WATCH_TICK));
+  }
+  try { if (Number(read(file)) === process.pid) fs.unlinkSync(file); } catch {}
+  console.log(out);
+}
+
 function worker() {
   const flag = name => { const i = rest.indexOf(name); if (i < 0) return null; const v = rest[i + 1]; rest.splice(i, 2); return v; };
   const pid = Number(flag('--pid')) || null, type = flag('--type') || 'external';
@@ -320,7 +360,10 @@ function status() {
   // From the hook's subagent tracker: executors of this goal, running ones first.
   const { agents, running } = goalAgents(ms.session_id || '-', start, now, root);
   const mins = t => Math.round((now - t) / 60e3);
-  const run = a => `在跑，这一段 ${mins(a.seg)} 分钟${a.cmd ? `，正在跑命令「${clip(a.cmd, 80)}」（${mins(a.cmdAt)} 分钟）` : now - a.last >= C.SILENT ? `，${mins(a.last)} 分钟没有动静` : ''}`;
+  const run = a => {
+    const { last, wait } = activity(a);
+    return `在跑，这一段 ${mins(a.seg)} 分钟${wait ? `，${a.worker ? '正在跑命令' : '在等工具调用'}「${clip(wait.name, 80)}」（${mins(wait.at)} 分钟）` : now - last >= C.SILENT ? `，${mins(last)} 分钟没有动静` : ''}${a.asks ? `，没动静被驱动追问过 ${a.asks} 次` : ''}`;
+  };
   const state = a => (running.includes(a) ? run(a) : a.active ? `${mins(a.last)} 分钟没有动静，可能已被停掉` : a.gone ? `驱动已经不在了（最后动静 ${clock(a.last)}）` : `已交回（${clock(a.stopAt)}）`) + (a.said ? `；最后说：${clip(a.said, 100)}` : '');
   if (agents.length) out.push(`执行者（外部执行者注明类型和任务名；在跑 ${running.length} 个）：${[...running, ...agents.filter(a => !running.includes(a)).sort((a, b) => b.last - a.last).slice(0, 5)].map(a => `${agentName(a)}${a.worker ? `［${a.type} ${a.id}］` : ''}（${state(a)}）`).join('；')}`);
   const s = readSlot(root);
@@ -346,7 +389,7 @@ function mainAgent(transcript) {
   if (!mtime(transcript)) return [`主会话记录找不到：${transcript}`];
   const texts = [], tools = [];
   let user = '';
-  for (const o of tail(transcript, 3e6)) {
+  for (const o of tailRecords(transcript, 3e6)) {
     const at = `[${clock(Date.parse(o.timestamp))}] `;
     if (o.type === 'response_item') { // Codex
       const p = o.payload || {};
@@ -417,7 +460,7 @@ function subagents({ transcript_path: transcript, session_id: sessionId, goal_st
   const out = [`\n## 子代理（最近活动的 ${list.length} 个）`];
   for (const { f, t, name, type, stopped } of list) {
     let last = '';
-    for (const o of tail(f, 4e5)) {
+    for (const o of tailRecords(f, 4e5)) {
       const c = o.type === 'assistant' ? o.message?.content : o.type === 'response_item' && o.payload?.role === 'assistant' ? o.payload.content : null;
       for (const b of Array.isArray(c) ? c : []) if (/^(text|output_text)$/.test(b.type) && b.text.trim()) last = b.text;
     }
@@ -425,19 +468,6 @@ function subagents({ transcript_path: transcript, session_id: sessionId, goal_st
     out.push(`- ${name}（${type}，${state}${stopped ? '，被停止' : ''}）：${clip(last, 200) || '（还没有输出）'}`);
   }
   return out;
-}
-
-function tail(file, bytes) {
-  try {
-    const fd = fs.openSync(file, 'r');
-    const size = fs.fstatSync(fd).size, n = Math.min(size, bytes);
-    const buf = Buffer.alloc(n);
-    fs.readSync(fd, buf, 0, n, size - n);
-    fs.closeSync(fd);
-    const lines = buf.toString('utf8').split('\n');
-    if (n < size) lines.shift(); // partial first line
-    return lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-  } catch { return []; }
 }
 
 function describe(input = {}) {

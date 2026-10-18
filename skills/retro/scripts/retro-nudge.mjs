@@ -11,8 +11,10 @@
 //   with nothing new, the stall and idle-slot notes speak instead.
 // - Subagent tracker: each subagent tool call touches <tmp>/claude-retro-<session>.agents/<agent>.json and SubagentStop
 //   marks it stopped; workers another harness runs (.retro/workers/, Codex threads for a Claude main agent) count too.
-//   From that: slots left idle (against the count set with `retro.mjs slots`), a segment past an hour, an executor
-//   silent for 20 min (a worker inside a command is not).
+//   From that: slots left idle (against the count set with `retro.mjs slots`), and lib executorNotes: a segment past
+//   an hour, a silent or stuck executor. Claude Code's main agent sleeps between turns, so `retro.mjs watch` wakes it
+//   from the background when one is due, and this hook says it; a Stop with executors running and no watch is blocked. A subagent whose tool
+//   call ran SILENT or longer is asked, right then, what took so long.
 // - Background slot: one route review or idea scout at a time per project, state in .retro/slot. Only this hook
 //   reserves it (under an exclusive lock): at goal start (a scout), then hourly; a scout when none ran for 4 h or the
 //   idea pool runs low, otherwise a review; or right away after `retro.mjs request`. If nothing new came back in the
@@ -26,8 +28,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  C, SLOT_AGENTS, agentName, agentsDir, ensureDir, goalAgents, handbacks, harnessLimit, iso, lastRetro, limitOf, locked,
-  log, mainCheckout, newestResult, openIdeas, progressGoal, read, readSlot, readSlots, safe, sessions, withLock, writeSlot,
+  C, SLOT_AGENTS, agentName, agentsDir, claimSaid, ensureDir, executorNotes, goalAgents, handbacks, harnessLimit, iso, lastRetro,
+  limitOf, locked, log, mainCheckout, newestResult, openIdeas, progressGoal, read, readSlot, readSlots, safe, said, sessions,
+  watchFile, watching, writeSlot,
 } from './lib.mjs';
 
 const now = Date.now();
@@ -53,6 +56,7 @@ const RESUME = /^\s*\/?(resume|continue|restart|unpause|go on|恢复|继续)\s*[
 // agent): only recorded for the tracker.
 if (event === 'SubagentStop' || input.agent_id) {
   try { track(); } catch {}
+  try { slowTool(); } catch {}
   process.exit(0);
 }
 
@@ -79,9 +83,11 @@ const stopping = event === 'Stop';
 const notes = [];
 
 // /goal blocks every unfinished Stop, so stop_hook_active stays true for the whole run and can't tell turns apart.
-// Speak at a Stop only if the main agent made a tool call since this hook last blocked; otherwise change nothing.
+// Speak at a Stop only if the main agent made a tool call since this hook last blocked, or the watch woke it (.woke):
+// a woken turn may end without a tool call, and its Stop is then the only place to say why. Otherwise change nothing.
 const lastBlock = read(base + '.blocked').trim();
-if (stopping && lastBlock !== '' && (Number(read(base + '.call')) || 0) <= Number(lastBlock)) process.exit(0);
+const lastTurn = Math.max(Number(read(base + '.call')) || 0, Number(read(base + '.woke')) || 0);
+if (stopping && lastBlock !== '' && lastTurn <= Number(lastBlock)) process.exit(0);
 if (!stopping) try { fs.writeFileSync(base + '.call', String(now)); } catch {}
 
 try { if (!stopping) launched(); } catch {}
@@ -93,7 +99,7 @@ try { enough = harness(); } catch {}
 if (enough) {
   try { checkpoint(); } catch {}
   try { slot(); } catch {}
-  try { watch(); } catch {}
+  try { executors(); } catch {}
 }
 
 if (notes.length) {
@@ -106,20 +112,9 @@ if (notes.length) {
   }
 }
 
-// What was said when. claim(key, ok) says yes, and records it, only if ok(last time said) — checked again under a
-// lock, so parallel tool calls don't both say it. A busy lock means "not now": a later call says it instead.
-function saidMap() { try { return JSON.parse(read(base + '.said')) || {}; } catch { return {}; } }
-function claim(key, ok) {
-  if (!ok(saidMap()[key])) return false;
-  return withLock(base + '.said.lock', () => {
-    const m = saidMap();
-    if (!ok(m[key])) return false;
-    m[key] = now;
-    for (const k of Object.keys(m)) if (now - m[k] > 864e5) delete m[k];
-    fs.writeFileSync(base + '.said', JSON.stringify(m));
-    return true;
-  }) === true;
-}
+// What was said when (lib claimSaid): claim(key, ok) says yes, and records it, only if ok(last time said).
+function saidMap() { return said(input.session_id); }
+function claim(key, ok) { return claimSaid(input.session_id, key, ok, now); }
 // Due since `due`: say it, then again once 10 minutes have passed since it was last said. An urgent one (a due
 // checkpoint, an unlaunched reservation) is also said at every Stop the hook may speak at: ending the turn with it
 // still pending is when it matters most, and the Stop rule above keeps that from looping.
@@ -128,16 +123,22 @@ function timely(key, due, urgent = false) {
 }
 function once(key) { return claim(key, last => !last); }
 
-// A subagent's tool call, or its stop. Only executors are tracked: not the review/scout (the slot times those), not
-// Codex's approval reviewers, and not Claude Code's internal agents (/btw, prompt suggestions), which have no
-// agent_type. Nothing is written unless the main agent's goal was last seen active.
-function track() {
-  if (event !== 'PostToolUse' && event !== 'SubagentStop') return;
+// The subagent behind this event if it is an executor, while the main agent's goal was last seen active: not the
+// review/scout (the slot times those), not Codex's approval reviewers, and not Claude Code's internal agents (/btw,
+// prompt suggestions), which have no agent_type.
+function executorType() {
   const type = String(input.agent_type || '');
-  if (!type || SLOT_AGENTS.has(type) || /guardian/i.test(type)) return;
+  if (!type || SLOT_AGENTS.has(type) || /guardian/i.test(type)) return '';
   let cache = null;
   try { cache = JSON.parse(read(base + '.goal')); } catch {}
-  if (!cache?.active) return;
+  return cache?.active ? type : '';
+}
+
+// An executor's tool call, or its stop.
+function track() {
+  if (event !== 'PostToolUse' && event !== 'SubagentStop') return;
+  const type = executorType();
+  if (!type) return;
   const d = agentsDir(input.session_id), id = safe(input.agent_id || 'unknown');
   const f = path.join(d, `${id}.json`), stop = path.join(d, `${id}.stop`);
   const header = () => JSON.stringify({ type, seg: now, tp: input.agent_transcript_path || input.transcript_path });
@@ -164,18 +165,28 @@ function track() {
   }
 }
 
-// The main agent just launched a subagent. An executor: remember when, since it is tracked only from its first tool
-// call and its slot shouldn't look idle meanwhile. The reserved review/scout: mark it started, so a Stop right after
+// An executor's tool call that ran SILENT or longer kept it silent all along: ask it now, while it can still say why.
+// Claude Code reports how long the call took; Codex polls a long command instead of waiting on it.
+function slowTool() {
+  const ms = Number(input.duration_ms);
+  if (event !== 'PostToolUse' || !(ms >= C.SILENT) || !executorType()) return;
+  process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: `这个工具调用（${input.tool_name}）跑了 ${Math.round(ms / 60e3)} 分钟，这段时间外面看不到你的任何动静。在你的 notes.md 里记一笔：它在做什么、为什么要这么久、能不能更快。超过约 1 分钟的评测或构建，按 executor.md 放到后台跑，等的时候做别的。` } }));
+}
+
+// The main agent just launched a subagent. An executor in the background: remember when, since it is tracked only from
+// its first tool call and its slot shouldn't look idle meanwhile. The reserved review/scout: mark it started, so a Stop right after
 // isn't told otherwise. Only an exact agent name counts: Claude Code's Agent (formerly Task) tool names it in
 // subagent_type; another spawn tool (Codex) in some field. Todo tools (TaskCreate…) and prompts that merely mention
-// the name don't.
+// the name don't. It just started the background watch: that counts as running until the watch writes its file.
 function launched() {
   const ti = input.tool_input || {};
   const name = String(input.tool_name);
+  if (/^(Bash|PowerShell)$/.test(name) && /retro\.mjs"?\s+watch\b/.test(String(ti.command)) && !watching(input.session_id)) fs.writeFileSync(watchFile(input.session_id), '');
   const named = /^(Agent|Task)$/.test(name) ? [ti.subagent_type] : /spawn/i.test(name) ? Object.values(ti) : [];
   if (!named.length) return;
   if (!named.some(v => SLOT_AGENTS.has(v))) {
-    fs.writeFileSync(base + '.launch', String(now));
+    // A foreground subagent has already finished by now.
+    if (!/^(Agent|Task)$/.test(name) || ti.run_in_background) fs.writeFileSync(base + '.launch', String(now));
     return;
   }
   const s = readSlot(root);
@@ -274,17 +285,18 @@ function checkpoint() {
   notes.push(text);
 }
 
-// The subagent tracker, read for the main agent: segments past the limit, subagents gone silent, slots left idle.
-function watch() {
+// The subagent tracker, read for the main agent: executors past their hour, silent or stuck (lib executorNotes); in
+// Claude Code, a turn ending with executors running and no watch to wake the main agent; slots left idle.
+function executors() {
   const { agents, running } = goalAgents(input.session_id, goal.start, now, root);
-  const min = t => Math.round((now - t) / 60e3);
-  for (const a of running) {
-    if (a.worker) { worker(a, min); continue; }
-    if (now - a.seg >= C.SEGMENT_MAX) {
-      if (once(`over ${a.id} ${a.seg}`)) notes.push(`子代理「${agentName(a)}」（${a.type}）这一段已经连续跑了 ${min(a.seg)} 分钟，超过一段 1 小时的上限，还没有交阶段回报。问它一次进展；没有说得过去的理由，就停掉它，按它任务目录里的 notes.md 另派。`);
-    } else if (now - a.last >= C.SILENT && once(`silent ${a.id} ${a.last}`)) {
-      notes.push(`子代理「${agentName(a)}」（${a.type}）已经 ${min(a.last)} 分钟没有调用工具。如果它在等一个长命令，就不用管；否则问它一次，没有回应就停掉换人。`);
-    }
+  const said = executorNotes(running, { now, sessionId: input.session_id, root, codex: goal.codex, wcmd }).map(n => n.text);
+  notes.push(...said);
+  // A new executor shows up only at its first tool call.
+  const launch = Number(read(base + '.launch')) || 0;
+  const watch = `\`node "${CLI}" watch --session ${input.session_id} --root "${root.replace(/\\/g, '/')}"\``;
+  if (!goal.codex && (running.length || now - launch < C.IDLE_GRACE) && !watching(input.session_id)) {
+    if (stopping) notes.push(`有执行者在跑，后台却没有 retro 的 watch：先用 Bash 在后台（run_in_background）运行 ${watch}，再结束这一轮。执行者没动静、卡住或超时时它会结束，把你叫醒；要处理什么，这个 hook 会在你下一次调用工具或结束这一轮时告诉你。`);
+    else if (said.length) notes.push(`处理完，用 Bash 在后台（run_in_background）重新运行 ${watch}。`);
   }
   const set = readSlots(root);
   if (!set || set.at < goal.start) {
@@ -292,26 +304,10 @@ function watch() {
     return;
   }
   if (running.length >= set.n) return;
-  // Idle since the last time a slot freed up (approximately, when several are idle), or since the last launch: a new
-  // executor shows up only at its first tool call.
-  const launch = Number(read(base + '.launch')) || 0;
+  // Idle since the last time a slot freed up (approximately, when several are idle), or since the last launch.
   const freed = Math.max(set.at, goal.start, launch, ...agents.map(a => a.stopAt || (a.active && !a.worker && now - a.last >= C.GONE ? a.last + C.GONE : 0)));
   if (timely('idle', freed + C.IDLE_GRACE)) {
     notes.push(`名额空着：这个目标的名额是 ${set.n} 个，现在在跑的执行子代理只有 ${running.length} 个${running.length ? `（${running.map(agentName).join('、')}）` : ''}。按主循环补位，从“下一步”或想法池派任务，别忘了探索。名额要变，就用 ${cmd('slots <N> <理由>')} 改。`);
-  }
-}
-
-// A worker can't be asked anything mid-turn: stop it and resume the same thread, which keeps its context. Inside a
-// command it is not silent (the hour limit still applies).
-function worker(a, min) {
-  const name = `${a.type === 'codex' ? 'Codex 执行者' : '外部执行者'}「${agentName(a)}」（任务 ${a.id}）`;
-  const ask = what => `它跑着的时候收不到消息：${a.driver === 'codex-worker'
-    ? `用 ${wcmd(`stop ${a.id}`)} 停掉，再在后台运行 ${wcmd(`resume ${a.id} "${what}"`)}`
-    : `用它的驱动停掉，再让同一个线程接着做：“${what}”`}，上下文还在。`;
-  if (now - a.seg >= C.SEGMENT_MAX) {
-    if (once(`over ${a.id} ${a.seg}`)) notes.push(`${name}这一段已经连续跑了 ${min(a.seg)} 分钟，超过一段 1 小时的上限，还没有交回。${a.cmd ? `它正在跑命令「${a.cmd.slice(0, 120)}」（${min(a.cmdAt)} 分钟）。` : ''}没有说得过去的理由，就要它交阶段回报：${ask('到时间上限了：停下来，交阶段回报和继续申请')}`);
-  } else if (!a.cmd && now - a.last >= C.SILENT && once(`silent ${a.id} ${a.last}`)) {
-    notes.push(`${name}已经 ${min(a.last)} 分钟没有动静，也不在跑命令。问它一次进展：${ask('你已经很久没有动静：说一下进展和卡在哪里')}`);
   }
 }
 

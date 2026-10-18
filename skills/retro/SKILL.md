@@ -65,7 +65,7 @@ description: /goal 的增强：长程 coding 任务里，主 agent 只决策和�
 
 觉得路线本身有问题，不在检查点里改，而是运行 `retro.mjs request review`（第 5 节）。
 
-**子代理超时或没动静**：hook 提醒时，问它一次进展。没有说得过去的理由，就停掉它，按它任务目录里的 `notes.md` 另派。
+**子代理超时或没动静**：按 hook 的提醒做。没动静的，打断它问一句，它会带着上下文接着做；问过还是没动静，就停掉它，按它任务目录里的 `notes.md` 另派。超时的，问它一次进展，没有说得过去的理由就停掉另派。
 
 **目标结束时**（达成、判定达不到，或者用户叫停），先做完这些再宣布。Claude Code 判定达成后不会再给你下一轮；Codex 要在调用 `update_goal` 之前做完。
 1. 达成时，先派子代理重评积压（第 6 节）。有变成高的，先修，目标还不算达成。
@@ -253,7 +253,7 @@ PROGRESS.md 是快照，不是日志：检查点时整体改写，过程细节�
 | 派任务 | Agent 工具，后台运行（`run_in_background`） | `spawn_agent`，`fork_turns` 设为 `"none"` |
 | 追问、让它接着做 | SendMessage | `followup_task` |
 | 停掉 | TaskStop | `interrupt_agent` |
-| 等结果 | 结束这一轮；子代理交回时会唤醒你，`/goal` 也会定期检查 | `wait_agent`，超时不超过 10 分钟，因为 hook 的提醒只在你调用工具之后送到 |
+| 等结果 | 结束这一轮。hook 说后台没有 watch 时，按它给的命令在后台开一个：执行者没动静、卡住或超时时它会结束，把你叫醒，hook 会告诉你要处理什么。子代理交回时也会唤醒你 | `wait_agent`，超时不超过 10 分钟，因为 hook 的提醒只在你调用工具之后送到 |
 | 子代理上限 | 默认 20，环境变量 `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` | 默认 3，`~/.codex/config.toml` 里 `[agents]` 的 `max_concurrent_threads_per_session`（不含主线程） |
 | 判断目标达成 | 一个独立的模型看对话内容判断，它不跑命令，所以证据要出现在对话里 | 你自己用 `update_goal` 标记完成，标记前要有这次会话里的证据 |
 | 一次性提醒 | CronCreate，`recurring: false`；先用 CronList 查有没有 | Codex app 里的一次性线程定时任务 |
@@ -263,9 +263,10 @@ PROGRESS.md 是快照，不是日志：检查点时整体改写，过程细节�
 
 用户要 Codex 执行任务时，执行子代理换成 Codex 线程，由 `<本 skill 目录>/scripts/codex-worker.mjs` 驱动。核实任务和后台的评审、侦察仍然用 Claude 子代理。
 - **派任务**：任务说明照第 3 节写全，第一行是一个短标题，写进 `<任务目录>/brief.md`。然后用 Bash 在后台（`run_in_background`）运行 `node "<本 skill 目录>/scripts/codex-worker.mjs" run <任务> --root "<项目>"`，任务名就是任务目录名。要在别的目录（worktree）里做，加 `--cd <目录>`。
-- **等结果**：结束这一轮。命令结束时，它的输出会作为新的一轮送到：这一轮怎么结束的、`report.md` 在哪、它最后说的话。`/goal` 也会等它。
+- **等结果**：结束这一轮。命令结束时你会收到通知，但通知里只有退出码：读通知给的输出文件，里面有这一轮怎么结束的、`report.md` 在哪、它最后说的话。`/goal` 也会等它。
 - **追问、让它接着做**：等它这一轮结束，再在后台运行同一个脚本的 `resume <任务> "<话>" --root "<项目>"`，还是同一个线程，上下文还在。它跑着的时候收不到消息。
 - **停掉**：`stop <任务> --root "<项目>"`。不要只用 TaskStop 停那条后台命令，它起的命令可能停不干净。
-- **名额**：Codex 线程不占 Claude Code 的子代理上限，按资源和用户写的上限定。hook 把它们和 Claude 子代理一起算，超时、没动静也会提醒。
+- **名额**：Codex 线程不占 Claude Code 的子代理上限，按资源和用户写的上限定。hook 把它们和 Claude 子代理一起算，超时也会提醒。
+- **没动静**：驱动自己处理。它没动静时，驱动打断它问一句，让它接着做；问过还是卡着，就结束这一轮，输出里写“卡住了”。这时按 `notes.md` 另派，或者 `resume` 再试一次。
 - **能力**：Codex 线程能改代码、跑命令、联网、提交，和 Claude 子代理一样派任务。
 - **跑不起来**：输出里说缺 codex-code-mode-host、没能启动 codex，或者命令一直卡着。先停掉它，把输出转给用户，请用户装上 Codex 桌面版或按 retro 的 README 设 `RETRO_CODEX`；在那之前改用 Claude 子代理执行，并在回复里说明。

@@ -12,7 +12,7 @@ description: 进度台：在单独的会话里回答用户“现在进度怎样�
 1. 运行 `node <retro skill 目录>/scripts/retro.mjs status --root <项目目录>`。
    - retro skill 目录通常是 `~/.claude/skills/retro`，Codex 是 `~/.agents/skills/retro`。
    - 项目目录就是主 agent 工作的目录。不确定就问用户一次，之后记住。
-2. 输出里包括：目标；主 agent 最近说的话和最近的工具调用；正在活动的子代理；检查点、名额、各个执行者（在跑多久、有没有动静；Codex 执行者标着［codex 任务名］，还有它正在跑的命令和最后说的话）和后台评审的状态；任务回报；总表的最后几行；PROGRESS.md 的开头；最近的事件。
+2. 输出里包括：目标；主 agent 最近说的话和最近的工具调用；正在活动的子代理；检查点、名额、各个执行者（在跑多久、有没有动静；子代理在等哪个工具调用；Codex 执行者标着［codex 任务名］，还有它正在跑的命令、最后说的话和没动静被追问过几次）和后台评审的状态；任务回报；总表的最后几行；PROGRESS.md 的开头；最近的事件。
 3. 用户想看细节时，再去读对应的文件：
    - 任务目录里的 `report.md` 和 `notes.md`；
    - `.retro/route-review.md`、`.retro/ideas.md`、`.retro/backlog.md`、`.retro/log.tsv`；

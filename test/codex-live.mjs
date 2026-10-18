@@ -4,6 +4,7 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -38,7 +39,8 @@ const cli = (...a) => spawnSync(process.execPath, [path.join(SCRIPTS, 'retro.mjs
 const retro = p => path.join(proj, '.retro', p);
 const worker = id => { try { return JSON.parse(fs.readFileSync(retro(`workers/${id}.json`), 'utf8')); } catch { return null; } };
 const start = (...a) => {
-  const p = spawn(process.execPath, [path.join(SCRIPTS, 'codex-worker.mjs'), ...a, '--root', proj], { env });
+  const extra = typeof a.at(-1) === 'object' ? a.pop() : {};
+  const p = spawn(process.execPath, [path.join(SCRIPTS, 'codex-worker.mjs'), ...a, '--root', proj], { env: { ...env, ...extra } });
   let out = '';
   p.stdout.on('data', d => (out += d));
   p.stderr.on('data', d => (out += d));
@@ -79,6 +81,10 @@ try {
   console.log(`     回报第一行：${fs.readFileSync(retro('tasks/t1/report.md'), 'utf8').split('\n').find(l => l.trim())}`);
   // The sandbox keeps .git read-only; the driver makes the git directory writable.
   assert.match(git('log', '--oneline').stdout, /add hello/, 'it can commit');
+  // The driver followed the thread's own rollout.
+  const w1 = worker('t1');
+  assert.ok(w1.rollout?.endsWith(`-${w1.thread}.jsonl`) && fs.statSync(w1.rollout).size > 0, `rollout: ${w1.rollout}`);
+  assert.equal(w1.asks, 0);
 
   ok = step('the finished task makes the checkpoint due; the freed slot is reported');
   assert.match(hook(), /检查点到期/);
@@ -105,6 +111,33 @@ try {
   assert.match(r4.out.split('最后的话：')[1], /\b200\b/);
   ok();
 
+  // Past the stuck limit, so it passes only if the driver sees each poll in the rollout: from the --json events alone
+  // a command running that long counts as stuck.
+  ok = step('a command running past the stuck limit is not stuck: each poll of it shows in the rollout (time scaled: 15 min = 6 min)');
+  const sleep7 = process.platform === 'win32' ? 'Start-Sleep -Seconds 420' : 'sleep 420';
+  brief('t4', `运行这条 shell 命令，等它结束后只回答 done：${sleep7}\n`);
+  const r5 = await start('run', 't4', { RETRO_TIME_SCALE: '0.4' }).done;
+  assert.equal(r5.code, 0, r5.out);
+  assert.doesNotMatch(r5.out, /追问/);
+  assert.equal(worker('t4').asks, 0);
+  ok();
+
+  ok = step('a Codex that hangs (its model endpoint never answers) is asked once on the same thread, then ends as stuck (time scaled: 5 min = 30 s)');
+  const hole = net.createServer(sock => sock.on('error', () => {})).listen(0, '127.0.0.1');
+  await new Promise(res => hole.on('listening', res));
+  const url = `127.0.0.1:${hole.address().port}`;
+  const hung = JSON.stringify([...codexCmd, '-c', 'model_provider="bh"', '-c', `model_providers.bh={name="bh",base_url="http://${url}/v1",wire_api="responses"}`]);
+  brief('t5', '说一句 hi。\n');
+  const r6 = await start('run', 't5', { RETRO_TIME_SCALE: '0.1', RETRO_CODEX: hung }).done;
+  hole.close();
+  assert.equal(r6.code, 1, r6.out);
+  assert.match(r6.out, /Codex 执行者 t5：卡住了：被打断追问之后又 \d+ 分钟没有任何动静，已停止/);
+  assert.equal(worker('t5').asks, 1);
+  assert.match(fs.readFileSync(retro('log.tsv'), 'utf8'), /\tagent-asked\tt5 /);
+  assert.match(fs.readFileSync(worker('t5').rollout, 'utf8'), /（retro 驱动）你已经 \d+ 分钟没有任何动静/, 'the question went to the same thread');
+  await until(() => !processesWith(url).length, 15e3, `processes left: ${processesWith(url).join(', ')}`);
+  ok();
+
   ok = step('stop ends a thread inside a long command, with the command\'s processes');
   const marker = process.platform === 'win32' ? 'Start-Sleep -Seconds 287' : 'sleep 287';
   brief('t2', `运行这条 shell 命令，等它结束后回答 done：${marker}\n`);
@@ -127,6 +160,6 @@ try {
   console.log(`FAIL ${e.message}\n${e.stack.split('\n').slice(1, 3).join('\n')}`);
   process.exitCode = 1;
 } finally {
-  for (const id of ['t1', 't2']) { const w = worker(id); if (w && !w.stopAt) spawnSync(process.execPath, [path.join(SCRIPTS, 'codex-worker.mjs'), 'stop', id, '--root', proj], { env }); }
+  for (const id of ['t1', 't2', 't4', 't5']) { const w = worker(id); if (w && !w.stopAt) spawnSync(process.execPath, [path.join(SCRIPTS, 'codex-worker.mjs'), 'stop', id, '--root', proj], { env }); }
   if (fs.existsSync(proj)) console.log(`project kept for inspection: ${proj}`);
 }

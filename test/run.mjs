@@ -56,10 +56,13 @@ function setup(name, { goalAgo = 5, cond = 'tests pass', extra = [], sid: sidArg
 }
 const goalLine = (cond, t, extra = {}) => ({ type: 'attachment', timestamp: new Date(t).toISOString(), attachment: { type: 'goal_status', met: false, sentinel: true, condition: cond, ...extra } });
 const iso = t => new Date(t).toISOString();
+const until = async (ok, ms = 10000) => { const safeOk = () => { try { return ok(); } catch { return false; } }; for (const t0 = Date.now(); !safeOk(); ) { if (Date.now() - t0 > ms) throw new Error('timed out waiting'); await new Promise(r => setTimeout(r, 50)); } };
 const codexGoal = (objective, createdAt, status = 'active') => ({ timestamp: iso(Date.now()), type: 'event_msg', payload: { type: 'thread_goal_updated', goal: { objective, status, createdAt } } });
 const codexMeta = (id, source = 'vscode') => ({ timestamp: iso(Date.now()), type: 'session_meta', payload: { session_id: id, id, source, base_instructions: { text: 'x' } } });
 
+// TEST_ONLY=<text> runs only the tests whose name contains it.
 async function test(name, fn) {
+  if (process.env.TEST_ONLY && !name.includes(process.env.TEST_ONLY)) return;
   n++;
   try { await fn(); console.log(`ok   ${name}`); } catch (e) { failed++; console.log(`FAIL ${name}\n     ${e.stack.split('\n').slice(0, 3).join('\n     ')}`); }
 }
@@ -176,9 +179,9 @@ await test('tracker: a segment past an hour and a silent subagent are reported o
   t.setTime(t.agentFile('quiet'), 25);
   const r = t.text(t.hook());
   assert.match(r, /「long」（general-purpose）这一段已经连续跑了 61 分钟/);
-  assert.match(r, /「quiet」（general-purpose）已经 25 分钟没有调用工具/);
+  assert.match(r, /「quiet」（general-purpose）已经 25 分钟没有任何动静/);
   const r2 = t.text(t.hook());
-  assert.doesNotMatch(r2, /连续跑了|没有调用工具/);
+  assert.doesNotMatch(r2, /连续跑了|没有任何动静/);
   t.hook({ hook_event_name: 'SubagentStop', agent_id: 'long', agent_type: 'general-purpose' });
   t.sub('long'); // a follow-up
   assert.ok(Date.now() - JSON.parse(fs.readFileSync(t.agentFile('long'), 'utf8')).seg < MIN);
@@ -186,6 +189,112 @@ await test('tracker: a segment past an hour and a silent subagent are reported o
   // The review/scout, internal agents and Codex guardians are not tracked.
   for (const agent_type of ['', 'route-reviewer', 'idea-scout', 'guardian']) t.sub('x' + agent_type, { agent_type });
   assert.deepEqual(fs.readdirSync(path.dirname(t.agentFile('long'))).filter(f => f.startsWith('x')), []);
+});
+
+await test('silence: a subagent with nothing out for 5 min is to be interrupted and asked, replaced if still silent; a tool call out counts after 15 min; a slow call is asked about at once', () => {
+  const t = setup('silence', { goalAgo: 30 });
+  t.hook(); t.cli('slots', '3', 'x');
+  for (const id of ['idle', 'tool', 'busy']) t.sub(id);
+  // tool and busy wait on a Bash call, as their own transcripts show.
+  const sdir = path.join(t.transcript.replace(/\.jsonl$/, ''), 'subagents');
+  fs.mkdirSync(sdir, { recursive: true });
+  const callOut = (id, mins) => fs.writeFileSync(path.join(sdir, `agent-${id}.jsonl`), [
+    { type: 'user', timestamp: iso(Date.now() - (mins + 1) * MIN), message: { content: [{ type: 'tool_result', tool_use_id: 'u0' }] } },
+    { type: 'assistant', timestamp: iso(Date.now() - mins * MIN), message: { content: [{ type: 'tool_use', id: 'u1', name: 'Bash', input: { command: 'npm test' } }] } },
+    { type: 'user', timestamp: iso(Date.now()), message: { content: '主 agent 发来的消息不算它的动静' } },
+  ].map(l => JSON.stringify(l)).join('\n') + '\n');
+  callOut('tool', 16); callOut('busy', 10);
+  for (const [id, m] of [['idle', 6], ['tool', 16], ['busy', 10]]) t.setTime(t.agentFile(id), m);
+  const r = t.text(t.hook());
+  assert.match(r, /子代理「idle」（general-purpose）已经 6 分钟没有任何动静，也不在等工具。打断它问一句：用 TaskStop 停掉它（idle），再用 SendMessage 对它说：“你已经 6 分钟没有动静，被打断了：先说一句刚才在做什么、卡在哪里，然后接着做”/);
+  assert.match(r, /子代理「tool」（general-purpose）在等的工具调用 Bash（npm test） 已经 16 分钟没有返回/);
+  assert.doesNotMatch(r, /「busy」/);
+  assert.match(t.cli('status').stdout, /busy（在跑，这一段 \d+ 分钟，在等工具调用「Bash（npm test）」（10 分钟）/);
+  assert.doesNotMatch(t.text(t.hook()), /没有任何动静|没有返回/);
+  // Still nothing 5 min after it was asked: replace it.
+  t.age(6);
+  assert.match(t.text(t.hook()), /子代理「idle」（general-purpose）被问过之后又 6 分钟没有动静。停掉它，按它任务目录里的 notes\.md 另派/);
+  const logged = fs.readFileSync(t.retro('log.tsv'), 'utf8');
+  assert.match(logged, /\tagent-quiet\tidle 6min\n/); assert.match(logged, /\tagent-quiet\ttool 16min tool\n/); assert.match(logged, /\tagent-stuck\tidle\n/);
+  // A tool call that ran 5 min or more: the subagent is asked right away.
+  assert.match(t.text(t.sub('idle', { duration_ms: 6 * MIN })), /这个工具调用（Bash）跑了 6 分钟/);
+  assert.equal(t.sub('idle', { duration_ms: 1000 }), null);
+  assert.equal(t.sub('x', { agent_type: 'route-reviewer', duration_ms: 6 * MIN }), null);
+});
+
+await test('watch: a Stop with executors running and no watch is blocked; the watch wakes the main agent and the hook says what, once; one watch per session', async () => {
+  const t = setup('watch', { goalAgo: 30 });
+  t.hook(); t.cli('slots', '3', 'x');
+  t.sub('w1');
+  const stop = () => t.text(t.hook({ hook_event_name: 'Stop' }));
+  assert.match(stop(), /后台却没有 retro 的 watch：先用 Bash 在后台（run_in_background）运行 `node ".*retro\.mjs" watch --session sess-watch --root "[^"]+"`/);
+  // Starting it counts right away.
+  t.hook({ tool_input: { command: `node "${CLI}" watch --session sess-watch --root "${t.proj}"`, run_in_background: true } });
+  assert.doesNotMatch(stop(), /retro 的 watch/);
+  // In scaled time (5 min = 3 s): it waits while w1 is fine, then exits with the note.
+  const env = { ...t.env, RETRO_TIME_SCALE: '0.01' }, wf = t.state('watch');
+  t.sub('w1');
+  const w = spawn(process.execPath, [CLI, 'watch', '--root', t.proj], { env });
+  let out = '';
+  w.stdout.on('data', d => (out += d));
+  const done = new Promise(res => w.on('close', res));
+  await until(() => fs.readFileSync(wf, 'utf8') === String(w.pid), 5000);
+  const second = spawnSync(process.execPath, [CLI, 'watch', '--session', 'sess-watch', '--root', t.proj], { env, encoding: 'utf8' });
+  assert.match(second.stdout, new RegExp(`已经有一个 watch 在跑（进程 ${w.pid}）`));
+  assert.equal(w.exitCode, null);
+  await done;
+  // The main agent sees only that it ended: the hook says what to do.
+  assert.match(out, /有执行者要处理：子代理「w1」（general-purpose）。你下一次调用工具或结束这一轮时，hook 会说明怎么做/);
+  assert.ok(!fs.existsSync(wf));
+  // Started again before the hook spoke, it doesn't wake the main agent for the same thing.
+  const w2 = spawn(process.execPath, [CLI, 'watch', '--root', t.proj], { env });
+  let out2 = '';
+  w2.stdout.on('data', d => (out2 += d));
+  const done2 = new Promise(res => w2.on('close', res));
+  await new Promise(res => setTimeout(res, 1500));
+  assert.equal(w2.exitCode, null);
+  const scaled = () => t.text(t.hook({}, { RETRO_TIME_SCALE: '0.01' }));
+  // The woken turn ends without a tool call, after a Stop this hook blocked: the wake still lets it speak.
+  fs.writeFileSync(t.state('call'), String(Date.now() - 60e3)); fs.writeFileSync(t.state('blocked'), String(Date.now() - 30e3));
+  assert.match(t.text(t.hook({ hook_event_name: 'Stop' }, { RETRO_TIME_SCALE: '0.01' })), /子代理「w1」（general-purpose）已经 \d+ 分钟没有任何动静，也不在等工具。打断它问一句/);
+  assert.doesNotMatch(scaled(), /「w1」/);
+  // Still silent after being asked: the watch wakes the main agent again, and the hook says to replace it.
+  await done2;
+  assert.match(out2, /有执行者要处理：子代理「w1」/);
+  // Said at a tool call with no watch running: the note says how to start it again.
+  assert.match(scaled(), /子代理「w1」（general-purpose）被问过之后又 \d+ 分钟没有动静。停掉它[\s\S]*处理完，用 Bash 在后台（run_in_background）重新运行 `node ".*retro\.mjs" watch --session sess-watch/);
+  // Nothing running and nothing launched lately: it exits at once, and a Stop needs no watch.
+  t.hook({ hook_event_name: 'SubagentStop', agent_id: 'w1', agent_type: 'general-purpose' });
+  assert.match(spawnSync(process.execPath, [CLI, 'watch', '--root', t.proj], { env, encoding: 'utf8' }).stdout, /没有在跑的执行者了，watch 退出/);
+  t.hook();
+  assert.doesNotMatch(stop(), /retro 的 watch/);
+  // A foreground subagent has finished by the time its call returns; one in the background is about to run.
+  t.hook({ tool_name: 'Agent', tool_input: { subagent_type: 'Explore', prompt: 'x' } });
+  assert.doesNotMatch(stop(), /retro 的 watch/);
+  t.hook({ tool_name: 'Agent', tool_input: { subagent_type: 'general-purpose', prompt: 'x', run_in_background: true } });
+  assert.match(stop(), /retro 的 watch/);
+  // The goal state unreadable (the hook rewrites it at every event): not taken for the goal ending.
+  fs.unlinkSync(t.state('goal'));
+  const gone = spawnSync(process.execPath, [CLI, 'watch', '--root', t.proj], { env, encoding: 'utf8' }).stdout;
+  assert.match(gone, /读不到这个会话的目标状态/);
+});
+
+await test('silence in Codex: a subagent\'s own rollout shows its tool call out, and what it was told is not its step; the note says interrupt_agent and followup_task; a torn tracker header is no overtime', () => {
+  const created = Math.floor((Date.now() - 30 * MIN) / 1000);
+  const t = setup('silencecodex', { goalAgo: null, extra: [codexMeta('sess-silencecodex'), codexGoal('codex goal', created)] });
+  t.hook(); t.cli('slots', '3', 'x');
+  const rollout = id => path.join(t.tmp, `rollout-2026-10-17T00-00-00-${id}.jsonl`);
+  const rec = (mins, type, payload) => ({ timestamp: iso(Date.now() - mins * MIN), type, payload });
+  const write = (id, recs) => fs.writeFileSync(rollout(id), recs.map(r => JSON.stringify(r)).join('\n') + '\n');
+  write('k1', [rec(17, 'event_msg', { type: 'task_started' }), rec(16, 'response_item', { type: 'function_call', name: 'exec_command', call_id: 'c1' })]);
+  write('k2', [rec(17, 'response_item', { type: 'function_call', name: 'exec_command', call_id: 'c1' }), rec(16, 'response_item', { type: 'function_call_output', call_id: 'c1' }),
+    rec(0, 'response_item', { type: 'message', role: 'user', content: [{ type: 'input_text', text: '主 agent 发来的' }] })]);
+  for (const id of ['k1', 'k2']) { t.sub(id, { transcript_path: rollout(id), agent_type: 'worker' }); t.setTime(t.agentFile(id), 16); }
+  fs.writeFileSync(t.agentFile('torn'), '');
+  const r = t.text(t.hook());
+  assert.match(r, /子代理「k1」（worker）在等的工具调用 exec_command 已经 16 分钟没有返回。打断它问一句：用 interrupt_agent 打断它，再用 followup_task 对它说/);
+  assert.match(r, /子代理「k2」（worker）已经 16 分钟没有任何动静，也不在等工具/);
+  assert.doesNotMatch(r, /连续跑了/);
 });
 
 await test('idle slots: a launch restarts the grace; a Stop is not blocked again for it within 10 min', () => {
@@ -644,9 +753,9 @@ await test('metrics after the run: the window ends at the last event; labels in 
 
 // Codex executors for a Claude main agent: codex-worker.mjs drives a fake codex (test/fake-codex.mjs).
 const WORKER = path.join(here, '..', 'skills', 'retro', 'scripts', 'codex-worker.mjs');
-function codex(t) {
+function codex(t, extra = {}) {
   const logFile = path.join(t.tmp, 'fake-codex.log');
-  const env = { ...t.env, RETRO_CODEX: JSON.stringify([process.execPath, path.join(here, 'fake-codex.mjs')]), FAKE_CODEX_LOG: logFile };
+  const env = { ...t.env, RETRO_CODEX: JSON.stringify([process.execPath, path.join(here, 'fake-codex.mjs')]), FAKE_CODEX_LOG: logFile, ...extra };
   const run = (...a) => spawnSync(process.execPath, [WORKER, ...a, '--root', t.proj], { env, encoding: 'utf8' });
   const start = (...a) => {
     const p = spawn(process.execPath, [WORKER, ...a, '--root', t.proj], { env });
@@ -660,7 +769,6 @@ function codex(t) {
   const worker = id => JSON.parse(fs.readFileSync(t.retro(`workers/${id}.json`), 'utf8'));
   return { env, run, start, calls, brief, worker, pidFile: logFile + '.pid' };
 }
-const until = async (ok, ms = 10000) => { const safeOk = () => { try { return ok(); } catch { return false; } }; for (const t0 = Date.now(); !safeOk(); ) { if (Date.now() - t0 > ms) throw new Error('timed out waiting'); await new Promise(r => setTimeout(r, 50)); } };
 const isAlive = pid => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
 
 await test('codex command: RETRO_CODEX wins; else on Windows the desktop app\'s newest copy that has its host, with its flags; else codex', () => {
@@ -851,36 +959,96 @@ await test('codex-worker: a timeout stops the turn; a failed turn and a missing 
   }
 });
 
-await test('workers in the hook: past an hour or silent outside a command, the note names the task and the stop/resume commands; a dead driver counts as stopped', () => {
+await test('workers in the hook: past an hour, or silent and not driven by codex-worker (it asks by itself), the note names the task and the stop/resume commands; a dead driver counts as stopped', () => {
   const t = setup('cw-hook', { goalAgo: 90 });
-  t.hook(); t.cli('spawned', t.slot().start); t.cli('slots', '3', 'x'); t.cli('done');
-  for (const id of ['long', 'quiet', 'busy']) assert.equal(t.cli('worker', 'start', id, `任务 ${id}`, '--pid', String(process.pid), '--type', 'codex').status, 0);
+  t.hook(); t.cli('spawned', t.slot().start); t.cli('slots', '4', 'x'); t.cli('done');
+  for (const id of ['long', 'quiet', 'busy', 'other']) assert.equal(t.cli('worker', 'start', id, `任务 ${id}`, '--pid', String(process.pid), '--type', 'codex').status, 0);
   const file = id => t.retro(`workers/${id}.json`);
   const patch = (id, kv) => fs.writeFileSync(file(id), JSON.stringify({ ...JSON.parse(fs.readFileSync(file(id), 'utf8')), ...kv }));
-  for (const id of ['long', 'quiet', 'busy']) patch(id, { driver: 'codex-worker' });
+  for (const id of ['long', 'quiet']) patch(id, { driver: 'codex-worker' });
   patch('long', { seg: Date.now() - 61 * MIN });
-  patch('busy', { cmd: 'python eval.py', cmdAt: Date.now() - 80 * MIN });
-  // Inside a command for over an hour: still running (silence alone never ends a worker with a live driver).
-  t.setTime(file('quiet'), 25); t.setTime(file('busy'), 80);
+  patch('busy', { cmd: 'python eval.py', cmdAt: Date.now() - 10 * MIN });
+  // Silence alone never ends a worker with a live driver: all four still run.
+  t.setTime(file('quiet'), 25); t.setTime(file('busy'), 10); t.setTime(file('other'), 25);
   fs.writeFileSync(file('torn'), ''); // caught mid-write: ignored
-  fs.writeFileSync(t.retro('slots'), JSON.stringify({ n: 3, at: iso(Date.now() - 6 * MIN), why: 'x' }));
+  fs.writeFileSync(t.retro('slots'), JSON.stringify({ n: 4, at: iso(Date.now() - 6 * MIN), why: 'x' }));
   const r = t.text(t.hook());
   assert.doesNotMatch(r, /torn/);
   assert.doesNotMatch(t.cli('status').stdout, /torn/);
   assert.match(r, /Codex 执行者「任务 long」（任务 long）这一段已经连续跑了 61 分钟/);
   assert.match(r, /codex-worker\.mjs" stop long --root[\s\S]*codex-worker\.mjs" resume long "到时间上限了/);
-  assert.match(r, /「任务 quiet」（任务 quiet）已经 25 分钟没有动静，也不在跑命令/);
+  assert.doesNotMatch(r, /任务 quiet/);
+  assert.match(r, /Codex 执行者「任务 other」（任务 other）已经 25 分钟没有任何动静，也不在等工具。打断它问一句：它跑着的时候收不到消息：用它的驱动停掉，再让同一个线程接着做/);
   assert.doesNotMatch(r, /任务 busy/);
   assert.doesNotMatch(t.text(t.hook()), /Codex 执行者/);
   assert.doesNotMatch(r, /名额空着/);
+  // In a command past 15 min: stuck.
+  patch('busy', { cmdAt: Date.now() - 16 * MIN }); t.setTime(file('busy'), 16);
+  assert.match(t.text(t.hook()), /Codex 执行者「任务 busy」（任务 busy）在等的工具调用 python eval\.py 已经 16 分钟没有返回/);
   // A driver that died without saying so: not running, and its slot is free.
   const dead = spawnSync(process.execPath, ['-e', '0']).pid;
-  patch('quiet', { pid: dead }); patch('busy', { pid: dead }); patch('long', { pid: dead });
-  for (const id of ['long', 'quiet', 'busy']) t.setTime(file(id), 6);
-  fs.writeFileSync(t.retro('slots'), JSON.stringify({ n: 3, at: iso(Date.now() - 6 * MIN), why: 'x' }));
+  for (const id of ['long', 'quiet', 'busy', 'other']) { patch(id, { pid: dead }); t.setTime(file(id), 6); }
+  fs.writeFileSync(t.retro('slots'), JSON.stringify({ n: 4, at: iso(Date.now() - 6 * MIN), why: 'x' }));
   t.age(11);
-  assert.match(t.text(t.hook()), /名额是 3 个，现在在跑的执行子代理只有 0 个/);
+  assert.match(t.text(t.hook()), /名额是 4 个，现在在跑的执行子代理只有 0 个/);
   assert.match(t.cli('status').stdout, /任务 long［codex long］（驱动已经不在了/);
+});
+
+await test('codex-worker silence: quiet for 5 min, it is interrupted and asked on the same thread and goes on; quiet again before doing anything, it ends as stuck', () => {
+  const t = setup('cw-quiet', { goalAgo: 30 });
+  t.hook();
+  const c = codex(t, { RETRO_TIME_SCALE: '0.01' }); // 5 min = 3 s
+  c.brief('q1', '# 想一想\nQUIET\n');
+  const r = c.run('run', 'q1');
+  assert.equal(r.status, 0, r.stdout);
+  const calls = c.calls();
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1].argv.slice(calls[1].argv.indexOf('exec'), calls[1].argv.indexOf('exec') + 2), ['exec', 'resume']);
+  assert.equal(calls[1].argv.at(-2), c.worker('q1').thread);
+  assert.match(calls[1].prompt, /（retro 驱动）你已经 0 分钟没有任何动静，这一轮被打断了/);
+  assert.match(r.stdout, /Codex 执行者 q1：这一轮结束/);
+  assert.match(r.stdout, /中途没动静，被打断追问了 1 次。它的回答：答复：（retro 驱动）你已经/);
+  assert.equal(c.worker('q1').asks, 1);
+  assert.ok(c.worker('q1').rollout.endsWith(`-${c.worker('q1').thread}.jsonl`), 'the rollout it followed');
+  assert.match(fs.readFileSync(t.retro('log.tsv'), 'utf8'), /\tagent-asked\tq1 0min\n/);
+  // Quiet in every call: asked once, then stuck.
+  const c2 = codex(t, { RETRO_TIME_SCALE: '0.01', FAKE_CODEX_MODE: 'QUIET' });
+  c2.brief('q2', '# 又想一想\n');
+  const r2 = c2.run('run', 'q2');
+  assert.equal(r2.status, 1, r2.stdout);
+  assert.match(r2.stdout, /Codex 执行者 q2：卡住了：被打断追问之后又 0 分钟没有任何动静，已停止/);
+  assert.match(r2.stdout, /不然就按任务目录里的 notes\.md 另派/);
+  assert.equal(c2.calls().length, 4);
+  assert.equal(c2.worker('q2').why, 'stuck');
+});
+
+await test('codex-worker silence: a tool call out in the rollout, or steps written only there, are not silence until 15 min; without a rollout a running command counts as a call out', async () => {
+  const t = setup('cw-busy', { goalAgo: 30 });
+  t.hook();
+  const c = codex(t, { RETRO_TIME_SCALE: '0.01' }); // 5 min = 3 s, 15 min = 9 s
+  c.brief('p1', '# 等命令\nPOLL\n'); // a call out for 5 s
+  const r1 = c.run('run', 'p1');
+  assert.equal(r1.status, 0, r1.stdout);
+  c.brief('b1', '# 一直在想\nBEAT\n'); // a step every second for 5 s, nothing on stdout
+  const r2 = c.run('run', 'b1');
+  assert.equal(r2.status, 0, r2.stdout);
+  assert.doesNotMatch(r1.stdout + r2.stdout, /追问/);
+  assert.equal(c.calls().length, 2);
+  // A call out past 15 min: asked, about the tool.
+  const c2 = codex(t, { RETRO_TIME_SCALE: '0.01', FAKE_POLL_MS: '12000' });
+  c2.brief('p2', '# 等很久\nPOLL\n');
+  const r3 = c2.run('run', 'p2');
+  assert.equal(r3.status, 0, r3.stdout);
+  assert.match(c2.calls().at(-1).prompt, /你调用的工具 0 分钟没有返回，这一轮被打断了/);
+  // No rollout (the fake keeps none without CODEX_HOME): a command running is a call out, so 5 s is not silence.
+  const c3 = codex(t, { RETRO_TIME_SCALE: '0.01', CODEX_HOME: '' });
+  c3.brief('s1', '# 跑评测\nSLEEP\n');
+  const before = c3.calls().length;
+  const p = c3.start('run', 's1');
+  await new Promise(res => setTimeout(res, 5000));
+  assert.equal(c3.calls().length, before + 1);
+  c3.run('stop', 's1');
+  assert.equal((await p.done).code, 1);
 });
 
 await test('a worker handing back counts for the checkpoint; metrics counts its segments; retro.mjs worker for other drivers', () => {

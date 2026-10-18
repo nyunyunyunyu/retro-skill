@@ -35,12 +35,14 @@ retro 只在会话有活跃的 `/goal` 时生效，目标结束就自动停。
 | 记下名额 | 目标开始 10 分钟还没运行 `retro.mjs slots` | 每 10 分钟一次 |
 | 名额空着 | 在跑的执行者（子代理和 Codex 执行者）少于名额超过 5 分钟（从最近一次空出名额或派任务算起） | 每 10 分钟一次 |
 | 一段超时 | 一个执行者连续跑了 1 小时还没交回 | 每段一次 |
-| 没动静 | 一个子代理 20 分钟没有调用工具；Codex 执行者 20 分钟没有动静并且不在跑命令 | 每次一次 |
+| 没动静 | 一个执行者 5 分钟什么都没做、也没有在等工具，或者一个工具调用 15 分钟没返回：打断它问一句，它带着上下文接着做；问过之后还是没动静，就换人。驱动跑的 Codex 线程由驱动自己问（见下面） | 每次一次 |
+| 工具调用太久 | 一个 Claude 子代理的工具调用跑了 5 分钟以上：直接问这个子代理为什么这么久，让它记进 notes.md | 每次 |
+| 没开 watch | Claude Code 里一轮结束时有执行者在跑（或者刚派了任务），后台却没有 `retro.mjs watch` | 一轮结束时拦 |
 | 上下文被压缩 | 压缩之后 | 每次压缩 |
 | 子代理上限太低 | harness 允许的子代理数减 3 后不到 2 | 每 10 分钟一次，其他提醒都停 |
 | 进度台转达 | 用户在进度台说了话 | 送到一次 |
 
-hook 只能在主 agent 调用工具之后和一轮结束时说话；主 agent 长时间等待时，提醒在它下一次活动时送到。
+hook 只能在主 agent 调用工具之后和一轮结束时说话；主 agent 长时间等待时，提醒在它下一次活动时送到。Claude Code 里主 agent 结束一轮后，靠后台的 `retro.mjs watch` 叫醒它：watch 一直盯着执行者，有超时、没动静要处理就结束，命令结束会把主 agent 叫醒。主 agent 看不到后台命令的输出，所以要处理什么仍由 hook 在它下一次调用工具或结束这一轮时说。
 
 ## 安装
 
@@ -84,7 +86,7 @@ node retro-skill/install.mjs
   - `route-reviewer`：对照想法池给出结论：保持、调整优先级、先探测、换路线，默认保持；也看名额流动、迭代速度和验证占的时间。限 20 分钟。
   - `idea-scout`：从差距分解、假设审计、外部经验、换个问法、从零开始、复查死路六个角度找想法，只提不拍板。限 40 分钟。
 - **提醒 hook**（`scripts/retro-nudge.mjs`）：注册 PostToolUse、Stop、SubagentStop、SessionStart（只在压缩后）。从会话记录判断有没有活跃的 `/goal`（Codex 以目标数据库 `~/.codex/goals_1.sqlite` 为准），追踪子代理，检测 `/goal` 被替换或误用 `/goal resume`。
-- **辅助脚本**（`scripts/retro.mjs`）：`worker start|beat|stop` 给别的驱动登记外部执行者；`done` 标记检查点完成；`inbox` 列出上次检查点以来的回报（后台子代理用 `--since-last review|scout` 看上一轮以来的）；`slots` 记下名额；`request review|scout` 提前要一次后台评审；`status` 进度快照；`metrics [--since <时间>]` 整个运行的统计，供事后分析；`tell` 进度台转达用户的话；`spawned`、`finish`、`abort` 给后台子代理用。
+- **辅助脚本**（`scripts/retro.mjs`）：`watch` 在后台盯着执行者，需要时叫醒主 agent（Claude Code）；`worker start|beat|stop` 给别的驱动登记外部执行者；`done` 标记检查点完成；`inbox` 列出上次检查点以来的回报（后台子代理用 `--since-last review|scout` 看上一轮以来的）；`slots` 记下名额；`request review|scout` 提前要一次后台评审；`status` 进度快照；`metrics [--since <时间>]` 整个运行的统计，供事后分析；`tell` 进度台转达用户的话；`spawned`、`finish`、`abort` 给后台子代理用。
 - **Codex 执行驱动**（`scripts/codex-worker.mjs`）：Claude Code 当主 agent 时，把执行任务交给 Codex 线程，见下面的“Claude Code 调度、Codex 执行”。
 - **进度台 skill**（`skills/retro-status`）：在另一个会话里只读地回答“现在进度怎样”，把用户的指令转给主 agent。
 
@@ -95,13 +97,13 @@ node retro-skill/install.mjs
 | 装到哪 | `~/.claude/skills`、`~/.claude/agents`、`~/.claude/settings.json` | `~/.agents/skills`、`~/.codex/agents/*.toml`、`~/.codex/hooks.json` |
 | hook 生效 | 安装后马上生效 | 新加的条目要在 `/hooks` 里信任一次 |
 | 子代理上限（名额最多是上限减 3） | 默认 20，环境变量 `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` | 默认 3，**不够用**：在 `~/.codex/config.toml` 加 `[agents]` 和 `max_concurrent_threads_per_session = 12` |
-| 主 agent 怎么等 | 结束这一轮，子代理交回或 `/goal` 定期检查时被唤醒 | `wait_agent` 加不超过 10 分钟的超时 |
+| 主 agent 怎么等 | 结束这一轮，子代理交回、`retro.mjs watch` 退出或 `/goal` 定期检查时被唤醒 | `wait_agent` 加不超过 10 分钟的超时 |
 | 判断目标达成 | 独立的模型看对话 | agent 自己标记完成 |
 | 进度台转达 | 桌面版里用 SendMessage，立刻送到；否则走 `retro.mjs tell` | 走 `retro.mjs tell`，主 agent 下一次调用工具时送到 |
 
 ### Claude Code 调度、Codex 执行
 
-Claude Code 当主 agent，负责调度、核实和后台评审，执行任务交给 Codex：在 `/goal` 条件或对话里告诉它“执行交给 Codex”。主 agent 把任务说明写进 `.retro/tasks/<任务>/brief.md`，在后台运行 `codex-worker.mjs run <任务>`；命令结束时，Claude Code 把输出作为新的一轮送给它，`/goal` 也会等后台命令跑完。追问用 `resume <任务> "<话>"`，接着同一个线程；停掉用 `stop <任务>`。
+Claude Code 当主 agent，负责调度、核实和后台评审，执行任务交给 Codex：在 `/goal` 条件或对话里告诉它“执行交给 Codex”。主 agent 把任务说明写进 `.retro/tasks/<任务>/brief.md`，在后台运行 `codex-worker.mjs run <任务>`；命令结束时，Claude Code 用新的一轮通知它（通知里只有退出码和输出文件的路径），`/goal` 也会等后台命令跑完。追问用 `resume <任务> "<话>"`，接着同一个线程；停掉用 `stop <任务>`。
 
 驱动做的事：
 - 用 `codex exec --json` 跑一轮，`approval_policy` 设为 `never`：没人能回答确认请求，不设的话命令会一直卡在等确认。
@@ -110,7 +112,8 @@ Claude Code 当主 agent，负责调度、核实和后台评审，执行任务�
   - 它还把 `.git` 设成只读（实测 `git add` 报 Permission denied），执行者提交不了，所以驱动把仓库的 git 目录（worktree 共用的那个）加进可写目录。这样它也能改 `.git` 里的 hook、配置（会在沙箱外执行）和所有分支。
   - 工作目录（`--cd`）不包含项目的 `.retro/` 时（比如 worktree），`.retro/` 也加进去，回报才写得进去。
   - 这些可写目录会替换你配置里的 `writable_roots`。`RETRO_CODEX` 里自己给了 `sandbox_mode`、`network_access` 或 `writable_roots` 的，驱动就不加自己的那一项；想收紧，就在那里写上。
-- 把线程登记在 `.retro/workers/<任务>.json`：hook 把它算进名额，一段超过 1 小时、不在跑命令却 20 分钟没动静时提醒主 agent，检查点也能看到它交回。驱动进程没了，就算它停了。
+- 把线程登记在 `.retro/workers/<任务>.json`：hook 把它算进名额，一段超过 1 小时时提醒主 agent，检查点也能看到它交回。驱动进程没了，就算它停了。
+- 没动静时自己问。驱动读 Codex 自己的 rollout（`~/.codex/sessions/…/rollout-…-<线程>.jsonl`），Codex 的每一步都在里面，包括轮询还在跑的命令，`--json` 事件里没有这些。没动静时（门槛同上面的提醒表），驱动就停掉这一轮，接着同一个线程问它在做什么、卡在哪里，让它答完接着做，回答写在最后的输出里。问过之后它什么都没做又没动静，就按“卡住了”结束。找不到 rollout 时改看 `--json` 事件，正在跑的命令算作在等工具。
 - `stop` 让正在跑的驱动结束这个线程和它起的所有进程。驱动已经不在了的：Windows 上 codex 会随驱动一起结束；其他系统上先确认那还是这一段启动的 codex 进程，才结束它的进程组，免得误伤用了同一个进程号的别的程序。
 - codex 退出后，驱动最多再等 2 秒读完输出就交回，不会被它留在后台的进程拖住。
 - 事件存在任务目录的 `codex-events.jsonl`（命令输出太长的截断），最后一条消息存在 `codex-last.md`；超过一天的登记会被清掉，`resume` 从事件里找回线程。一轮超过 2 小时会被强制停掉，作为兜底。
@@ -121,9 +124,9 @@ Claude Code 当主 agent，负责调度、核实和后台评审，执行任务�
 - 要指定，就设环境变量 `RETRO_CODEX`（比如写在 `~/.claude/settings.json` 的 `env` 里）：一个可执行文件，或者 JSON 数组（可执行文件加前置参数），比如 `["C:/tools/codex.exe", "-c", "model_reasoning_effort=\"high\""]`。设了它就不再自动找，桌面版的两个开关也要自己写上。
 - 模型和思考强度用 Codex 自己的配置。
 
-**别的驱动**（比如走 Codex app-server）：每个线程开始时运行 `retro.mjs worker start <任务> [说明] --pid <驱动进程> --type <类型>`，有动静时 `worker beat <任务>`，结束时 `worker stop <任务>`。不给 `--pid` 的，60 分钟没动静就算停了。
+**别的驱动**（比如走 Codex app-server）：每个线程开始时运行 `retro.mjs worker start <任务> [说明] --pid <驱动进程> --type <类型>`，有动静时 `worker beat <任务>`（至少每 5 分钟一次，跑长命令时也要，否则算没动静），结束时 `worker stop <任务>`。不给 `--pid` 的，60 分钟没动静就算停了。
 
-**测试**：`node test/run.mjs` 用一个假的 codex 测驱动；`node test/codex-live.mjs` 用真的 Codex 跑一遍派任务、回报、检查点、追问和停掉，要几分钟，会用一点 Codex 额度。
+**测试**：`node test/run.mjs` 用一个假的 codex 测驱动；`node test/codex-live.mjs` 用真的 Codex 跑一遍派任务、回报、检查点、追问、长命令不算没动静、卡住时的追问和停掉，要十几分钟，会用一点 Codex 额度。
 
 ## 项目里的文件
 
@@ -141,7 +144,7 @@ Claude Code 当主 agent，负责调度、核实和后台评审，执行任务�
 | `.retro/probes/` | 后台子代理 | 探测脚本，评审和侦察的细节 |
 | `.retro/` 里的其他文件 | hook 和脚本 | 状态和事件日志，不要手改 |
 
-`.retro/` 不进 git，所有分支和 worktree 共用一份。hook 新建 `.retro/` 时放一个忽略全部内容的 `.gitignore`；已有的 `.retro/` 没有 `.gitignore` 时，只忽略脚本和代理生成的文件。每个会话的提醒记录和子代理追踪放在系统临时目录（`claude-retro-<会话>.*`）。
+`.retro/` 不进 git，所有分支和 worktree 共用一份。hook 新建 `.retro/` 时放一个忽略全部内容的 `.gitignore`；已有的 `.retro/` 没有 `.gitignore` 时，只忽略脚本和代理生成的文件。每个会话的提醒记录、子代理追踪和 watch 的进程号放在系统临时目录（`claude-retro-<会话>.*`）。
 
 ## 常驻规则
 
@@ -155,7 +158,7 @@ Claude Code 当主 agent，负责调度、核实和后台评审，执行任务�
 
 - **依赖没有公开文档的内部格式**：Claude Code 的 `goal_status` 和 `Goal cleared` 记录，Codex 的 `thread_goal_updated` 事件和目标数据库。格式一变，hook 会安静地失效。
 - **hook 只在工具调用之后和一轮结束时说话**：Codex 用代码模式时，`exec` 单元本身不触发 hook。
-- **子代理追踪是推断的**：子代理被直接停掉、没有触发 SubagentStop 时，会先显示为“没动静”，一小时后才不算在跑。子代理在前台等一个很长的命令时，20 分钟后会被报“没动静”。
+- **子代理追踪是推断的**：子代理被直接停掉、没有触发 SubagentStop 时，会先显示为“没动静”，一小时后才不算在跑。停掉时触发了的，被叫回来之后要到它下一次调用工具才重新算在跑，这之间卡住看不到。
 - **同一个项目里同时有两个会话在跑目标时，Codex 执行者会算进两边的名额**：登记按项目记，不按会话；Claude 子代理没有这个问题。
 - **Codex 执行者跑着的时候收不到消息**：追问要等这一轮结束；急的话停掉再 `resume`，上下文还在，只丢掉手头这一步。
 - **Codex 里子代理交回的结论只在主 agent 活动时送到**；`/goal` 会自己开下一轮，所以不会卡住。
@@ -171,7 +174,9 @@ Claude Code 当主 agent，负责调度、核实和后台评审，执行任务�
 - **提醒按种类限频**：同一种最多 10 分钟一次。只有到期的检查点和没启动的评审在一轮结束时还会拦一次；名额空着之类的不拦，否则主 agent 有意少开名额时每一轮都会被拦。
 - **兜底拦截不会循环**：`/goal` 让 `stop_hook_active` 一直是 true，分不出轮次，所以 hook 自己记录：上次拦截之后主 agent 调用过工具，才会再拦。
 - **名额由主 agent 定、hook 来查**：只有主 agent 知道资源情况。不到 2 个名额时直接停下，因为后台评审、主线和探索至少要这么多。
-- **超时和没动静由 hook 盯**：主 agent 定期问进展会打断子代理、塞满自己的上下文。
+- **超时和没动静由脚本盯**：主 agent 定期问进展会打断子代理、塞满自己的上下文。
+- **在等工具不算没动静**：问话要打断执行者，因为 Claude 子代理到下一步才收到消息，Codex 一轮之中收不到。所以只在它真的什么都没做时问；工具调用跑得久的，等它返回时由 hook 直接问它为什么这么久。Claude Code 的前台命令 10 分钟会转后台，Codex 轮询一次最多等 5 分钟，所以工具调用 15 分钟没返回才算卡住。
+- **用后台命令叫醒主 agent**：hook 只在事件发生时运行，卡住的执行者不产生事件。Claude Code 把后台命令的结束当作新的一轮送给主 agent，这是叫醒已经结束一轮的主 agent 的唯一办法，所以由 `retro.mjs watch` 来盯。
 - **到时间上限默认让原来的子代理接着做**：它的上下文最便宜。
 - **同一个目标按条件原文识别**（Codex 按 createdAt）：Claude Code 恢复会话和压缩后会重写设定目标的记录；暂停后 12 小时内用原文重设，也接着原来的开始时间算。
 - **后台评审同一时间只有一个**，在排他锁下登记；子代理开始和交付时都由脚本核对这一轮还有效，作废的结论写不进去。

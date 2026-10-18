@@ -9,8 +9,9 @@
 //   sessions/<id>.json   sessions that hold an active /goal here, for the progress desk
 //   tasks/<task>/report.md   executor reports; ideas.md, backlog.md, results.tsv, route-review.md, reviews/ are written by agents
 //   user-inbox.jsonl what the user said at the progress desk, until the hook hands it over; then kept in user-said.md
-// Per session, in the system temp dir (claude-retro-<session>.*): the goal cache, what the hook said when (.said),
-// the last main tool call (.call) and Stop block (.blocked), and the subagent tracker (.agents/, see trackedAgents).
+// Per session, in the system temp dir (claude-retro-<session>.*): the goal cache, what the hook and the watch said
+// when (.said, see claimSaid), the last main tool call (.call) and Stop block (.blocked), the subagent tracker
+// (.agents/, see trackedAgents) and the background watch (.watch, see watching).
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -21,7 +22,11 @@ const MIN = 60e3 * scale;
 export const C = {
   CHECKPOINT_EVERY: 60 * MIN, REPEAT: 10 * MIN,
   SLOT_EVERY: 60 * MIN, SCOUT_EVERY: 240 * MIN, LAUNCH_MAX: 20 * MIN, REVIEW_MAX: 20 * MIN, SCOUT_MAX: 40 * MIN, GRACE: 2 * MIN,
-  SEGMENT_MAX: 60 * MIN, SILENT: 20 * MIN, GONE: 60 * MIN, IDLE_GRACE: 5 * MIN, SLOTS_BY: 10 * MIN,
+  SEGMENT_MAX: 60 * MIN, GONE: 60 * MIN, IDLE_GRACE: 5 * MIN, SLOTS_BY: 10 * MIN,
+  // An executor is silent when for SILENT it neither did anything nor waited on a tool, or when a tool call of its hasn't
+  // come back after STUCK: Claude Code moves a foreground command to the background at 10 min, and Codex returns from a
+  // poll of a running command within 5, so a live executor gets its tool back well within that.
+  SILENT: 5 * MIN, STUCK: 15 * MIN,
   // A backstop: codex-worker.mjs stops a Codex turn this long. The hook asks the main agent at SEGMENT_MAX.
   WORKER_MAX: 120 * MIN,
   // Subagents the harness allows at once, minus RESERVE (the background review/scout and two spare), must leave
@@ -114,6 +119,29 @@ export function withLock(lock, fn, tries = 1) {
   return undefined;
 }
 
+// What was said to a session's main agent when ({key: time}), by the hook and the background watch alike, so neither
+// repeats the other. claimSaid says yes, and records it, only if ok(last time said) — checked again under a lock, so
+// parallel tool calls don't both say it. A busy lock means "not now": a later call says it instead.
+const saidFile = sessionId => path.join(os.tmpdir(), `claude-retro-${safe(sessionId)}.said`);
+export function said(sessionId) { try { return JSON.parse(read(saidFile(sessionId))) || {}; } catch { return {}; } }
+export function claimSaid(sessionId, key, ok, now = Date.now()) {
+  if (!ok(said(sessionId)[key])) return false;
+  return withLock(saidFile(sessionId) + '.lock', () => {
+    const m = said(sessionId);
+    if (!ok(m[key])) return false;
+    m[key] = now;
+    for (const k of Object.keys(m)) if (now - m[k] > 864e5) delete m[k];
+    fs.writeFileSync(saidFile(sessionId), JSON.stringify(m));
+    return true;
+  }) === true;
+}
+
+// The background watch of a session (`retro.mjs watch`) rewrites <tmp>/claude-retro-<session>.watch (its pid) every
+// WATCH_TICK while it runs.
+export const WATCH_TICK = Math.min(10e3, C.SILENT / 30);
+export const watchFile = sessionId => path.join(os.tmpdir(), `claude-retro-${safe(sessionId)}.watch`);
+export const watching = sessionId => Date.now() - mtime(watchFile(sessionId)) < 3 * WATCH_TICK;
+
 export function log(root, session, event, detail = '') {
   try {
     ensureDir(root);
@@ -204,13 +232,15 @@ export function trackedAgents(sessionId) {
     let h = {};
     try { h = JSON.parse(read(path.join(d, f))); } catch {}
     const stopAt = mtime(path.join(d, `${id}.stop`));
-    return { id, type: h.type || '?', seg: h.seg || 0, tp: h.tp || '', last: mtime(path.join(d, f)), stopAt, active: !stopAt };
+    const last = mtime(path.join(d, f)); // a header caught mid-write reads as a fresh segment
+    return { id, type: h.type || '?', seg: h.seg || last, tp: h.tp || '', last, stopAt, active: !stopAt };
   });
 }
 // External workers: executors another harness runs for this project, registered by their driver (codex-worker.mjs, or
 // `retro.mjs worker start|beat|stop`). .retro/workers/<id>.json holds {desc, type, driver, seg, stopAt, pid (the
-// driver process), child, thread, cwd, cmd (the command running now), cmdAt, said (its last words)}; its mtime is the
-// last sign of life. Written whole (temp file, then rename), so a reader never sees half a record.
+// driver process), child (the codex process) and childAt (when it started, if after seg), thread, rollout, cwd, cmd (the
+// command running now), cmdAt, said (its last words), asks (times its driver asked it why it went silent)}; its mtime
+// is the last sign of life. Written whole (temp file, then rename), so a reader never sees half a record.
 // A worker whose driver process is gone (or, without a pid, silent for GONE) counts as stopped at its last sign.
 const workersDir = root => path.join(dir(root), 'workers');
 export const alive = pid => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
@@ -249,7 +279,7 @@ export function workerStart(root, id, { desc, type = 'external', driver = '', pi
   const prev = readWorker(root, id) || {};
   const w = writeWorker(root, id, {
     desc: desc || prev.desc || '', type, driver, seg: Date.now(), stopAt: 0, pid, child, thread: thread === undefined ? prev.thread ?? null : thread,
-    cwd: cwd ?? prev.cwd ?? null, cmd: null, cmdAt: 0, said: '', exit: null, why: null,
+    cwd: cwd ?? prev.cwd ?? null, rollout: '', childAt: 0, cmd: null, cmdAt: 0, said: '', asks: 0, exit: null, why: null,
   });
   log(root, '-', 'agent-start', `${safe(id)} ${type}`);
   return w;
@@ -268,9 +298,9 @@ export function workerStop(root, id, kv = {}) {
   log(root, '-', 'agent-stop', safe(id));
   return true;
 }
-const seen = new Map(); // per process: the hook asks several times per call
+const seen = new Map(); // the hook asks several times per call; the watch once per tick
 export function workers(root) {
-  if (seen.has(root)) return seen.get(root);
+  if (seen.has(root) && Date.now() - seen.get(root).at < 1000) return seen.get(root).out;
   let names = [];
   try { names = fs.readdirSync(workersDir(root)).filter(f => f.endsWith('.json')); } catch {}
   const now = Date.now();
@@ -283,9 +313,10 @@ export function workers(root) {
     return {
       id: f.slice(0, -5), worker: true, type: w.type || 'external', driver: w.driver || '', desc: w.desc || '', tp: '', seg: w.seg, last,
       stopAt: w.stopAt || (gone ? last : 0), active: !w.stopAt && !gone, gone, cmd: w.cmd || '', cmdAt: w.cmdAt || 0, said: w.said || '',
+      asks: w.asks || 0,
     };
   }).filter(Boolean);
-  seen.set(root, out);
+  seen.set(root, { at: now, out });
   return out;
 }
 const forget = (sessionId, root, a) => {
@@ -316,6 +347,101 @@ export function agentName(a) {
   const p = headOf(tp, 8192).match(/"agent_path":"([^"]*)"/)?.[1];
   return p ? path.basename(p) : a.id;
 }
+
+// What a running executor is doing: its last sign of life, and the tool call it waits on ({name, at}) if any. A worker:
+// what its driver reports (cmd is the command running now). A subagent: its last tool call (the tracker), and the tail
+// of its own transcript (Claude Code: <main transcript>/subagents/agent-<id>.jsonl; Codex: its rollout), where a call
+// without its result is out. Only its own steps and tool results count, not messages sent to it. The tail is long
+// enough to see past a big tool result written while another call is out.
+export function activity(a) {
+  if (a.worker) return { last: a.last, wait: a.cmd ? { name: a.cmd, at: a.cmdAt || a.last } : null };
+  const tp = String(a.tp || ''), own = path.join(tp.replace(/\.jsonl$/, ''), 'subagents', `agent-${a.id}.jsonl`);
+  const file = fs.existsSync(own) ? own : /[\\/](agent-|rollout-)[^\\/]*\.jsonl$/.test(tp) ? tp : '';
+  let last = a.last;
+  const out = new Map();
+  for (const o of file ? tailRecords(file, 2 ** 21) : []) {
+    const t = Date.parse(o.timestamp) || 0, c = o.message?.content;
+    if (o.type === 'assistant' && Array.isArray(c)) {
+      last = Math.max(last, t);
+      for (const b of c) if (b.type === 'tool_use') out.set(b.id, { name: `${b.name}${b.input?.description || b.input?.command ? `（${clip(b.input.description || b.input.command, 60)}）` : ''}`, at: t });
+    } else if (o.type === 'user' && Array.isArray(c) && c.some(b => b.type === 'tool_result')) {
+      last = Math.max(last, t);
+      for (const b of c) if (b.type === 'tool_result') out.delete(b.tool_use_id);
+    } else if (rolloutStep(o, out, t)) last = Math.max(last, t);
+  }
+  return { last, wait: [...out.values()].at(-1) || null };
+}
+
+// One record of a Codex rollout, applied to `out` (the tool calls out, by call_id: {name, at}). Returns 'step' for
+// Codex's own step (reasoning, a message, a tool call), 'result' for a tool's output, '' for anything else (what it was
+// told, bookkeeping). A turn starting or ending clears what is out.
+export function rolloutStep(o, out, at) {
+  const p = o.payload || {};
+  if (o.type === 'event_msg' && /^(task_started|turn_aborted|task_complete)$/.test(p.type)) out.clear();
+  if (o.type !== 'response_item' || (p.type === 'message' && p.role !== 'assistant')) return '';
+  if (/_output$/.test(p.type)) { out.delete(p.call_id); return 'result'; }
+  if (p.call_id && /_call$/.test(p.type)) out.set(p.call_id, { name: p.name || p.type, at });
+  return 'step';
+}
+
+// What the main agent should hear about its running executors, as [{who, text}]: a segment past SEGMENT_MAX; silence
+// (see C.SILENT), with how to interrupt it and ask, since it keeps its context; silence again after that, when it is
+// to be replaced. A Codex thread driven by codex-worker.mjs is asked by its driver. The hook says each once per session
+// and logs it. wake: for the background watch, which only wakes the main agent so that the hook says it (the main
+// agent doesn't see a background command's output): what the hook hasn't said yet, each once. codex: the main agent
+// runs in Codex. wcmd(sub): a codex-worker.mjs command line.
+export function executorNotes(running, { now = Date.now(), sessionId, root, codex = false, wcmd, wake = false }) {
+  const notes = [], min = t => Math.round((now - t) / 60e3), had = said(sessionId);
+  const once = key => (wake ? !had[key] && claimSaid(sessionId, `wake ${key}`, l => !l, now) : claimSaid(sessionId, key, l => !l, now));
+  for (const a of running) {
+    const driven = a.driver === 'codex-worker', over = now - a.seg >= C.SEGMENT_MAX;
+    // Silence counts from its last sign of life, never earlier than its last tool call.
+    const quiet = !driven && now - a.last >= C.SILENT;
+    if (!over && !quiet) continue;
+    const who = a.worker ? `${a.type === 'codex' ? 'Codex 执行者' : '外部执行者'}「${agentName(a)}」（任务 ${a.id}）` : `子代理「${agentName(a)}」（${a.type}）`;
+    const say = (text, event = '', detail = '') => {
+      if (event && !wake) log(root, sessionId, event, detail);
+      notes.push({ who, text: who + text });
+    };
+    // A worker hears nothing mid-turn: stop it and resume the same thread.
+    const ask = what => a.worker
+      ? `它跑着的时候收不到消息：${driven ? `用 ${wcmd(`stop ${a.id}`)} 停掉，再在后台运行 ${wcmd(`resume ${a.id} "${what}"`)}` : `用它的驱动停掉，再让同一个线程接着做：“${what}”`}，上下文还在。`
+      : codex ? `用 interrupt_agent 打断它，再用 followup_task 对它说：“${what}”，它会带着上下文接着做。`
+      : `用 TaskStop 停掉它（${a.id}），再用 SendMessage 对它说：“${what}”，它会带着上下文接着做。`;
+    if (over && once(`over ${a.id} ${a.seg}`)) {
+      say(a.worker
+        ? `这一段已经连续跑了 ${min(a.seg)} 分钟，超过一段 1 小时的上限，还没有交回。${a.cmd ? `它正在跑命令「${clip(a.cmd, 120)}」（${min(a.cmdAt)} 分钟）。` : ''}没有说得过去的理由，就要它交阶段回报：${ask('到时间上限了：停下来，交阶段回报和继续申请')}`
+        : `这一段已经连续跑了 ${min(a.seg)} 分钟，超过一段 1 小时的上限，还没有交阶段回报。问它一次进展；没有说得过去的理由，就停掉它，按它任务目录里的 notes.md 另派。`);
+    }
+    if (!quiet) continue;
+    const { last, wait } = activity(a);
+    const limit = wait ? C.STUCK : C.SILENT, key = `quiet ${a.id} ${a.seg} ${last}`, asked = had[key];
+    if (!asked && now - last >= limit && once(key)) {
+      say(wait
+        ? `在等的工具调用 ${wait.name} 已经 ${min(wait.at)} 分钟没有返回。打断它问一句：${ask(`你调用的 ${wait.name} ${min(wait.at)} 分钟没有返回，被打断了：先说一句它在做什么、为什么卡住，然后接着做`)}`
+        : `已经 ${min(last)} 分钟没有任何动静，也不在等工具。打断它问一句：${ask(`你已经 ${min(last)} 分钟没有动静，被打断了：先说一句刚才在做什么、卡在哪里，然后接着做`)}`,
+      'agent-quiet', `${a.id} ${min(last)}min${wait ? ' tool' : ''}`);
+    } else if (asked && now - Math.max(asked, last) >= limit && once(`stuck ${a.id} ${a.seg} ${last}`)) {
+      say(`被问过之后又 ${min(asked)} 分钟没有动静。停掉它，按它任务目录里的 notes.md 另派。`, 'agent-stuck', a.id);
+    }
+  }
+  return notes;
+}
+
+// The complete JSON records in the last `bytes` of a JSONL file.
+export function tailRecords(file, bytes) {
+  try {
+    const fd = fs.openSync(file, 'r');
+    const size = fs.fstatSync(fd).size, n = Math.min(size, bytes);
+    const buf = Buffer.alloc(n);
+    fs.readSync(fd, buf, 0, n, size - n);
+    fs.closeSync(fd);
+    const lines = buf.toString('utf8').split('\n');
+    if (n < size) lines.shift(); // partial first line
+    return lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  } catch { return []; }
+}
+const clip = (s, n) => { s = String(s ?? '').replace(/\s+/g, ' ').trim(); return s.length > n ? s.slice(0, n) + '…' : s; };
 
 export function headOf(file, bytes) {
   try {
