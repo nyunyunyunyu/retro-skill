@@ -642,6 +642,244 @@ await test('metrics after the run: the window ends at the last event; labels in 
   assert.match(out, /标“推翻前提”的 1 份；核实：一致 0，不一致 1/);
 });
 
+// Codex executors for a Claude main agent: codex-worker.mjs drives a fake codex (test/fake-codex.mjs).
+const WORKER = path.join(here, '..', 'skills', 'retro', 'scripts', 'codex-worker.mjs');
+function codex(t) {
+  const logFile = path.join(t.tmp, 'fake-codex.log');
+  const env = { ...t.env, RETRO_CODEX: JSON.stringify([process.execPath, path.join(here, 'fake-codex.mjs')]), FAKE_CODEX_LOG: logFile };
+  const run = (...a) => spawnSync(process.execPath, [WORKER, ...a, '--root', t.proj], { env, encoding: 'utf8' });
+  const start = (...a) => {
+    const p = spawn(process.execPath, [WORKER, ...a, '--root', t.proj], { env });
+    let out = '';
+    p.stdout.on('data', d => (out += d));
+    p.done = new Promise(res => p.on('close', code => res({ code, out })));
+    return p;
+  };
+  const calls = () => (fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l)) : []);
+  const brief = (task, text) => { fs.mkdirSync(t.retro(`tasks/${task}`), { recursive: true }); fs.writeFileSync(t.retro(`tasks/${task}/brief.md`), text); };
+  const worker = id => JSON.parse(fs.readFileSync(t.retro(`workers/${id}.json`), 'utf8'));
+  return { env, run, start, calls, brief, worker, pidFile: logFile + '.pid' };
+}
+const until = async (ok, ms = 10000) => { const safeOk = () => { try { return ok(); } catch { return false; } }; for (const t0 = Date.now(); !safeOk(); ) { if (Date.now() - t0 > ms) throw new Error('timed out waiting'); await new Promise(r => setTimeout(r, 50)); } };
+const isAlive = pid => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
+
+await test('codex-worker run: brief and settings passed, final message and report printed, segment logged; resume continues the thread', () => {
+  const t = setup('cw-run', { goalAgo: 30 });
+  t.hook();
+  const c = codex(t);
+  const report = t.retro('tasks/t1/report.md');
+  c.brief('t1', `# 试一下 expectimax\nREPORT:${report}\n`);
+  const r = c.run('run', 't1');
+  assert.equal(r.status, 0, r.stdout);
+  assert.match(r.stdout, /Codex 执行者 t1：这一轮结束。线程 thread-\d+/);
+  assert.match(r.stdout, /回报：.*report\.md/);
+  assert.match(r.stdout, /最后的话：\n答复：# 试一下 expectimax/);
+  const [call] = c.calls();
+  assert.equal(call.prompt, `# 试一下 expectimax\nREPORT:${report}\n`);
+  for (const a of ['approval_policy="never"', 'sandbox_mode="workspace-write"', 'exec', '--json', '-C', t.proj]) assert.ok(call.argv.includes(a), a);
+  assert.ok(!call.argv.some(a => a.includes('writable_roots')), 'working in the project needs no extra writable root');
+  const w = c.worker('t1');
+  assert.equal(w.desc, '试一下 expectimax'); assert.equal(w.type, 'codex'); assert.ok(w.stopAt > 0); assert.match(w.thread, /^thread-/);
+  const r2 = c.run('resume', 't1', '为什么', '这么慢？');
+  assert.equal(r2.status, 0, r2.stdout);
+  const call2 = c.calls()[1];
+  assert.deepEqual(call2.argv.slice(-2), [w.thread, '-']); assert.ok(call2.argv.includes('resume'));
+  assert.equal(call2.prompt, '为什么 这么慢？');
+  assert.match(r2.stdout, /这一轮没有写 report\.md/);
+  assert.equal(c.worker('t1').desc, '试一下 expectimax');
+  const log = fs.readFileSync(t.retro('log.tsv'), 'utf8');
+  assert.equal(log.match(/agent-start\tt1 codex/g).length, 2);
+  assert.equal(log.match(/agent-stop\tt1/g).length, 2);
+  // Working in a worktree: the project's .retro/ stays writable.
+  const wt = path.join(t.tmp, 'wt');
+  fs.mkdirSync(wt, { recursive: true });
+  c.brief('t2', 'x');
+  assert.equal(c.run('run', 't2', '--cd', wt).status, 0);
+  const call3 = c.calls()[2];
+  assert.equal(path.resolve(call3.cwd), path.resolve(wt));
+  assert.ok(call3.argv.some(a => a.startsWith('sandbox_workspace_write.writable_roots=[') && a.includes('/.retro')), call3.argv.join(' '));
+  assert.equal(c.run('resume', 't2', 'y').status, 0);
+  assert.equal(path.resolve(c.calls()[3].cwd), path.resolve(wt), 'resume works where the run did');
+  // Its record pruned after a day: resume finds the thread and directory in the task's event log.
+  const th = c.worker('t2').thread;
+  fs.unlinkSync(t.retro('workers/t2.json'));
+  assert.equal(c.run('resume', 't2', 'z').status, 0);
+  const call5 = c.calls()[4];
+  assert.equal(path.resolve(call5.cwd), path.resolve(wt)); assert.equal(call5.argv.at(-2), th);
+  // A directory inside the project that doesn't hold .retro/ (a worktree under the repo) gets it as a writable root too;
+  // sandbox settings in RETRO_CODEX are left alone.
+  const sub = path.join(t.proj, 'w');
+  fs.mkdirSync(sub, { recursive: true });
+  c.brief('t3', 'x');
+  assert.equal(c.run('run', 't3', '--cd', sub).status, 0);
+  assert.ok(c.calls()[5].argv.some(a => a.startsWith('sandbox_workspace_write.writable_roots=')));
+  const own = JSON.stringify([process.execPath, path.join(here, 'fake-codex.mjs'), '-c', 'sandbox_mode="danger-full-access"']);
+  assert.equal(spawnSync(process.execPath, [WORKER, 'run', 't3', '--root', t.proj], { env: { ...c.env, RETRO_CODEX: own }, encoding: 'utf8' }).status, 0);
+  assert.deepEqual(c.calls()[6].argv.filter(a => a.startsWith('sandbox_mode=')), ['sandbox_mode="danger-full-access"']);
+  // --git makes the repository's git directory writable, so it can commit; resume keeps it.
+  const gp = path.join(t.tmp, 'gp');
+  fs.mkdirSync(gp, { recursive: true });
+  spawnSync('git', ['init', '-q'], { cwd: gp });
+  c.brief('t4', 'x');
+  assert.equal(c.run('run', 't4', '--cd', gp, '--git').status, 0);
+  const roots = () => c.calls().at(-1).argv.find(a => a.startsWith('sandbox_workspace_write.writable_roots=')) || '';
+  assert.ok(roots().includes(`${gp.replace(/\\/g, '/')}/.git"`) && roots().includes('/.retro"'), roots());
+  assert.equal(c.run('resume', 't4', 'y').status, 0);
+  assert.ok(roots().includes('/.git"'), 'resume keeps --git');
+  assert.equal(c.run('run', 't4', '--cd', gp).status, 0);
+  assert.ok(!roots().includes('/.git"'), 'a new run without --git');
+  assert.match(c.run('run', 't3', '--cd', wt, '--git').stdout, /--git：git 在 .* 找不到仓库（.*not a git repository/i);
+  // A stop request left over from an earlier segment doesn't stop a new one.
+  fs.writeFileSync(t.retro('workers/t1.stop'), '12345');
+  assert.match(c.run('run', 't1').stdout, /t1：这一轮结束/);
+  assert.ok(!fs.existsSync(t.retro('workers/t1.stop')));
+  // A new run that fails before its thread starts doesn't keep the old thread or the old last words.
+  c.brief('t1', 'NOTHREAD');
+  assert.equal(c.run('run', 't1').status, 1);
+  assert.equal(c.worker('t1').thread, null); assert.equal(c.worker('t1').said, '');
+  assert.match(c.run('resume', 't1', 'x').stdout, /没有可以接着的线程/);
+});
+
+await test('codex-worker: a process codex leaves behind holding its output does not hold up the hand-back', () => {
+  const t = setup('cw-linger', { goalAgo: 30 });
+  t.hook();
+  const c = codex(t);
+  c.brief('lin', 'LINGER');
+  const t0 = Date.now();
+  const r = c.run('run', 'lin');
+  assert.equal(r.status, 0, r.stdout);
+  assert.match(r.stdout, /lin：这一轮结束/);
+  assert.ok(Date.now() - t0 < 10e3, `took ${Date.now() - t0} ms`);
+});
+
+await test('codex-worker stop: the process tree goes, the run exits 1 with a resume hint; while it runs the hook counts it and a second run is refused', async () => {
+  const t = setup('cw-stop', { goalAgo: 30 });
+  t.hook(); t.cli('spawned', t.slot().start);
+  fs.writeFileSync(t.retro('slots'), JSON.stringify({ n: 1, at: iso(Date.now() - 6 * MIN), why: 'x' }));
+  const c = codex(t);
+  c.brief('long', 'SLEEP');
+  const p = c.start('run', 'long');
+  await until(() => fs.existsSync(c.pidFile) && fs.existsSync(t.retro('workers/long.json')) && c.worker('long').cmd);
+  const grandchild = Number(fs.readFileSync(c.pidFile, 'utf8'));
+  assert.doesNotMatch(t.text(t.hook()), /名额空着/);
+  // Two commands ran at once and one finished: the other is still running.
+  assert.match(t.cli('status').stdout, /在跑 1 个）：SLEEP［codex long］（在跑，这一段 0 分钟，正在跑命令「python eval\.py」/);
+  const again = c.run('run', 'long');
+  assert.equal(again.status, 1); assert.match(again.stdout, /long 还在跑/);
+  assert.match(c.run('stop', 'long').stdout, /已停止 long。在后台跑它的 run\/resume 会交出输出/);
+  const { code, out } = await p.done;
+  assert.equal(code, 1);
+  assert.match(out, /Codex 执行者 long：已被停止/);
+  assert.match(out, /要它交阶段回报：在后台运行 node ".*codex-worker\.mjs" resume long "到时间上限了/);
+  await until(() => !isAlive(grandchild), 5000);
+  assert.ok(c.worker('long').stopAt > 0);
+  assert.match(fs.readFileSync(t.retro('log.tsv'), 'utf8'), /agent-stop\tlong/);
+  assert.match(c.run('stop', 'long').stdout, /long 没有在跑/);
+  assert.ok(!fs.existsSync(t.retro('workers/long.stop')));
+  fs.writeFileSync(t.retro('workers/long.json'), JSON.stringify({ ...c.worker('long'), stopAt: Date.now() - 6 * MIN }));
+  t.age(11);
+  assert.match(t.text(t.hook()), /名额是 1 个，现在在跑的执行子代理只有 0 个/);
+  // The driver died. On Windows its codex died with it, so stop kills nothing; elsewhere stop ends the codex process
+  // group this segment started, but never a process that merely got its pid.
+  const win = process.platform === 'win32';
+  const dead = spawnSync(process.execPath, ['-e', '0']).pid;
+  const orphan = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore', detached: !win });
+  const other = win ? spawn('ping', ['-n', '60', '127.0.0.1'], { stdio: 'ignore' }) : spawn('sleep', ['60'], { stdio: 'ignore' });
+  for (const [id, child] of [['orphan', orphan.pid], ['other', other.pid]]) fs.writeFileSync(t.retro(`workers/${id}.json`), JSON.stringify({ type: 'codex', driver: 'codex-worker', seg: Date.now(), stopAt: 0, pid: dead, child }));
+  const o = c.run('stop', 'orphan').stdout;
+  if (win) {
+    assert.match(o, /已停止 orphan：驱动已经不在了，Codex 进程随它一起结束/);
+    assert.ok(isAlive(orphan.pid)); orphan.kill();
+  } else {
+    assert.match(o, /已停止 orphan：驱动已经不在了，直接结束了 Codex 进程组/);
+    await until(() => !isAlive(orphan.pid), 5000);
+  }
+  assert.match(c.run('stop', 'other').stdout, win ? /已停止 other：驱动已经不在了/ : /Codex 进程也已经不在了/);
+  assert.ok(isAlive(other.pid), 'a process that is not codex was killed');
+  other.kill();
+  assert.ok(c.worker('other').stopAt > 0);
+});
+
+await test('codex-worker: a timeout stops the turn; a failed turn and a missing codex exit 1 with the reason; an empty brief registers nothing', async () => {
+  const t = setup('cw-fail', { goalAgo: 30 });
+  t.hook();
+  const c = codex(t);
+  c.brief('slow', 'SLEEP');
+  const r = c.run('run', 'slow', '--timeout', '0.02');
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /slow：超过 0 分钟，已停止/);
+  await until(() => !isAlive(Number(fs.readFileSync(c.pidFile, 'utf8'))), 5000);
+  c.brief('bad', 'FAIL');
+  const f = c.run('run', 'bad');
+  assert.equal(f.status, 1); assert.match(f.stdout, /异常结束（退出码 1）/); assert.match(f.stdout, /错误：boom/);
+  const missing = spawnSync(process.execPath, [WORKER, 'run', 'bad', '--root', t.proj], { env: { ...c.env, RETRO_CODEX: path.join(t.tmp, 'no-codex.exe') }, encoding: 'utf8' });
+  assert.equal(missing.status, 1); assert.match(missing.stdout, /没能启动 codex（ENOENT）/);
+  assert.ok(c.worker('bad').stopAt > 0, 'a codex that never started is not left running');
+  const empty = c.run('run', 'none');
+  assert.equal(empty.status, 1); assert.match(empty.stdout, /任务说明是空的/);
+  assert.ok(!fs.existsSync(t.retro('workers/none.json')));
+  assert.match(c.run('resume', 'none', 'x').stdout, /没有可以接着的线程/);
+  assert.match(c.run('run', '../x').stdout, /任务名只用字母/);
+  if (process.platform === 'win32') { // a .cmd can't be spawned directly
+    fs.writeFileSync(path.join(t.tmp, 'codex.cmd'), '@echo off\n');
+    c.brief('cmdx', 'x');
+    const r2 = spawnSync(process.execPath, [WORKER, 'run', 'cmdx', '--root', t.proj], { env: { ...c.env, RETRO_CODEX: path.join(t.tmp, 'codex.cmd') }, encoding: 'utf8' });
+    assert.equal(r2.status, 1); assert.match(r2.stdout, /没能启动 codex（EINVAL）.*不能是 \.cmd/);
+    assert.ok(!fs.existsSync(t.retro('workers/cmdx.json')));
+  }
+});
+
+await test('workers in the hook: past an hour or silent outside a command, the note names the task and the stop/resume commands; a dead driver counts as stopped', () => {
+  const t = setup('cw-hook', { goalAgo: 90 });
+  t.hook(); t.cli('spawned', t.slot().start); t.cli('slots', '3', 'x'); t.cli('done');
+  for (const id of ['long', 'quiet', 'busy']) assert.equal(t.cli('worker', 'start', id, `任务 ${id}`, '--pid', String(process.pid), '--type', 'codex').status, 0);
+  const file = id => t.retro(`workers/${id}.json`);
+  const patch = (id, kv) => fs.writeFileSync(file(id), JSON.stringify({ ...JSON.parse(fs.readFileSync(file(id), 'utf8')), ...kv }));
+  for (const id of ['long', 'quiet', 'busy']) patch(id, { driver: 'codex-worker' });
+  patch('long', { seg: Date.now() - 61 * MIN });
+  patch('busy', { cmd: 'python eval.py', cmdAt: Date.now() - 80 * MIN });
+  // Inside a command for over an hour: still running (silence alone never ends a worker with a live driver).
+  t.setTime(file('quiet'), 25); t.setTime(file('busy'), 80);
+  fs.writeFileSync(file('torn'), ''); // caught mid-write: ignored
+  fs.writeFileSync(t.retro('slots'), JSON.stringify({ n: 3, at: iso(Date.now() - 6 * MIN), why: 'x' }));
+  const r = t.text(t.hook());
+  assert.doesNotMatch(r, /torn/);
+  assert.doesNotMatch(t.cli('status').stdout, /torn/);
+  assert.match(r, /Codex 执行者「任务 long」（任务 long）这一段已经连续跑了 61 分钟/);
+  assert.match(r, /codex-worker\.mjs" stop long --root[\s\S]*codex-worker\.mjs" resume long "到时间上限了/);
+  assert.match(r, /「任务 quiet」（任务 quiet）已经 25 分钟没有动静，也不在跑命令/);
+  assert.doesNotMatch(r, /任务 busy/);
+  assert.doesNotMatch(t.text(t.hook()), /Codex 执行者/);
+  assert.doesNotMatch(r, /名额空着/);
+  // A driver that died without saying so: not running, and its slot is free.
+  const dead = spawnSync(process.execPath, ['-e', '0']).pid;
+  patch('quiet', { pid: dead }); patch('busy', { pid: dead }); patch('long', { pid: dead });
+  for (const id of ['long', 'quiet', 'busy']) t.setTime(file(id), 6);
+  fs.writeFileSync(t.retro('slots'), JSON.stringify({ n: 3, at: iso(Date.now() - 6 * MIN), why: 'x' }));
+  t.age(11);
+  assert.match(t.text(t.hook()), /名额是 3 个，现在在跑的执行子代理只有 0 个/);
+  assert.match(t.cli('status').stdout, /任务 long［codex long］（驱动已经不在了/);
+});
+
+await test('a worker handing back counts for the checkpoint; metrics counts its segments; retro.mjs worker for other drivers', () => {
+  const t = setup('cw-check', { goalAgo: 61 });
+  t.hook();
+  assert.equal(t.cli('worker', 'start', 'x1', '外部任务').status, 0);
+  assert.equal(t.cli('worker', 'beat', 'x1').status, 0);
+  assert.doesNotMatch(t.text(t.hook()), /检查点到期/);
+  assert.match(t.cli('worker', 'stop', 'x1').stdout, /已记下 x1 停了/);
+  assert.match(t.text(t.hook()), /检查点到期/);
+  assert.equal(t.cli('worker', 'beat', 'x1').status, 1);
+  assert.match(t.cli('worker', 'stop', 'x1').stdout, /没有登记或已经停了/);
+  assert.equal(t.cli('worker', 'start', 'a b').status, 1);
+  // Without a driver pid it counts as running until silent for an hour.
+  t.cli('worker', 'start', 'x2');
+  assert.match(t.cli('status').stdout, /在跑 1 个）：x2［external x2］/);
+  t.setTime(t.retro('workers/x2.json'), 61);
+  assert.match(t.cli('status').stdout, /在跑 0 个）/);
+  assert.match(t.cli('metrics').stdout, /2 段，2 个子代理；交回的 1 段/);
+});
+
 await test('inbox starts from the goal start and caps its size', () => {
   const t = setup('inbox', { goalAgo: 10 });
   t.hook();
@@ -901,6 +1139,6 @@ await test('hook stays fast on a 60 MB transcript (first scan, then cached)', ()
   assert.ok(cached < 1500);
 });
 
-fs.rmSync(TMP, { recursive: true, force: true });
+try { fs.rmSync(TMP, { recursive: true, force: true, maxRetries: 3 }); } catch (e) { console.log(`(could not remove ${TMP}: ${e.code})`); }
 console.log(`\n${n - failed}/${n} passed`);
 process.exit(failed ? 1 : 0);

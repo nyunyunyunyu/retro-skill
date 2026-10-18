@@ -15,11 +15,16 @@
 //   status                 progress digest for the progress desk (read-only)
 //   metrics [--since <ISO>]   process metrics since the goal started, for analysis after a run (read-only)
 //   tell <text>            the progress desk passes on what the user said; delivered at the main agent's next tool call
+//   worker start <id> [desc] [--pid <n>] [--type <t>] | beat <id> | stop <id>
+//                          a driver registers an executor another harness runs (codex-worker.mjs does this itself), so
+//                          the hook counts it in the slots and the checkpoint sees it hand back. --pid: the driver's
+//                          process; when it is gone the worker counts as stopped (without one: silent for an hour)
 import fs from 'node:fs';
 import path from 'node:path';
 import {
   C, EXIT_BUSY, EXIT_GONE, agentName, dir, ensureDir, goalAgents, goalCache, harnessLimit, headOf, iso, lastRetro, lastWrite,
-  limitOf, locked, log, mainCheckout, mtime, openIdeas, read, readSlot, readSlots, reports, sessions, writeSlot,
+  limitOf, locked, log, mainCheckout, mtime, openIdeas, read, readSlot, readSlots, reports, safe, sessions, workerBeat,
+  workerStart, workerStop, writeSlot,
 } from './lib.mjs';
 
 const args = process.argv.slice(2);
@@ -34,8 +39,8 @@ const ago = t => (t ? `${clock(t)}（${Math.max(0, Math.round((now - t) / 60e3))
 const fail = (msg, code = 1) => { console.log(msg); process.exit(code); };
 const busy = () => fail('状态文件被其他进程占用：等几秒后重试同一条命令。', EXIT_BUSY);
 
-const commands = { done, inbox, slots, request, spawned, finish, abort, status, metrics, tell, root: () => console.log(root) };
-if (!commands[cmd]) fail('用法：node retro.mjs <done|inbox [--since-last review|scout]|slots <N> <理由>|request review|scout|spawned <start>|finish <start> <file>|abort <start>|status|metrics [--since <ISO>]|tell <话>> [--root <项目>]');
+const commands = { done, inbox, slots, request, spawned, finish, abort, status, metrics, tell, worker, root: () => console.log(root) };
+if (!commands[cmd]) fail('用法：node retro.mjs <done|inbox [--since-last review|scout]|slots <N> <理由>|request review|scout|spawned <start>|finish <start> <file>|abort <start>|status|metrics [--since <ISO>]|tell <话>|worker start|beat|stop <id>> [--root <项目>]');
 commands[cmd]();
 
 // Same mapping as the hook: a worktree path stands for the same place in the main checkout.
@@ -287,6 +292,17 @@ function abort() {
   console.log('已释放这一轮。');
 }
 
+function worker() {
+  const flag = name => { const i = rest.indexOf(name); if (i < 0) return null; const v = rest[i + 1]; rest.splice(i, 2); return v; };
+  const pid = Number(flag('--pid')) || null, type = flag('--type') || 'external';
+  const [sub, id, ...desc] = rest;
+  if (!id || safe(id) !== id) fail('用法：node retro.mjs worker start <id> [说明] [--pid <驱动进程>] [--type <类型>] | beat <id> | stop <id>（id 只用字母、数字、_ 和 -）');
+  if (sub === 'start') { workerStart(root, id, { desc: desc.join(' '), type, pid }); console.log(`已登记 ${id}。`); }
+  else if (sub === 'beat') { if (!workerBeat(root, id)) fail(`${id} 没有登记或已经停了。`); }
+  else if (sub === 'stop') console.log(workerStop(root, id) ? `已记下 ${id} 停了。` : `${id} 没有登记或已经停了。`);
+  else fail('用法：worker start|beat|stop <id>');
+}
+
 function status() {
   const all = sessions(root);
   const out = [`# 进度快照（${new Date(now).toLocaleString('zh-CN', { hour12: false })}，项目 ${root}）`];
@@ -302,10 +318,11 @@ function status() {
   const set = readSlots(root);
   out.push(`名额：${set && set.at >= start ? `${set.n} 个（${set.why || '没写理由'}，记于 ${ago(set.at)}）` : '这个目标还没记下'}`);
   // From the hook's subagent tracker: executors of this goal, running ones first.
-  const { agents, running } = ms.session_id ? goalAgents(ms.session_id, start, now) : { agents: [], running: [] };
+  const { agents, running } = goalAgents(ms.session_id || '-', start, now, root);
   const mins = t => Math.round((now - t) / 60e3);
-  const state = a => running.includes(a) ? `在跑，这一段 ${mins(a.seg)} 分钟${now - a.last >= C.SILENT ? `，${mins(a.last)} 分钟没有调用工具` : ''}` : a.active ? `${mins(a.last)} 分钟没有动静，可能已被停掉` : `已交回（${clock(a.stopAt)}）`;
-  if (agents.length) out.push(`执行子代理（hook 记录，在跑 ${running.length} 个）：${[...running, ...agents.filter(a => !running.includes(a)).sort((a, b) => b.last - a.last).slice(0, 5)].map(a => `${agentName(a)}（${state(a)}）`).join('；')}`);
+  const run = a => `在跑，这一段 ${mins(a.seg)} 分钟${a.cmd ? `，正在跑命令「${clip(a.cmd, 80)}」（${mins(a.cmdAt)} 分钟）` : now - a.last >= C.SILENT ? `，${mins(a.last)} 分钟没有动静` : ''}`;
+  const state = a => (running.includes(a) ? run(a) : a.active ? `${mins(a.last)} 分钟没有动静，可能已被停掉` : a.gone ? `驱动已经不在了（最后动静 ${clock(a.last)}）` : `已交回（${clock(a.stopAt)}）`) + (a.said ? `；最后说：${clip(a.said, 100)}` : '');
+  if (agents.length) out.push(`执行者（外部执行者注明类型和任务名；在跑 ${running.length} 个）：${[...running, ...agents.filter(a => !running.includes(a)).sort((a, b) => b.last - a.last).slice(0, 5)].map(a => `${agentName(a)}${a.worker ? `［${a.type} ${a.id}］` : ''}（${state(a)}）`).join('；')}`);
   const s = readSlot(root);
   const kind = { review: '路线评审', scout: '全局侦察', stall: '停滞提醒' }[s.type] || s.type;
   out.push(`后台评审：${s.state === 'none' ? '还没用过' : `${kind} ${s.state}，登记于 ${ago(s.start)}${s.spawned ? `，启动于 ${ago(s.spawnedAt)}` : ''}`}${s.kv.want ? `；已请求一次${s.kv.want === 'scout' ? '侦察' : '评审'}` : ''}`);

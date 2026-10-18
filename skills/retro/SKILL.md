@@ -258,3 +258,14 @@ PROGRESS.md 是快照，不是日志：检查点时整体改写，过程细节�
 | 判断目标达成 | 一个独立的模型看对话内容判断，它不跑命令，所以证据要出现在对话里 | 你自己用 `update_goal` 标记完成，标记前要有这次会话里的证据 |
 | 一次性提醒 | CronCreate，`recurring: false`；先用 CronList 查有没有 | Codex app 里的一次性线程定时任务 |
 | 项目规则文件 | `CLAUDE.md`（里面一行 `@AGENTS.md`） | `AGENTS.md` |
+
+### Claude Code 里派 Codex 执行
+
+用户要 Codex 执行任务时，执行子代理换成 Codex 线程，由 `<本 skill 目录>/scripts/codex-worker.mjs` 驱动。核实任务和后台的评审、侦察仍然用 Claude 子代理。
+- **派任务**：任务说明照第 3 节写全，第一行是一个短标题，写进 `<任务目录>/brief.md`。然后用 Bash 在后台（`run_in_background`）运行 `node "<本 skill 目录>/scripts/codex-worker.mjs" run <任务> --root "<项目>"`，任务名就是任务目录名。要在别的目录（worktree）里做，加 `--cd <目录>`。
+- **等结果**：结束这一轮。命令结束时，它的输出会作为新的一轮送到：这一轮怎么结束的、`report.md` 在哪、它最后说的话。`/goal` 也会等它。
+- **追问、让它接着做**：等它这一轮结束，再在后台运行同一个脚本的 `resume <任务> "<话>" --root "<项目>"`，还是同一个线程，上下文还在。它跑着的时候收不到消息。
+- **停掉**：`stop <任务> --root "<项目>"`。不要只用 TaskStop 停那条后台命令，它起的命令可能停不干净。
+- **名额**：Codex 线程不占 Claude Code 的子代理上限，按资源和用户写的上限定。hook 把它们和 Claude 子代理一起算，超时、没动静也会提醒。
+- **能力**：Codex 线程在 workspace-write 沙箱里，`.git` 是只读的，默认也不能联网。任务要提交就加 `--git`（`resume` 沿用），只加在要提交的任务上：它能改 `.git` 里的 hook、配置和所有分支。需要联网（装依赖、拉代码）的任务交给 Claude 子代理，除非用户已经在 `RETRO_CODEX` 里放开。
+- **跑不起来**：输出里说缺 codex-code-mode-host、没能启动 codex，或者命令一直卡着。先停掉它，把输出转给用户，请用户按 retro 的 README 配置 `RETRO_CODEX`；在那之前改用 Claude 子代理执行，并在回复里说明。

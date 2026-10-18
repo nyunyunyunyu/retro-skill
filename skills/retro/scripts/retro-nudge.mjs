@@ -10,8 +10,9 @@
 //   a ledger row, a commit, a subagent stop), repeated until marked done. Calls and result counts never trigger it;
 //   with nothing new, the stall and idle-slot notes speak instead.
 // - Subagent tracker: each subagent tool call touches <tmp>/claude-retro-<session>.agents/<agent>.json and SubagentStop
-//   marks it stopped. From that: slots left idle (against the count set with `retro.mjs slots`), a segment past an
-//   hour, a subagent silent for 20 min.
+//   marks it stopped; workers another harness runs (.retro/workers/, Codex threads for a Claude main agent) count too.
+//   From that: slots left idle (against the count set with `retro.mjs slots`), a segment past an hour, an executor
+//   silent for 20 min (a worker inside a command is not).
 // - Background slot: one route review or idea scout at a time per project, state in .retro/slot. Only this hook
 //   reserves it (under an exclusive lock): at goal start (a scout), then hourly; a scout when none ran for 4 h or the
 //   idea pool runs low, otherwise a review; or right away after `retro.mjs request`. If nothing new came back in the
@@ -25,9 +26,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  C, SLOT_AGENTS, agentName, agentsDir, ensureDir, goalAgents, harnessLimit, iso, lastRetro, limitOf, locked, log,
-  mainCheckout, newestResult, openIdeas, progressGoal, read, readSlot, readSlots, safe, sessions, trackedAgents, withLock,
-  writeSlot,
+  C, SLOT_AGENTS, agentName, agentsDir, ensureDir, goalAgents, handbacks, harnessLimit, iso, lastRetro, limitOf, locked,
+  log, mainCheckout, newestResult, openIdeas, progressGoal, read, readSlot, readSlots, safe, sessions, withLock, writeSlot,
 } from './lib.mjs';
 
 const now = Date.now();
@@ -63,7 +63,9 @@ const root = mainCheckout(process.env.CLAUDE_PROJECT_DIR || input.cwd || process
 if (read(base + '.root') !== root) try { fs.writeFileSync(base + '.root', root); } catch {}
 const CLI = fileURLToPath(new URL('./retro.mjs', import.meta.url)).replace(/\\/g, '/');
 const SKILL = fileURLToPath(new URL('../SKILL.md', import.meta.url)).replace(/\\/g, '/');
+const WORKER = fileURLToPath(new URL('./codex-worker.mjs', import.meta.url)).replace(/\\/g, '/');
 const cmd = sub => `\`node "${CLI}" ${sub} --root "${root.replace(/\\/g, '/')}"\``;
+const wcmd = sub => `\`node "${WORKER}" ${sub} --root "${root.replace(/\\/g, '/')}"\``;
 const tool = goal.codex ? 'Codex' : 'Claude Code';
 
 if (event === 'SessionStart') {
@@ -261,7 +263,7 @@ function checkpoint() {
   const R = Math.max(goal.start, lastRetro(root));
   const due = R + C.CHECKPOINT_EVERY;
   // Only once something came back since the last one: with nothing to sort, the stall and idle-slot notes speak instead.
-  if (now < due || newestResult(root, trackedAgents(input.session_id).map(a => a.stopAt).filter(Boolean)) <= R) return;
+  if (now < due || newestResult(root, handbacks(input.session_id, root)) <= R) return;
   const first = !(saidMap().checkpoint >= due);
   if (!timely('checkpoint', due, true)) return;
   const mins = Math.round((now - R) / 60e3);
@@ -274,9 +276,10 @@ function checkpoint() {
 
 // The subagent tracker, read for the main agent: segments past the limit, subagents gone silent, slots left idle.
 function watch() {
-  const { agents, running } = goalAgents(input.session_id, goal.start, now);
+  const { agents, running } = goalAgents(input.session_id, goal.start, now, root);
   const min = t => Math.round((now - t) / 60e3);
   for (const a of running) {
+    if (a.worker) { worker(a, min); continue; }
     if (now - a.seg >= C.SEGMENT_MAX) {
       if (once(`over ${a.id} ${a.seg}`)) notes.push(`子代理「${agentName(a)}」（${a.type}）这一段已经连续跑了 ${min(a.seg)} 分钟，超过一段 1 小时的上限，还没有交阶段回报。问它一次进展；没有说得过去的理由，就停掉它，按它任务目录里的 notes.md 另派。`);
     } else if (now - a.last >= C.SILENT && once(`silent ${a.id} ${a.last}`)) {
@@ -292,9 +295,23 @@ function watch() {
   // Idle since the last time a slot freed up (approximately, when several are idle), or since the last launch: a new
   // executor shows up only at its first tool call.
   const launch = Number(read(base + '.launch')) || 0;
-  const freed = Math.max(set.at, goal.start, launch, ...agents.map(a => a.stopAt || (a.active && now - a.last >= C.GONE ? a.last + C.GONE : 0)));
+  const freed = Math.max(set.at, goal.start, launch, ...agents.map(a => a.stopAt || (a.active && !a.worker && now - a.last >= C.GONE ? a.last + C.GONE : 0)));
   if (timely('idle', freed + C.IDLE_GRACE)) {
     notes.push(`名额空着：这个目标的名额是 ${set.n} 个，现在在跑的执行子代理只有 ${running.length} 个${running.length ? `（${running.map(agentName).join('、')}）` : ''}。按主循环补位，从“下一步”或想法池派任务，别忘了探索。名额要变，就用 ${cmd('slots <N> <理由>')} 改。`);
+  }
+}
+
+// A worker can't be asked anything mid-turn: stop it and resume the same thread, which keeps its context. Inside a
+// command it is not silent (the hour limit still applies).
+function worker(a, min) {
+  const name = `${a.type === 'codex' ? 'Codex 执行者' : '外部执行者'}「${agentName(a)}」（任务 ${a.id}）`;
+  const ask = what => `它跑着的时候收不到消息：${a.driver === 'codex-worker'
+    ? `用 ${wcmd(`stop ${a.id}`)} 停掉，再在后台运行 ${wcmd(`resume ${a.id} "${what}"`)}`
+    : `用它的驱动停掉，再让同一个线程接着做：“${what}”`}，上下文还在。`;
+  if (now - a.seg >= C.SEGMENT_MAX) {
+    if (once(`over ${a.id} ${a.seg}`)) notes.push(`${name}这一段已经连续跑了 ${min(a.seg)} 分钟，超过一段 1 小时的上限，还没有交回。${a.cmd ? `它正在跑命令「${a.cmd.slice(0, 120)}」（${min(a.cmdAt)} 分钟）。` : ''}没有说得过去的理由，就要它交阶段回报：${ask('到时间上限了：停下来，交阶段回报和继续申请')}`);
+  } else if (!a.cmd && now - a.last >= C.SILENT && once(`silent ${a.id} ${a.last}`)) {
+    notes.push(`${name}已经 ${min(a.last)} 分钟没有动静，也不在跑命令。问它一次进展：${ask('你已经很久没有动静：说一下进展和卡在哪里')}`);
   }
 }
 
@@ -341,7 +358,7 @@ function slot() {
     if (tellOwner(s.kv.start)) notes.push(stopNote);
     return;
   }
-  const finished = trackedAgents(input.session_id).map(a => a.stopAt).filter(Boolean);
+  const finished = handbacks(input.session_id, root);
   const plan = t => {
     if (t.state === 'running') return null;
     // `retro.mjs request`, made during this goal

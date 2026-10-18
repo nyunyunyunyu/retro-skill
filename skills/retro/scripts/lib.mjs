@@ -4,6 +4,7 @@
 //   retro-done       ISO time the last finished checkpoint's window ends, written by `retro.mjs done`
 //   inbox-at         when the main agent last ran `retro.mjs inbox`
 //   probes/          background agents' probe scripts and the notes behind their reports
+//   workers/<task>.json   executors another harness runs (Codex threads driven by codex-worker.mjs), see workers()
 //   log.tsv          append-only event log (time, session, event, detail), for the progress desk and later analysis
 //   sessions/<id>.json   sessions that hold an active /goal here, for the progress desk
 //   tasks/<task>/report.md   executor reports; ideas.md, backlog.md, results.tsv, route-review.md, reviews/ are written by agents
@@ -21,6 +22,8 @@ export const C = {
   CHECKPOINT_EVERY: 60 * MIN, REPEAT: 10 * MIN,
   SLOT_EVERY: 60 * MIN, SCOUT_EVERY: 240 * MIN, LAUNCH_MAX: 20 * MIN, REVIEW_MAX: 20 * MIN, SCOUT_MAX: 40 * MIN, GRACE: 2 * MIN,
   SEGMENT_MAX: 60 * MIN, SILENT: 20 * MIN, GONE: 60 * MIN, IDLE_GRACE: 5 * MIN, SLOTS_BY: 10 * MIN,
+  // A backstop: codex-worker.mjs stops a Codex turn this long. The hook asks the main agent at SEGMENT_MAX.
+  WORKER_MAX: 120 * MIN,
   // Subagents the harness allows at once, minus RESERVE (the background review/scout and two spare), must leave
   // MIN_SLOTS executors. Defaults: Codex 3 ([agents] max_concurrent_threads_per_session), Claude Code 20.
   RESERVE: 3, MIN_SLOTS: 2, CODEX_LIMIT: 3, CLAUDE_LIMIT: 20,
@@ -57,7 +60,7 @@ export const mtime = f => { try { return fs.statSync(f).mtimeMs; } catch { retur
 export const read = f => { try { return fs.readFileSync(f, 'utf8'); } catch { return ''; } };
 
 // Files the scripts and agents generate; kept out of git so worktrees don't carry stale copies.
-const GENERATED = ['slot', 'slot.lock', 'slots', 'retro-done', 'inbox-at', 'log.tsv', 'sessions/', 'tasks/', 'reviews/', 'probes/', 'ideas.md', 'backlog.md', 'results.tsv', 'route-review.md', 'user-inbox.jsonl', 'user-said.md'];
+const GENERATED = ['slot', 'slot.lock', 'slots', 'retro-done', 'inbox-at', 'log.tsv', 'sessions/', 'tasks/', 'reviews/', 'probes/', 'workers/', 'ideas.md', 'backlog.md', 'results.tsv', 'route-review.md', 'user-inbox.jsonl', 'user-said.md'];
 // A new .retro/ ignores everything. An existing one (some projects commit parts of it) gets a .gitignore for the
 // generated files only, unless it already has one. A list we wrote earlier picks up names added since.
 export function ensureDir(root) {
@@ -204,19 +207,89 @@ export function trackedAgents(sessionId) {
     return { id, type: h.type || '?', seg: h.seg || 0, tp: h.tp || '', last: mtime(path.join(d, f)), stopAt, active: !stopAt };
   });
 }
-// The tracked executors of a goal that started at `since`, and which of them are running: not stopped, and heard from
-// within GONE (a subagent stopped without a SubagentStop looks like this). Entries idle for a day are removed.
-export function goalAgents(sessionId, since, now = Date.now()) {
-  const all = trackedAgents(sessionId);
-  for (const a of all) {
-    if (now - Math.max(a.last, a.stopAt) > 864e5) for (const ext of ['json', 'stop']) try { fs.unlinkSync(path.join(agentsDir(sessionId), `${a.id}.${ext}`)); } catch {}
-  }
-  const agents = all.filter(a => Math.max(a.seg, a.last, a.stopAt) >= since && now - Math.max(a.last, a.stopAt) <= 864e5);
-  return { agents, running: agents.filter(a => a.active && now - a.last < C.GONE) };
+// External workers: executors another harness runs for this project, registered by their driver (codex-worker.mjs, or
+// `retro.mjs worker start|beat|stop`). .retro/workers/<id>.json holds {desc, type, driver, seg, stopAt, pid (the
+// driver process), child, thread, cwd, cmd (the command running now), cmdAt, said (its last words)}; its mtime is the
+// last sign of life. Written whole (temp file, then rename), so a reader never sees half a record.
+// A worker whose driver process is gone (or, without a pid, silent for GONE) counts as stopped at its last sign.
+const workersDir = root => path.join(dir(root), 'workers');
+export const alive = pid => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
+export function readWorker(root, id) {
+  try { return JSON.parse(fs.readFileSync(path.join(workersDir(root), `${safe(id)}.json`), 'utf8')); } catch { return null; }
 }
+export function writeWorker(root, id, kv) {
+  ensureDir(root);
+  fs.mkdirSync(workersDir(root), { recursive: true });
+  const w = { ...readWorker(root, id), ...kv };
+  const f = path.join(workersDir(root), `${safe(id)}.json`), tmp = `${f}.${process.pid}.tmp`;
+  try { fs.writeFileSync(tmp, JSON.stringify(w)); fs.renameSync(tmp, f); } catch { try { fs.unlinkSync(tmp); } catch {} fs.writeFileSync(f, JSON.stringify(w)); }
+  return w;
+}
+// A new segment: what the last one said and how it ended don't carry over. thread: undefined keeps the old one.
+export function workerStart(root, id, { desc, type = 'external', driver = '', pid = null, child = null, thread, cwd } = {}) {
+  const prev = readWorker(root, id) || {};
+  const w = writeWorker(root, id, {
+    desc: desc || prev.desc || '', type, driver, seg: Date.now(), stopAt: 0, pid, child, thread: thread === undefined ? prev.thread ?? null : thread,
+    cwd: cwd ?? prev.cwd ?? null, cmd: null, cmdAt: 0, said: '', exit: null, why: null,
+  });
+  log(root, '-', 'agent-start', `${safe(id)} ${type}`);
+  return w;
+}
+// A sign of life, with what changed (cmd, said, thread…). False once it stopped.
+export function workerBeat(root, id, kv = {}) {
+  const w = readWorker(root, id);
+  if (!w || w.stopAt) return false;
+  writeWorker(root, id, kv);
+  return true;
+}
+export function workerStop(root, id, kv = {}) {
+  const w = readWorker(root, id);
+  if (!w || w.stopAt) return false;
+  writeWorker(root, id, { ...kv, stopAt: Date.now(), cmd: null });
+  log(root, '-', 'agent-stop', safe(id));
+  return true;
+}
+const seen = new Map(); // per process: the hook asks several times per call
+export function workers(root) {
+  if (seen.has(root)) return seen.get(root);
+  let names = [];
+  try { names = fs.readdirSync(workersDir(root)).filter(f => f.endsWith('.json')); } catch {}
+  const now = Date.now();
+  const out = names.map(f => {
+    let w = null;
+    try { w = JSON.parse(read(path.join(workersDir(root), f))); } catch {}
+    if (!w?.seg) return null;
+    const last = mtime(path.join(workersDir(root), f));
+    const gone = !w.stopAt && (w.pid ? !alive(w.pid) : now - last >= C.GONE);
+    return {
+      id: f.slice(0, -5), worker: true, type: w.type || 'external', driver: w.driver || '', desc: w.desc || '', tp: '', seg: w.seg, last,
+      stopAt: w.stopAt || (gone ? last : 0), active: !w.stopAt && !gone, gone, cmd: w.cmd || '', cmdAt: w.cmdAt || 0, said: w.said || '',
+    };
+  }).filter(Boolean);
+  seen.set(root, out);
+  return out;
+}
+const forget = (sessionId, root, a) => {
+  const base = path.join(a.worker ? workersDir(root) : agentsDir(sessionId), a.id);
+  for (const ext of ['json', 'stop']) try { fs.unlinkSync(`${base}.${ext}`); } catch {}
+};
+
+// The executors of a goal that started at `since` (tracked subagents, and the project's workers when root is given),
+// and which of them are running: not stopped, and for a subagent heard from within GONE (one stopped without a
+// SubagentStop looks like this). Entries idle for a day are removed.
+export function goalAgents(sessionId, since, now = Date.now(), root = null) {
+  const all = [...trackedAgents(sessionId), ...(root ? workers(root) : [])];
+  for (const a of all) if (now - Math.max(a.last, a.stopAt) > 864e5) forget(sessionId, root, a);
+  const agents = all.filter(a => Math.max(a.seg, a.last, a.stopAt) >= since && now - Math.max(a.last, a.stopAt) <= 864e5);
+  return { agents, running: agents.filter(a => a.active && (a.worker || now - a.last < C.GONE)) };
+}
+// When executors handed back (subagents of the session and the project's workers): progress for the checkpoint.
+export const handbacks = (sessionId, root) => [...trackedAgents(sessionId), ...workers(root)].map(a => a.stopAt).filter(Boolean);
 // A name the main agent knows the subagent by. Claude Code: the description in subagents/agent-<id>.meta.json next to
-// the main transcript. Codex: the agent path its rollout's first record names. Else the id.
+// the main transcript. Codex: the agent path its rollout's first record names. A worker: what its driver called it.
+// Else the id.
 export function agentName(a) {
+  if (a.desc) return a.desc;
   const tp = String(a.tp || '');
   const own = /[\\/]subagents[\\/]agent-[^\\/]+\.jsonl$/.test(tp);
   const meta = own ? tp.replace(/\.jsonl$/, '.meta.json') : path.join(tp.replace(/\.jsonl$/, ''), 'subagents', `agent-${a.id}.meta.json`);
