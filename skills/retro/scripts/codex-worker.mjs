@@ -13,13 +13,13 @@
 // nobody can answer a prompt, and without it commands hang waiting for one. Executors get what Claude's have: network
 // (off by default in the sandbox) and commits (the sandbox keeps .git read-only, so the repository's git directory is
 // added as a writable root).
-// The codex command is RETRO_CODEX: an executable, or a JSON array of the executable and leading arguments; default
-// "codex". The thread's events go to the task directory (codex-events.jsonl), its last message to codex-last.md.
+// The codex command: RETRO_CODEX, else the Codex desktop app's copy on Windows, else codex (lib.mjs codexCommand).
+// The thread's events go to the task directory (codex-events.jsonl), its last message to codex-last.md.
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { C, alive, dir, mainCheckout, mtime, read, readWorker, safe, withLock, workerBeat, workerStart, workerStop } from './lib.mjs';
+import { C, alive, codexCommand, dir, mainCheckout, mtime, read, readWorker, safe, withLock, workerBeat, workerStart, workerStop } from './lib.mjs';
 
 const args = process.argv.slice(2);
 const opt = name => { const i = args.indexOf(name); if (i < 0) return null; const v = args[i + 1]; args.splice(i, 2); return v ?? ''; };
@@ -40,10 +40,7 @@ const lastFile = path.join(taskDir, 'codex-last.md'), eventsFile = path.join(tas
 const prev = readWorker(root, task);
 const isRunning = w => !!w && !w.stopAt && !!w.pid && alive(w.pid);
 let exe, pre;
-try {
-  const raw = process.env.RETRO_CODEX || 'codex';
-  [exe, ...pre] = raw.trim().startsWith('[') ? JSON.parse(raw) : [raw];
-} catch { fail('RETRO_CODEX 不是合法的 JSON 数组。'); }
+try { [exe, ...pre] = codexCommand(); } catch { fail('RETRO_CODEX 不是合法的 JSON 数组。'); }
 
 if (cmd === 'stop') stop();
 
@@ -159,7 +156,7 @@ child.on('close', code => {
     : code === 0 ? '这一轮结束' : `异常结束（退出码 ${code}）`;
   const out = [`Codex 执行者 ${task}：${how}。线程 ${thread || '无'}，用时 ${Math.round((Date.now() - started) / 60e3)} 分钟。`];
   if (error) out.push(`错误：${clip(error, 600)}`);
-  if (/code-mode host/i.test(stderr)) out.push('这个 codex 缺 codex-code-mode-host，跑不了命令：把 RETRO_CODEX 指向带它的 codex（见 retro 的 README）。');
+  if (/code-mode host/i.test(stderr)) out.push(`这个 codex（${exe}）缺 codex-code-mode-host，跑不了命令：装上 Codex 桌面版，或者把 RETRO_CODEX 指向带它的 codex（见 retro 的 README）。`);
   else if (code !== 0 && !why && stderr.trim()) out.push(`codex 的报错（末尾）：${clip(stderr.slice(-1500), 1500)}`);
   if (writable.length && ownRoots) out.push(`注意：RETRO_CODEX 自己设了 writable_roots，驱动没有加 ${writable.join('、')}：要提交或写回报，那里面得有它们。`);
   out.push(mtime(report) >= started ? `回报：${report}` : '这一轮没有写 report.md。');

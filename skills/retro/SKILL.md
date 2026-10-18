@@ -268,4 +268,4 @@ PROGRESS.md 是快照，不是日志：检查点时整体改写，过程细节�
 - **停掉**：`stop <任务> --root "<项目>"`。不要只用 TaskStop 停那条后台命令，它起的命令可能停不干净。
 - **名额**：Codex 线程不占 Claude Code 的子代理上限，按资源和用户写的上限定。hook 把它们和 Claude 子代理一起算，超时、没动静也会提醒。
 - **能力**：Codex 线程能改代码、跑命令、联网、提交，和 Claude 子代理一样派任务。
-- **跑不起来**：输出里说缺 codex-code-mode-host、没能启动 codex，或者命令一直卡着。先停掉它，把输出转给用户，请用户按 retro 的 README 配置 `RETRO_CODEX`；在那之前改用 Claude 子代理执行，并在回复里说明。
+- **跑不起来**：输出里说缺 codex-code-mode-host、没能启动 codex，或者命令一直卡着。先停掉它，把输出转给用户，请用户装上 Codex 桌面版或按 retro 的 README 设 `RETRO_CODEX`；在那之前改用 Claude 子代理执行，并在回复里说明。

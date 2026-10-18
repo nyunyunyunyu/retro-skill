@@ -1,6 +1,6 @@
 // End-to-end check with a real Codex: a Claude Code main agent (synthetic hook input) dispatches executor tasks to Codex
 // through codex-worker.mjs. Takes a few minutes and a little Codex usage, so it is not part of run.mjs.
-// Run: node test/codex-live.mjs   (RETRO_CODEX as for real use; see README)
+// Run: node test/codex-live.mjs   (uses the codex the driver would pick; see README)
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -21,9 +21,10 @@ git('init', '-q'); fs.writeFileSync(path.join(proj, 'README.md'), 'live test\n')
 const old = (Date.now() - 120 * 60e3) / 1000;
 for (const f of fs.readdirSync(path.join(proj, '.git', 'logs'), { recursive: true })) fs.utimesSync(path.join(proj, '.git', 'logs', f), old, old);
 
-// Low effort keeps it quick; everything else as configured.
-const raw = process.env.RETRO_CODEX || 'codex';
-const codexCmd = [...(raw.trim().startsWith('[') ? JSON.parse(raw) : [raw]), '-c', 'model_reasoning_effort="low"'];
+// The codex the driver would pick, with low effort to keep it quick; everything else as configured.
+const { codexCommand } = await import('../skills/retro/scripts/lib.mjs');
+const codexCmd = [...codexCommand(), '-c', 'model_reasoning_effort="low"'];
+console.log(`codex: ${codexCmd.join(' ')}`);
 const env = { ...process.env, RETRO_CODEX: JSON.stringify(codexCmd) };
 // Hook and CLI keep their per-session state in their own temp dir; Codex keeps the real one.
 const hookEnv = { ...env, TEMP: state, TMP: state, TMPDIR: state, CLAUDE_PROJECT_DIR: proj };

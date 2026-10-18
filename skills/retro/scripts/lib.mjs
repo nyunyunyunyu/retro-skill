@@ -214,6 +214,25 @@ export function trackedAgents(sessionId) {
 // A worker whose driver process is gone (or, without a pid, silent for GONE) counts as stopped at its last sign.
 const workersDir = root => path.join(dir(root), 'workers');
 export const alive = pid => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
+// The codex command for workers, as [executable, ...leading args]. RETRO_CODEX wins: an executable, or a JSON array
+// (throws if that isn't valid). Otherwise, on Windows, the Codex desktop app's own copy, newest first among
+// %LOCALAPPDATA%\OpenAI\Codex\bin\<hash>\ that hold codex-code-mode-host.exe too, with the flags the app starts it
+// with: its directory changes with every update, and a standalone CLI may lack the host and then runs no command.
+// Else codex from PATH.
+export function codexCommand(env = process.env, platform = process.platform) {
+  const raw = env.RETRO_CODEX?.trim();
+  if (raw) return raw.startsWith('[') ? JSON.parse(raw) : [raw];
+  if (platform === 'win32' && env.LOCALAPPDATA) {
+    const bin = path.join(env.LOCALAPPDATA, 'OpenAI', 'Codex', 'bin');
+    let dirs = [];
+    try { dirs = fs.readdirSync(bin).map(d => path.join(bin, d)); } catch {}
+    const app = dirs.filter(d => fs.existsSync(path.join(d, 'codex.exe')) && fs.existsSync(path.join(d, 'codex-code-mode-host.exe')))
+      .sort((a, b) => mtime(path.join(b, 'codex.exe')) - mtime(path.join(a, 'codex.exe')))[0];
+    if (app) return [path.join(app, 'codex.exe'), '-c', 'features.code_mode_host=true', '-c', 'features.prefer_mxc=true'];
+  }
+  return ['codex'];
+}
+
 export function readWorker(root, id) {
   try { return JSON.parse(fs.readFileSync(path.join(workersDir(root), `${safe(id)}.json`), 'utf8')); } catch { return null; }
 }

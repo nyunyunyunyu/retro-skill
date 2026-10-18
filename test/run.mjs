@@ -4,7 +4,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const HOOK = path.join(here, '..', 'skills', 'retro', 'scripts', 'retro-nudge.mjs');
@@ -662,6 +662,28 @@ function codex(t) {
 }
 const until = async (ok, ms = 10000) => { const safeOk = () => { try { return ok(); } catch { return false; } }; for (const t0 = Date.now(); !safeOk(); ) { if (Date.now() - t0 > ms) throw new Error('timed out waiting'); await new Promise(r => setTimeout(r, 50)); } };
 const isAlive = pid => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
+
+await test('codex command: RETRO_CODEX wins; else on Windows the desktop app\'s newest copy that has its host, with its flags; else codex', () => {
+  const la = path.join(TMP, 'localappdata'), bin = path.join(la, 'OpenAI', 'Codex', 'bin');
+  const copy = (h, host, mins) => {
+    const d = path.join(bin, h);
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, 'codex.exe'), '');
+    if (host) fs.writeFileSync(path.join(d, 'codex-code-mode-host.exe'), '');
+    const t = (Date.now() - mins * MIN) / 1000; fs.utimesSync(path.join(d, 'codex.exe'), t, t);
+  };
+  copy('old', true, 60); copy('new', true, 5); copy('nohost', false, 0); fs.mkdirSync(path.join(bin, 'rgonly'));
+  const lib = pathToFileURL(path.join(here, '..', 'skills', 'retro', 'scripts', 'lib.mjs')).href;
+  const cmd = (env, platform) => {
+    const r = spawnSync(process.execPath, ['--input-type=module', '-e', `import { codexCommand } from ${JSON.stringify(lib)}; console.log(JSON.stringify(codexCommand(${JSON.stringify(env)}, ${JSON.stringify(platform)})))`], { encoding: 'utf8' });
+    return JSON.parse(r.stdout || 'null');
+  };
+  assert.deepEqual(cmd({ LOCALAPPDATA: la }, 'win32'), [path.join(bin, 'new', 'codex.exe'), '-c', 'features.code_mode_host=true', '-c', 'features.prefer_mxc=true']);
+  assert.deepEqual(cmd({ LOCALAPPDATA: la, RETRO_CODEX: 'C:/x/codex.exe' }, 'win32'), ['C:/x/codex.exe']);
+  assert.deepEqual(cmd({ LOCALAPPDATA: la, RETRO_CODEX: '["a", "-c", "b"]' }, 'win32'), ['a', '-c', 'b']);
+  assert.deepEqual(cmd({ LOCALAPPDATA: la }, 'linux'), ['codex']);
+  assert.deepEqual(cmd({ LOCALAPPDATA: path.join(TMP, 'no-app') }, 'win32'), ['codex']);
+});
 
 await test('codex-worker run: brief and settings passed, final message and report printed, segment logged; resume continues the thread', () => {
   const t = setup('cw-run', { goalAgo: 30 });

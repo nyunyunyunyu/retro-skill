@@ -115,13 +115,11 @@ Claude Code 当主 agent，负责调度、核实和后台评审，执行任务�
 - codex 退出后，驱动最多再等 2 秒读完输出就交回，不会被它留在后台的进程拖住。
 - 事件存在任务目录的 `codex-events.jsonl`（命令输出太长的截断），最后一条消息存在 `codex-last.md`；超过一天的登记会被清掉，`resume` 从事件里找回线程。一轮超过 2 小时会被强制停掉，作为兜底。
 
-**配置 `RETRO_CODEX`**：codex 的命令，可以是一个可执行文件，也可以是 JSON 数组（可执行文件加前置参数），默认 `codex`。模型和思考强度用 Codex 自己的配置，也可以在数组里加 `-c`。Windows 上单独装的 CLI（比如 `~/.local/bin/codex.exe`）可能缺 `codex-code-mode-host.exe`，跑不了任何命令，这时指向桌面版自带的 codex，并带上桌面版用的两个开关。写在 `~/.claude/settings.json` 里：
-
-```json
-{ "env": { "RETRO_CODEX": "[\"C:/Users/<你>/AppData/Local/OpenAI/Codex/bin/<版本目录>/codex.exe\", \"-c\", \"features.code_mode_host=true\", \"-c\", \"features.prefer_mxc=true\"]" } }
-```
-
-桌面版更新后版本目录会变，路径要跟着改。
+**用哪个 codex**：一般不用配。
+- Windows 上，驱动用 Codex 桌面版自带的那份：在 `%LOCALAPPDATA%\OpenAI\Codex\bin\<版本目录>\` 里找同时有 `codex.exe` 和 `codex-code-mode-host.exe` 的、最新的一个，带上桌面版启动它时用的两个开关（`features.code_mode_host`、`features.prefer_mxc`）。版本目录每次更新都会变，所以每次现找。单独装的 CLI（比如 `~/.local/bin/codex.exe`）可能缺 `codex-code-mode-host.exe`，跑不了任何命令，所以不优先用它。
+- 找不到桌面版，或者不是 Windows，就用 PATH 上的 `codex`。
+- 要指定，就设环境变量 `RETRO_CODEX`（比如写在 `~/.claude/settings.json` 的 `env` 里）：一个可执行文件，或者 JSON 数组（可执行文件加前置参数），比如 `["C:/tools/codex.exe", "-c", "model_reasoning_effort=\"high\""]`。设了它就不再自动找，桌面版的两个开关也要自己写上。
+- 模型和思考强度用 Codex 自己的配置。
 
 **别的驱动**（比如走 Codex app-server）：每个线程开始时运行 `retro.mjs worker start <任务> [说明] --pid <驱动进程> --type <类型>`，有动静时 `worker beat <任务>`，结束时 `worker stop <任务>`。不给 `--pid` 的，60 分钟没动静就算停了。
 
