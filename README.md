@@ -104,7 +104,8 @@ node retro-skill/install.mjs
 Claude Code 当主 agent，负责调度、核实和后台评审，执行任务交给 Codex：在 `/goal` 条件或对话里告诉它“执行交给 Codex”。主 agent 把任务说明写进 `.retro/tasks/<任务>/brief.md`，在后台运行 `codex-worker.mjs run <任务>`；命令结束时，Claude Code 把输出作为新的一轮送给它，`/goal` 也会等后台命令跑完。追问用 `resume <任务> "<话>"`，接着同一个线程；停掉用 `stop <任务>`。
 
 驱动做的事：
-- 用 `codex exec --json` 跑一轮，`approval_policy` 设为 `never`，因为没人能回答确认请求，不设的话命令会一直卡在等确认。沙箱默认是 `workspace-write`：不能联网，也提交不了，因为 Codex 把 `.git` 设成只读（实测 `git add` 报 Permission denied）。`run` 加 `--git` 时，驱动把仓库的 git 目录（worktree 共用的那个）加进可写目录，就能提交了；代价是它也能改 `.git` 里的 hook 和配置（会在沙箱外执行），还能改所有 worktree 的分支，包括 main；权限和 Claude 执行子代理差不多。要放开就在 `RETRO_CODEX` 里加 `-c`，比如 `sandbox_workspace_write.network_access=true`，或者换一个 `sandbox_mode`。工作目录（`--cd`）不包含项目的 `.retro/` 时（比如 worktree），驱动把 `.retro/` 加进可写目录，回报才写得进去；这会替换你配置里的 `writable_roots`。`RETRO_CODEX` 里自己给了 `sandbox_mode` 或 `writable_roots` 的，驱动就不加自己的。
+- 用 `codex exec --json` 跑一轮，`approval_policy` 设为 `never`：没人能回答确认请求，不设的话命令会一直卡在等确认。
+- 沙箱默认是 `workspace-write`，不能联网；要联网就在 `RETRO_CODEX` 里加 `-c sandbox_workspace_write.network_access=true`，或者换一个 `sandbox_mode`。这个沙箱还把 `.git` 设成只读（实测 `git add` 报 Permission denied），执行者就提交不了，所以驱动把仓库的 git 目录（worktree 共用的那个）加进可写目录。这样它也能改 `.git` 里的 hook、配置（会在沙箱外执行）和所有分支，和 Claude 执行子代理的权限差不多。工作目录（`--cd`）不包含项目的 `.retro/` 时（比如 worktree），`.retro/` 也加进去，回报才写得进去。这些可写目录会替换你配置里的 `writable_roots`；`RETRO_CODEX` 里自己给了 `sandbox_mode` 或 `writable_roots` 的，驱动就不加自己的。
 - 把线程登记在 `.retro/workers/<任务>.json`：hook 把它算进名额，一段超过 1 小时、不在跑命令却 20 分钟没动静时提醒主 agent，检查点也能看到它交回。驱动进程没了，就算它停了。
 - `stop` 让正在跑的驱动结束这个线程和它起的所有进程。驱动已经不在了的：Windows 上 codex 会随驱动一起结束；其他系统上先确认那还是这一段启动的 codex 进程，才结束它的进程组，免得误伤用了同一个进程号的别的程序。
 - codex 退出后，驱动最多再等 2 秒读完输出就交回，不会被它留在后台的进程拖住。

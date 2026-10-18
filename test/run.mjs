@@ -716,19 +716,18 @@ await test('codex-worker run: brief and settings passed, final message and repor
   const own = JSON.stringify([process.execPath, path.join(here, 'fake-codex.mjs'), '-c', 'sandbox_mode="danger-full-access"']);
   assert.equal(spawnSync(process.execPath, [WORKER, 'run', 't3', '--root', t.proj], { env: { ...c.env, RETRO_CODEX: own }, encoding: 'utf8' }).status, 0);
   assert.deepEqual(c.calls()[6].argv.filter(a => a.startsWith('sandbox_mode=')), ['sandbox_mode="danger-full-access"']);
-  // --git makes the repository's git directory writable, so it can commit; resume keeps it.
+  // Inside a git repository (from a subfolder too), its git directory is writable, so it can commit; resume too.
   const gp = path.join(t.tmp, 'gp');
-  fs.mkdirSync(gp, { recursive: true });
+  fs.mkdirSync(path.join(gp, 'src'), { recursive: true });
   spawnSync('git', ['init', '-q'], { cwd: gp });
   c.brief('t4', 'x');
-  assert.equal(c.run('run', 't4', '--cd', gp, '--git').status, 0);
+  assert.equal(c.run('run', 't4', '--cd', path.join(gp, 'src')).status, 0);
   const roots = () => c.calls().at(-1).argv.find(a => a.startsWith('sandbox_workspace_write.writable_roots=')) || '';
   assert.ok(roots().includes(`${gp.replace(/\\/g, '/')}/.git"`) && roots().includes('/.retro"'), roots());
   assert.equal(c.run('resume', 't4', 'y').status, 0);
-  assert.ok(roots().includes('/.git"'), 'resume keeps --git');
-  assert.equal(c.run('run', 't4', '--cd', gp).status, 0);
-  assert.ok(!roots().includes('/.git"'), 'a new run without --git');
-  assert.match(c.run('run', 't3', '--cd', wt, '--git').stdout, /--git：git 在 .* 找不到仓库（.*not a git repository/i);
+  assert.ok(roots().includes('/.git"'));
+  assert.equal(c.run('run', 't3', '--cd', wt).status, 0);
+  assert.ok(roots().includes('/.retro"') && !roots().includes('/.git"'), 'outside a repository there is no git directory to add');
   // A stop request left over from an earlier segment doesn't stop a new one.
   fs.writeFileSync(t.retro('workers/t1.stop'), '12345');
   assert.match(c.run('run', 't1').stdout, /t1：这一轮结束/);

@@ -2,17 +2,16 @@
 // Runs a retro executor task as a Codex thread (`codex exec --json`) for a main agent in another harness (Claude Code),
 // and registers it as a worker (.retro/workers/, see lib.mjs): the hook counts it in the slots, notices a long segment
 // or silence, and the checkpoint sees it hand back. Every command takes --root <project>.
-//   run <task> [--brief <file>] [--cd <dir>] [--git] [--desc <name>] [--timeout <min>]
-//                 a new thread on the brief (default .retro/tasks/<task>/brief.md), working in --cd (default the project).
-//                 --git lets it commit: the sandbox keeps .git read-only, so the repository's git directory is added
-//                 as a writable root (it could then also change hooks and config that run outside the sandbox)
-//   resume <task> <message> [--brief <file>] [--timeout <min>]   the same thread again (same directory and --git):
-//                 a follow-up, or more time
+//   run <task> [--brief <file>] [--cd <dir>] [--desc <name>] [--timeout <min>]
+//                 a new thread on the brief (default .retro/tasks/<task>/brief.md), working in --cd (default the project)
+//   resume <task> <message> [--brief <file>] [--timeout <min>]   the same thread again, in the same directory: a
+//                 follow-up, or more time
 //   stop <task>   asks the run/resume driving the thread to stop it with its process tree (.retro/workers/<task>.stop)
 // run and resume block until the turn ends, so start them in the background; they print how the turn ended and the
 // thread's last message, and exit 0 only when the turn completed. The turn is stopped after --timeout (default
 // WORKER_MAX). Codex runs in the workspace-write sandbox (RETRO_CODEX may override it) with approval_policy "never":
-// nobody can answer a prompt, and without it commands hang waiting for one.
+// nobody can answer a prompt, and without it commands hang waiting for one. The sandbox keeps .git read-only, so the
+// repository's git directory is added as a writable root and executors can commit, as Claude's do.
 // The codex command is RETRO_CODEX: an executable, or a JSON array of the executable and leading arguments; default
 // "codex". The thread's events go to the task directory (codex-events.jsonl), its last message to codex-last.md.
 import { spawn, spawnSync } from 'node:child_process';
@@ -24,8 +23,6 @@ import { C, alive, dir, mainCheckout, mtime, read, readWorker, safe, withLock, w
 const args = process.argv.slice(2);
 const opt = name => { const i = args.indexOf(name); if (i < 0) return null; const v = args[i + 1]; args.splice(i, 2); return v ?? ''; };
 const rootArg = opt('--root'), briefArg = opt('--brief'), cdArg = opt('--cd'), descArg = opt('--desc'), timeoutArg = opt('--timeout');
-const gitArg = args.includes('--git');
-if (gitArg) args.splice(args.indexOf('--git'), 1);
 const [cmd, task, ...words] = args;
 const root = mainCheckout(rootArg || process.env.CLAUDE_PROJECT_DIR || process.cwd());
 const SELF = fileURLToPath(import.meta.url).replace(/\\/g, '/');
@@ -65,10 +62,7 @@ const given = key => pre.some(a => String(a).startsWith(`${key}=`));
 const config = given('sandbox_mode') ? [] : ['-c', 'sandbox_mode="workspace-write"'];
 // The report goes under the project's .retro/, which a worktree or another directory doesn't contain.
 const rel = path.relative(cwd, dir(root));
-const git = gitArg || (resume && !!(prev ? prev.git : logged.git));
-const gd = git ? gitDir(cwd) : {};
-if (git && !gd.dir) fail(`--git：git 在 ${cwd} 找不到仓库（${gd.err}）。`);
-const writable = [(rel.startsWith('..') || path.isAbsolute(rel)) && dir(root), gd.dir].filter(Boolean);
+const writable = [(rel.startsWith('..') || path.isAbsolute(rel)) && dir(root), gitDir(cwd)].filter(Boolean);
 const ownRoots = given('sandbox_workspace_write.writable_roots');
 if (writable.length && !ownRoots) config.push('-c', `sandbox_workspace_write.writable_roots=[${writable.map(d => JSON.stringify(d.replace(/\\/g, '/'))).join(',')}]`);
 const argv = [...pre, ...config, '-c', 'approval_policy="never"', 'exec', ...(resume ? ['resume'] : []), '--json', '--skip-git-repo-check',
@@ -89,8 +83,7 @@ const got = withLock(lockFile, () => {
     return e; // e.g. EINVAL for a .cmd on Windows
   }
   seg = workerStart(root, task, { desc, type: 'codex', driver: 'codex-worker', pid: process.pid, child: child.pid ?? null, thread: thread0, cwd }).seg;
-  workerBeat(root, task, { git });
-  try { fs.appendFileSync(eventsFile, JSON.stringify({ type: 'retro.run', cwd, git, at: new Date(started).toISOString() }) + '\n'); } catch {}
+  try { fs.appendFileSync(eventsFile, JSON.stringify({ type: 'retro.run', cwd, at: new Date(started).toISOString() }) + '\n'); } catch {}
   return 'ok';
 }, 20);
 if (got === undefined || got === 'busy') fail(`${task} 正在由另一个 run/resume 启动或在跑。`);
@@ -166,7 +159,7 @@ child.on('close', code => {
   if (error) out.push(`错误：${clip(error, 600)}`);
   if (/code-mode host/i.test(stderr)) out.push('这个 codex 缺 codex-code-mode-host，跑不了命令：把 RETRO_CODEX 指向带它的 codex（见 retro 的 README）。');
   else if (code !== 0 && !why && stderr.trim()) out.push(`codex 的报错（末尾）：${clip(stderr.slice(-1500), 1500)}`);
-  if (git && ownRoots) out.push('注意：RETRO_CODEX 自己设了 writable_roots，--git 没有生效，除非那里面有仓库的 git 目录。');
+  if (writable.length && ownRoots) out.push(`注意：RETRO_CODEX 自己设了 writable_roots，驱动没有加 ${writable.join('、')}：要提交或写回报，那里面得有它们。`);
   out.push(mtime(report) >= started ? `回报：${report}` : '这一轮没有写 report.md。');
   if (why && thread) out.push(`要它交阶段回报：在后台运行 ${again(`resume ${task} "到时间上限了：停下来，交阶段回报和继续申请"`)}`);
   const last = read(lastFile).trim() || said.trim();
@@ -211,19 +204,18 @@ function killTree(pid) {
   else try { process.kill(-pid, 'SIGTERM'); } catch {}
 }
 
-// The repository's git directory, shared by its worktrees (commits write there), or why git couldn't give it.
+// The repository's git directory, shared by its worktrees (commits write there), or '' outside a repository.
 function gitDir(d) {
   const r = spawnSync('git', ['-C', d, 'rev-parse', '--git-common-dir'], { encoding: 'utf8', windowsHide: true });
-  if (r.status === 0 && r.stdout.trim()) return { dir: path.resolve(d, r.stdout.trim()) };
-  return { err: clip(r.error?.message || r.stderr, 200) || '原因不明' };
+  return r.status === 0 && r.stdout.trim() ? path.resolve(d, r.stdout.trim()) : '';
 }
 
-// The last thread, working directory and --git in the task's event log.
+// The last thread and working directory in the task's event log.
 function fromEvents() {
   const out = {};
   for (const l of read(eventsFile).split('\n')) {
     if (l.includes('"thread.started"')) out.thread = l.match(/"thread_id":"([^"]+)"/)?.[1] || out.thread;
-    if (l.startsWith('{"type":"retro.run"')) try { ({ cwd: out.cwd, git: out.git } = JSON.parse(l)); } catch {}
+    if (l.startsWith('{"type":"retro.run"')) try { out.cwd = JSON.parse(l).cwd; } catch {}
   }
   return out;
 }

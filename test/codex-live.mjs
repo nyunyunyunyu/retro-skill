@@ -63,9 +63,9 @@ try {
   cli('slots', '1', 'live');
   fs.writeFileSync(retro('slots'), JSON.stringify({ n: 1, at: new Date(Date.now() - 6 * MIN).toISOString(), why: 'live' }));
 
-  let ok = step('a task brief runs as a Codex thread; the hook counts it while it runs; it follows executor.md, commits with --git and reports');
+  let ok = step('a task brief runs as a Codex thread; the hook counts it while it runs; it follows executor.md, commits and reports');
   brief('t1', `# 写 hello.txt\n任务：在项目根目录 ${proj.replace(/\\/g, '/')} 用一条 shell 命令创建 hello.txt，内容只有一行 hi from codex，然后用 git 提交它（提交信息 add hello）。\n验收：文件存在，内容正确；提交不了就在回报里写原因，不要绕过。验证档位：探索，验证预算 2 分钟。时间上限 10 分钟。\n任务目录：${retro('tasks/t1').replace(/\\/g, '/')}\n开始前先读 ${EXECUTOR}，按其中的规则执行和回报。\n`);
-  const p1 = start('run', 't1', '--git');
+  const p1 = start('run', 't1');
   await until(() => worker('t1')?.thread, 120e3, 'thread started');
   assert.doesNotMatch(hook(), /名额空着|检查点到期/);
   assert.match(cli('status'), /在跑 1 个）：写 hello\.txt［codex t1］/);
@@ -76,8 +76,8 @@ try {
   assert.match(r1.out, /回报：.*report\.md/);
   ok();
   console.log(`     回报第一行：${fs.readFileSync(retro('tasks/t1/report.md'), 'utf8').split('\n').find(l => l.trim())}`);
-  // Without --git the sandbox keeps .git read-only and the commit fails.
-  assert.match(git('log', '--oneline').stdout, /add hello/, 'with --git it can commit');
+  // The sandbox keeps .git read-only; the driver makes the git directory writable.
+  assert.match(git('log', '--oneline').stdout, /add hello/, 'it can commit');
 
   ok = step('the finished task makes the checkpoint due; the freed slot is reported');
   assert.match(hook(), /检查点到期/);
