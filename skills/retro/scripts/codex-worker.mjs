@@ -10,8 +10,9 @@
 // run and resume block until the turn ends, so start them in the background; they print how the turn ended and the
 // thread's last message, and exit 0 only when the turn completed. The turn is stopped after --timeout (default
 // WORKER_MAX). Codex runs in the workspace-write sandbox (RETRO_CODEX may override it) with approval_policy "never":
-// nobody can answer a prompt, and without it commands hang waiting for one. The sandbox keeps .git read-only, so the
-// repository's git directory is added as a writable root and executors can commit, as Claude's do.
+// nobody can answer a prompt, and without it commands hang waiting for one. Executors get what Claude's have: network
+// (off by default in the sandbox) and commits (the sandbox keeps .git read-only, so the repository's git directory is
+// added as a writable root).
 // The codex command is RETRO_CODEX: an executable, or a JSON array of the executable and leading arguments; default
 // "codex". The thread's events go to the task directory (codex-events.jsonl), its last message to codex-last.md.
 import { spawn, spawnSync } from 'node:child_process';
@@ -60,6 +61,7 @@ const timeout = Number(timeoutArg) > 0 ? Number(timeoutArg) * 60e3 : C.WORKER_MA
 // Sandbox settings RETRO_CODEX gives are left alone. approval_policy is always "never", since a prompt would hang.
 const given = key => pre.some(a => String(a).startsWith(`${key}=`));
 const config = given('sandbox_mode') ? [] : ['-c', 'sandbox_mode="workspace-write"'];
+if (!given('sandbox_workspace_write.network_access')) config.push('-c', 'sandbox_workspace_write.network_access=true');
 // The report goes under the project's .retro/, which a worktree or another directory doesn't contain.
 const rel = path.relative(cwd, dir(root));
 const writable = [(rel.startsWith('..') || path.isAbsolute(rel)) && dir(root), gitDir(cwd)].filter(Boolean);

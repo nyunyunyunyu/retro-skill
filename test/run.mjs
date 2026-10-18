@@ -676,7 +676,7 @@ await test('codex-worker run: brief and settings passed, final message and repor
   assert.match(r.stdout, /最后的话：\n答复：# 试一下 expectimax/);
   const [call] = c.calls();
   assert.equal(call.prompt, `# 试一下 expectimax\nREPORT:${report}\n`);
-  for (const a of ['approval_policy="never"', 'sandbox_mode="workspace-write"', 'exec', '--json', '-C', t.proj]) assert.ok(call.argv.includes(a), a);
+  for (const a of ['approval_policy="never"', 'sandbox_mode="workspace-write"', 'sandbox_workspace_write.network_access=true', 'exec', '--json', '-C', t.proj]) assert.ok(call.argv.includes(a), a);
   assert.ok(!call.argv.some(a => a.includes('writable_roots')), 'working in the project needs no extra writable root');
   const w = c.worker('t1');
   assert.equal(w.desc, '试一下 expectimax'); assert.equal(w.type, 'codex'); assert.ok(w.stopAt > 0); assert.match(w.thread, /^thread-/);
@@ -713,9 +713,10 @@ await test('codex-worker run: brief and settings passed, final message and repor
   c.brief('t3', 'x');
   assert.equal(c.run('run', 't3', '--cd', sub).status, 0);
   assert.ok(c.calls()[5].argv.some(a => a.startsWith('sandbox_workspace_write.writable_roots=')));
-  const own = JSON.stringify([process.execPath, path.join(here, 'fake-codex.mjs'), '-c', 'sandbox_mode="danger-full-access"']);
+  const own = JSON.stringify([process.execPath, path.join(here, 'fake-codex.mjs'), '-c', 'sandbox_mode="danger-full-access"', '-c', 'sandbox_workspace_write.network_access=false']);
   assert.equal(spawnSync(process.execPath, [WORKER, 'run', 't3', '--root', t.proj], { env: { ...c.env, RETRO_CODEX: own }, encoding: 'utf8' }).status, 0);
   assert.deepEqual(c.calls()[6].argv.filter(a => a.startsWith('sandbox_mode=')), ['sandbox_mode="danger-full-access"']);
+  assert.deepEqual(c.calls()[6].argv.filter(a => a.startsWith('sandbox_workspace_write.network_access=')), ['sandbox_workspace_write.network_access=false']);
   // Inside a git repository (from a subfolder too), its git directory is writable, so it can commit; resume too.
   const gp = path.join(t.tmp, 'gp');
   fs.mkdirSync(path.join(gp, 'src'), { recursive: true });

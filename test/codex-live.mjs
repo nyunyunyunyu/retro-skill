@@ -96,6 +96,14 @@ try {
   assert.equal(fs.readFileSync(retro('log.tsv'), 'utf8').match(/agent-start\tt1 codex/g).length, 2);
   ok();
 
+  ok = step('it can reach the network (the sandbox blocks it unless the driver opens it)');
+  const fetch = process.platform === 'win32' ? '(Invoke-WebRequest -UseBasicParsing -TimeoutSec 20 https://example.com).StatusCode' : 'curl -s -o /dev/null -w "%{http_code}" https://example.com';
+  brief('t3', `只运行这一条 shell 命令，然后只回答它输出的数字，失败就回答错误信息：${fetch}\n`);
+  const r4 = await start('run', 't3').done;
+  assert.equal(r4.code, 0, r4.out);
+  assert.match(r4.out.split('最后的话：')[1], /\b200\b/);
+  ok();
+
   ok = step('stop ends a thread inside a long command, with the command\'s processes');
   const marker = process.platform === 'win32' ? 'Start-Sleep -Seconds 287' : 'sleep 287';
   brief('t2', `运行这条 shell 命令，等它结束后回答 done：${marker}\n`);
