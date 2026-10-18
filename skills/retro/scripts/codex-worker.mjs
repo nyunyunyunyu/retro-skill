@@ -154,7 +154,7 @@ function onLine(line) {
     // Codex quotes the shell's full path ("C:\\…\\powershell.exe" -Command '…'): its name is enough.
     if (e.type === 'item.started') inflight.set(it.id, { cmd: clip(String(it.command).replace(/^"[^"]*?([^"\\/]+)"/, '$1'), 300), at: Date.now() });
     if (e.type === 'item.completed') inflight.delete(it.id);
-    const cur = [...inflight.values()].at(-1);
+    const cur = [...inflight.values()][0];
     Object.assign(kv, { cmd: cur?.cmd ?? null, cmdAt: cur?.at ?? 0 });
   }
   if (it.type === 'agent_message' && e.type === 'item.completed' && it.text?.trim()) {

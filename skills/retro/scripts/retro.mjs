@@ -28,7 +28,7 @@ import { fileURLToPath } from 'node:url';
 import {
   C, EXIT_BUSY, EXIT_GONE, WATCH_TICK, activity, agentName, alive, dir, ensureDir, executorNotes, goalAgents, goalCache,
   harnessLimit, headOf, iso, lastRetro, lastWrite, limitOf, locked, log, mainCheckout, mtime, openIdeas, read, readSlot,
-  readSlots, reports, safe, sessions, tailRecords, watchFile, workerBeat, workerStart, workerStop, writeSlot,
+  readSlots, reports, safe, sessions, tailRecords, timedTools, watchFile, workerBeat, workerStart, workerStop, writeSlot,
 } from './lib.mjs';
 
 const args = process.argv.slice(2);
@@ -366,6 +366,8 @@ function status() {
   };
   const state = a => (running.includes(a) ? run(a) : a.active ? `${mins(a.last)} 分钟没有动静，可能已被停掉` : a.gone ? `驱动已经不在了（最后动静 ${clock(a.last)}）` : `已交回（${clock(a.stopAt)}）`) + (a.said ? `；最后说：${clip(a.said, 100)}` : '');
   if (agents.length) out.push(`执行者（外部执行者注明类型和任务名；在跑 ${running.length} 个）：${[...running, ...agents.filter(a => !running.includes(a)).sort((a, b) => b.last - a.last).slice(0, 5)].map(a => `${agentName(a)}${a.worker ? `［${a.type} ${a.id}］` : ''}（${state(a)}）`).join('；')}`);
+  const slow = timedTools(ms.session_id || '-').filter(t => cache?.active && t.goal === cache.start && (t.ended || now) - t.at >= C.SLOW_TOOL);
+  if (slow.length) out.push(`工具耗时：${slow.slice(0, 5).map(t => `${t.agent || '主 agent'} — ${t.name}（${t.ended ? '已返回，用时' : '未见完成记录，启动至今'} ${Math.floor(((t.ended || now) - t.at) / 60e3)} 分钟）`).join('；')}`);
   const s = readSlot(root);
   const kind = { review: '路线评审', scout: '全局侦察', stall: '停滞提醒' }[s.type] || s.type;
   out.push(`后台评审：${s.state === 'none' ? '还没用过' : `${kind} ${s.state}，登记于 ${ago(s.start)}${s.spawned ? `，启动于 ${ago(s.spawnedAt)}` : ''}`}${s.kv.want ? `；已请求一次${s.kv.want === 'scout' ? '侦察' : '评审'}` : ''}`);

@@ -45,7 +45,7 @@ function readJson(f) {
 }
 const hasRetro = groups => (groups || []).some(g => (g.hooks || []).some(h => JSON.stringify(h).includes('retro-nudge.mjs')));
 // The hook's events and their matchers. SessionStart only after a compaction.
-const EVENTS = { PostToolUse: '*', Stop: null, SubagentStop: null, SessionStart: 'compact' };
+const EVENTS = { PreToolUse: '*', PostToolUse: '*', Stop: null, SubagentStop: null, SessionStart: 'compact' };
 const need = C.RESERVE + C.MIN_SLOTS;
 
 function installSkills(skillsDir) {
@@ -65,7 +65,7 @@ if (want('claude')) {
   const file = path.join(base, 'settings.json'), s = readJson(file);
   const script = slash(path.join(base, 'skills', 'retro', 'scripts', 'retro-nudge.mjs'));
   let changed = false;
-  for (const [ev, matcher] of s ? Object.entries(EVENTS) : []) {
+  for (const [ev, matcher] of s ? Object.entries({ ...EVENTS, PostToolUseFailure: '*' }) : []) {
     s.hooks ||= {};
     if (hasRetro(s.hooks[ev])) continue;
     const entry = { hooks: [{ type: 'command', command: 'node', args: [script], timeout: 10 }] };

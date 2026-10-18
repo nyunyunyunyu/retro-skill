@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Hook for Claude Code and Codex (PostToolUse, Stop, SubagentStop, SessionStart) that enhances /goal. It only acts
+// Hook for Claude Code and Codex (tool start/end, Stop, SubagentStop, SessionStart) that enhances /goal. It only acts
 // while the session has an active /goal, read from the session transcript (Claude Code: goal_status attachments and
 // "Goal cleared" records; Codex: thread_goal_updated events, overruled by its goal database). These are internal
 // formats; if they change, it goes quiet.
@@ -30,7 +30,7 @@ import { fileURLToPath } from 'node:url';
 import {
   C, SLOT_AGENTS, agentName, agentsDir, claimSaid, ensureDir, executorNotes, goalAgents, handbacks, harnessLimit, iso, lastRetro,
   limitOf, locked, log, mainCheckout, newestResult, openIdeas, progressGoal, read, readSlot, readSlots, safe, said, sessions,
-  watchFile, watching, writeSlot,
+  trackTool, watching, writeSlot,
 } from './lib.mjs';
 
 const now = Date.now();
@@ -46,7 +46,7 @@ if (fs.existsSync(debug)) {
     fs.appendFileSync(debug + '.log', JSON.stringify({ t: iso(now), event, session_id, agent_id, agent_type, stop_hook_active, tool_name, source, cwd, transcript_path, keys: Object.keys(input), toolKeys }) + '\n');
   } catch {}
 }
-if (!['PostToolUse', 'Stop', 'SubagentStop', 'SessionStart'].includes(event) || typeof input.transcript_path !== 'string') process.exit(0);
+if (!['PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'Stop', 'SubagentStop', 'SessionStart'].includes(event) || typeof input.transcript_path !== 'string') process.exit(0);
 
 const sid = safe(input.session_id);
 const base = path.join(os.tmpdir(), `claude-retro-${sid}`);
@@ -55,6 +55,7 @@ const RESUME = /^\s*\/?(resume|continue|restart|unpause|go on|恢复|继续)\s*[
 // A subagent's tool call or stop (they share the session id; a message here would reach the subagent, not the main
 // agent): only recorded for the tracker.
 if (event === 'SubagentStop' || input.agent_id) {
+  try { trackTool(input, JSON.parse(read(base + '.goal')), now); } catch {}
   try { track(); } catch {}
   try { slowTool(); } catch {}
   process.exit(0);
@@ -62,6 +63,8 @@ if (event === 'SubagentStop' || input.agent_id) {
 
 const goal = goalState(input.transcript_path, base + '.goal');
 if (!goal.active || goal.child) process.exit(0);
+try { trackTool(input, goal, now); } catch {}
+if (event === 'PreToolUse') process.exit(0);
 
 const root = mainCheckout(process.env.CLAUDE_PROJECT_DIR || input.cwd || process.cwd());
 if (read(base + '.root') !== root) try { fs.writeFileSync(base + '.root', root); } catch {}
@@ -90,7 +93,7 @@ const lastTurn = Math.max(Number(read(base + '.call')) || 0, Number(read(base + 
 if (stopping && lastBlock !== '' && lastTurn <= Number(lastBlock)) process.exit(0);
 if (!stopping) try { fs.writeFileSync(base + '.call', String(now)); } catch {}
 
-try { if (!stopping) launched(); } catch {}
+try { if (event === 'PostToolUse') launched(); } catch {}
 try { userInbox(); } catch {}
 try { goalNote(); } catch {}
 try { sessionFile(); } catch {}
@@ -108,7 +111,7 @@ if (notes.length) {
     try { fs.writeFileSync(base + '.blocked', String(now)); } catch {}
     process.stdout.write(JSON.stringify({ decision: 'block', reason: text }));
   } else {
-    process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: text } }));
+    process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: event, additionalContext: text } }));
   }
 }
 
@@ -136,7 +139,7 @@ function executorType() {
 
 // An executor's tool call, or its stop.
 function track() {
-  if (event !== 'PostToolUse' && event !== 'SubagentStop') return;
+  if (!['PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'SubagentStop'].includes(event)) return;
   const type = executorType();
   if (!type) return;
   const d = agentsDir(input.session_id), id = safe(input.agent_id || 'unknown');
@@ -169,19 +172,18 @@ function track() {
 // Claude Code reports how long the call took; Codex polls a long command instead of waiting on it.
 function slowTool() {
   const ms = Number(input.duration_ms);
-  if (event !== 'PostToolUse' || !(ms >= C.SILENT) || !executorType()) return;
-  process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: `这个工具调用（${input.tool_name}）跑了 ${Math.round(ms / 60e3)} 分钟，这段时间外面看不到你的任何动静。在你的 notes.md 里记一笔：它在做什么、为什么要这么久、能不能更快。超过约 1 分钟的评测或构建，按 executor.md 放到后台跑，等的时候做别的。` } }));
+  if (!['PostToolUse', 'PostToolUseFailure'].includes(event) || !(ms >= C.SILENT) || !executorType()) return;
+  process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: event, additionalContext: `这个工具调用（${input.tool_name}）跑了 ${Math.round(ms / 60e3)} 分钟，这段时间外面看不到你的任何动静。在你的 notes.md 里记一笔：它在做什么、为什么要这么久、能不能更快。超过约 1 分钟的评测或构建，按 executor.md 放到后台跑，等的时候做别的。` } }));
 }
 
 // The main agent just launched a subagent. An executor in the background: remember when, since it is tracked only from
 // its first tool call and its slot shouldn't look idle meanwhile. The reserved review/scout: mark it started, so a Stop right after
 // isn't told otherwise. Only an exact agent name counts: Claude Code's Agent (formerly Task) tool names it in
 // subagent_type; another spawn tool (Codex) in some field. Todo tools (TaskCreate…) and prompts that merely mention
-// the name don't. It just started the background watch: that counts as running until the watch writes its file.
+// the name don't. Only the watch writes its liveness file: it may have exited before this hook runs.
 function launched() {
   const ti = input.tool_input || {};
   const name = String(input.tool_name);
-  if (/^(Bash|PowerShell)$/.test(name) && /retro\.mjs"?\s+watch\b/.test(String(ti.command)) && !watching(input.session_id)) fs.writeFileSync(watchFile(input.session_id), '');
   const named = /^(Agent|Task)$/.test(name) ? [ti.subagent_type] : /spawn/i.test(name) ? Object.values(ti) : [];
   if (!named.length) return;
   if (!named.some(v => SLOT_AGENTS.has(v))) {

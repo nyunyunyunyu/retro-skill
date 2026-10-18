@@ -222,15 +222,136 @@ await test('silence: a subagent with nothing out for 5 min is to be interrupted 
   assert.equal(t.sub('x', { agent_type: 'route-reviewer', duration_ms: 6 * MIN }), null);
 });
 
+await test('bottleneck: Codex first tool is timed before returning; fresh activity cannot hide it; main hears it once before 20 min', () => {
+  const created = Math.floor((Date.now() - 15 * MIN) / 1000);
+  const t = setup('slow-codex', { goalAgo: null, extra: [codexMeta('sess-slow-codex'), codexGoal('tests pass', created)] });
+  t.hook();
+  const call = { agent_id: 'tester', agent_type: 'worker', tool_name: 'Bash', tool_use_id: 'test-1', tool_input: { command: 'npm test' } };
+  assert.equal(t.hook({ ...call, hook_event_name: 'PreToolUse' }), null);
+  assert.ok(fs.existsSync(t.agentFile('tester')), 'the first running tool is invisible until it returns');
+  const file = path.join(t.state('tools'), 'test-1.json');
+  const rec = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.doesNotMatch(t.text(t.hook()), /瓶颈检查/);
+  rec.at = Date.now() - 11 * MIN;
+  fs.writeFileSync(file, JSON.stringify(rec));
+  assert.match(t.cli('status').stdout, /工具耗时：tester — npm test.*11 分钟/);
+  t.sub('tester', { agent_type: 'worker' }); // the executor is still active
+  const msg = t.text(t.hook());
+  assert.match(msg, /瓶颈检查：执行者「tester」的「npm test」.*已经 11 分钟/);
+  assert.match(msg, /CPU\/GPU\/内存/);
+  assert.doesNotMatch(msg, /没有任何动静|被问过之后/);
+  assert.doesNotMatch(t.text(t.hook()), /瓶颈检查/);
+  assert.match(fs.readFileSync(t.retro('log.tsv'), 'utf8'), /tool-slow\ttester 11min npm test/);
+  t.hook({ ...call, hook_event_name: 'PostToolUse', tool_response: { exit_code: 0 } });
+  assert.doesNotMatch(t.text(t.hook()), /瓶颈检查/);
+  assert.ok(!fs.existsSync(file), 'a completed, delivered timing was not removed');
+  // The same command in a later call is a new measurement.
+  t.hook({ ...call, tool_use_id: 'test-2', hook_event_name: 'PreToolUse' });
+  const second = path.join(t.state('tools'), 'test-2.json');
+  const next = JSON.parse(fs.readFileSync(second, 'utf8'));
+  fs.writeFileSync(second, JSON.stringify({ ...next, at: Date.now() - 12 * MIN }));
+  assert.match(t.text(t.hook()), /瓶颈检查/);
+  t.addTranscript(codexGoal('tests pass', created, 'paused'));
+  assert.equal(t.hook(), null);
+});
+
+await test('bottleneck: background command polling preserves the start; short and completed jobs are cleaned up', () => {
+  const t = setup('slow-background');
+  t.hook();
+  const call = { agent_id: 'tester', agent_type: 'general-purpose', tool_use_id: 'bg', tool_input: { command: 'python eval.py' } };
+  t.hook({ ...call, hook_event_name: 'PreToolUse' });
+  t.hook({ ...call, tool_response: 'Wall time: 1 seconds\nProcess running with session ID 123\n' });
+  const file = path.join(t.state('tools'), 'bg.json'), rec = JSON.parse(fs.readFileSync(file, 'utf8'));
+  rec.at = Date.now() - 12 * MIN;
+  fs.writeFileSync(file, JSON.stringify(rec));
+  for (let i = 0; i < 3; i++) t.hook({ ...call, tool_name: 'write_stdin', tool_use_id: `poll-${i}`, tool_input: { session_id: 123 }, tool_response: { session_id: 123, output: 'progress' } });
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).at, rec.at);
+  assert.match(t.text(t.hook()), /瓶颈检查.*python eval\.py.*12 分钟/);
+  t.hook({ ...call, tool_name: 'write_stdin', tool_input: { session_id: 123 }, tool_response: 'Wall time: 1 seconds\nProcess exited with code 0\n' });
+  assert.doesNotMatch(t.text(t.hook()), /瓶颈检查/);
+  assert.ok(!fs.existsSync(file));
+  // Claude's background task has the same lifetime across TaskOutput polls.
+  t.hook({ ...call, hook_event_name: 'PreToolUse' });
+  t.hook({ ...call, tool_response: { backgroundTaskId: 'task-1' } });
+  t.hook({ ...call, tool_name: 'TaskOutput', tool_input: { task_id: 'task-1' }, tool_response: { task: { status: 'running' } } });
+  assert.ok(fs.existsSync(file));
+  t.hook({ ...call, tool_name: 'TaskOutput', tool_input: { task_id: 'task-1' }, tool_response: { task: { status: 'completed' } } });
+  assert.ok(!fs.existsSync(file));
+  t.hook({ ...call, hook_event_name: 'PreToolUse' });
+  t.hook({ ...call, tool_response: 'null' });
+  assert.ok(!fs.existsSync(file));
+});
+
+await test('bottleneck: a late result cannot enter a replacement goal; repeated reads keep the first completion time', () => {
+  const t = setup('slow-boundaries', { goalAgo: 30 });
+  t.hook();
+  const call = { agent_id: 'tester', agent_type: 'general-purpose', tool_use_id: 'old', tool_input: { command: 'npm test' } };
+  t.hook({ ...call, hook_event_name: 'PreToolUse' });
+  const file = path.join(t.state('tools'), 'old.json'), rec = JSON.parse(fs.readFileSync(file, 'utf8'));
+  fs.writeFileSync(file, JSON.stringify({ ...rec, at: Date.now() - 12 * MIN }));
+  t.addTranscript(goalLine('new goal', Date.now()));
+  assert.doesNotMatch(t.text(t.hook()), /瓶颈检查/);
+  t.hook({ ...call, duration_ms: 12 * MIN, tool_response: { exit_code: 0 } });
+  assert.doesNotMatch(t.text(t.hook()), /瓶颈检查/);
+  assert.ok(!fs.existsSync(file));
+  t.hook({ ...call, hook_event_name: 'PreToolUse' });
+  t.hook({ ...call, tool_response: { backgroundTaskId: 'bg' } });
+  const ended = Date.now() - MIN;
+  const current = JSON.parse(fs.readFileSync(file, 'utf8'));
+  fs.writeFileSync(file, JSON.stringify({ ...current, at: ended - 11 * MIN, ended }));
+  t.hook({ ...call, tool_name: 'TaskOutput', tool_input: { task_id: 'bg' }, tool_response: { task: { status: 'completed' } } });
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).ended, ended);
+});
+
+await test('bottleneck: a slow failed tool is reported to its executor and main; watch wakes on elapsed time, not silence', () => {
+  const t = setup('slow-failure');
+  t.hook();
+  const call = { agent_id: 'tester', agent_type: 'general-purpose', tool_use_id: 'slow', tool_input: { command: 'npm test' } };
+  t.hook({ ...call, hook_event_name: 'PreToolUse' });
+  const file = path.join(t.state('tools'), 'slow.json'), rec = JSON.parse(fs.readFileSync(file, 'utf8'));
+  fs.writeFileSync(file, JSON.stringify({ ...rec, at: Date.now() - 11 * MIN }));
+  const wake = t.cli('watch');
+  assert.equal(wake.status, 0);
+  assert.match(wake.stdout, /有执行者要处理/);
+  assert.match(t.text(t.hook({ hook_event_name: 'Stop' })), /瓶颈检查/);
+  assert.doesNotMatch(t.text(t.hook()), /瓶颈检查/);
+  const fail = t.hook({ ...call, hook_event_name: 'PostToolUseFailure', duration_ms: 11 * MIN });
+  assert.equal(fail.hookSpecificOutput.hookEventName, 'PostToolUseFailure');
+  assert.match(t.text(fail), /跑了 11 分钟/);
+  t.hook();
+  assert.ok(!fs.existsSync(file));
+  // Completion before the main agent wakes must not swallow the alert, even without a PreToolUse record.
+  t.hook({ ...call, tool_use_id: 'failed-2', hook_event_name: 'PostToolUseFailure', duration_ms: 12 * MIN });
+  assert.match(t.text(t.hook()), /瓶颈检查.*已返回，用时 12 分钟/);
+});
+
+await test('bottleneck: a driven worker with fresh heartbeats is reported; monitor and driver wrappers are excluded', () => {
+  const t = setup('slow-worker');
+  t.hook();
+  t.cli('worker', 'start', 'eval', 'long evaluation', '--pid', String(process.pid), '--type', 'codex');
+  const file = t.retro('workers/eval.json'), rec = JSON.parse(fs.readFileSync(file, 'utf8'));
+  fs.writeFileSync(file, JSON.stringify({ ...rec, driver: 'codex-worker', cmd: 'python eval.py', cmdAt: Date.now() - 11 * MIN }));
+  assert.match(t.text(t.hook()), /瓶颈检查.*python eval\.py.*11 分钟/);
+  assert.doesNotMatch(t.text(t.hook()), /瓶颈检查/);
+  for (const command of ['node "retro.mjs" watch', 'node "codex-worker.mjs" run eval']) {
+    t.hook({ hook_event_name: 'PreToolUse', tool_use_id: 'wrapper', tool_input: { command } });
+    assert.ok(!fs.existsSync(path.join(t.state('tools'), 'wrapper.json')));
+  }
+  const no = setup('slow-no-goal', { goalAgo: null });
+  assert.equal(no.hook({ hook_event_name: 'PreToolUse', tool_use_id: 'x', tool_input: { command: 'npm test' } }), null);
+  assert.ok(!fs.existsSync(no.state('tools')));
+});
+
 await test('watch: a Stop with executors running and no watch is blocked; the watch wakes the main agent and the hook says what, once; one watch per session', async () => {
   const t = setup('watch', { goalAgo: 30 });
   t.hook(); t.cli('slots', '3', 'x');
   t.sub('w1');
   const stop = () => t.text(t.hook({ hook_event_name: 'Stop' }));
   assert.match(stop(), /后台却没有 retro 的 watch：先用 Bash 在后台（run_in_background）运行 `node ".*retro\.mjs" watch --session sess-watch --root "[^"]+"`/);
-  // Starting it counts right away.
+  // A delayed launch result must not recreate a dead watch's liveness file.
   t.hook({ tool_input: { command: `node "${CLI}" watch --session sess-watch --root "${t.proj}"`, run_in_background: true } });
-  assert.doesNotMatch(stop(), /retro 的 watch/);
+  assert.ok(!fs.existsSync(t.state('watch')));
+  assert.match(stop(), /retro 的 watch/);
   // In scaled time (5 min = 3 s): it waits while w1 is fine, then exits with the note.
   const env = { ...t.env, RETRO_TIME_SCALE: '0.01' }, wf = t.state('watch');
   t.sub('w1');
@@ -239,6 +360,8 @@ await test('watch: a Stop with executors running and no watch is blocked; the wa
   w.stdout.on('data', d => (out += d));
   const done = new Promise(res => w.on('close', res));
   await until(() => fs.readFileSync(wf, 'utf8') === String(w.pid), 5000);
+  t.hook();
+  assert.doesNotMatch(stop(), /retro 的 watch/);
   const second = spawnSync(process.execPath, [CLI, 'watch', '--session', 'sess-watch', '--root', t.proj], { env, encoding: 'utf8' });
   assert.match(second.stdout, new RegExp(`已经有一个 watch 在跑（进程 ${w.pid}）`));
   assert.equal(w.exitCode, null);
@@ -1125,10 +1248,10 @@ await test('install.mjs: BOM is fine, JSONC is refused untouched, CRLF agents co
   let r = spawnSync(process.execPath, [path.join(repo, 'install.mjs')], { env, encoding: 'utf8' });
   assert.equal(r.status, 0, r.stderr);
   const s = JSON.parse(fs.readFileSync(settings, 'utf8'));
-  assert.equal(s.model, 'x'); assert.ok(s.hooks.Stop && s.hooks.SubagentStop && s.hooks.PostToolUse);
+  assert.equal(s.model, 'x'); assert.ok(s.hooks.Stop && s.hooks.SubagentStop && s.hooks.PreToolUse && s.hooks.PostToolUse && s.hooks.PostToolUseFailure);
   assert.equal(s.hooks.SessionStart[0].matcher, 'compact');
   const codexHooks = JSON.parse(fs.readFileSync(path.join(home, '.codex', 'hooks.json'), 'utf8')).hooks;
-  assert.deepEqual(Object.keys(codexHooks).sort(), ['PostToolUse', 'SessionStart', 'Stop', 'SubagentStop']);
+  assert.deepEqual(Object.keys(codexHooks).sort(), ['PostToolUse', 'PreToolUse', 'SessionStart', 'Stop', 'SubagentStop']);
   assert.equal(codexHooks.SessionStart[0].matcher, 'compact');
   assert.match(fs.readFileSync(path.join(home, '.codex', 'agents', 'idea-scout.toml'), 'utf8'), /model_reasoning_effort = "xhigh"/);
   assert.match(r.stdout, /WARNING: Codex lets a session run only 3 subagents/);

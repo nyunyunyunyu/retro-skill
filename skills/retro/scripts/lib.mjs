@@ -11,7 +11,7 @@
 //   user-inbox.jsonl what the user said at the progress desk, until the hook hands it over; then kept in user-said.md
 // Per session, in the system temp dir (claude-retro-<session>.*): the goal cache, what the hook and the watch said
 // when (.said, see claimSaid), the last main tool call (.call) and Stop block (.blocked), the subagent tracker
-// (.agents/, see trackedAgents) and the background watch (.watch, see watching).
+// (.agents/, see trackedAgents), elapsed tool calls (.tools/, see timedTools), and the background watch (.watch).
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -26,7 +26,7 @@ export const C = {
   // An executor is silent when for SILENT it neither did anything nor waited on a tool, or when a tool call of its hasn't
   // come back after STUCK: Claude Code moves a foreground command to the background at 10 min, and Codex returns from a
   // poll of a running command within 5, so a live executor gets its tool back well within that.
-  SILENT: 5 * MIN, STUCK: 15 * MIN,
+  SILENT: 5 * MIN, STUCK: 15 * MIN, SLOW_TOOL: 10 * MIN,
   // A backstop: codex-worker.mjs stops a Codex turn this long. The hook asks the main agent at SEGMENT_MAX.
   WORKER_MAX: 120 * MIN,
   // Subagents the harness allows at once, minus RESERVE (the background review/scout and two spare), must leave
@@ -236,6 +236,70 @@ export function trackedAgents(sessionId) {
     return { id, type: h.type || '?', seg: h.seg || last, tp: h.tp || '', last, stopAt, active: !stopAt };
   });
 }
+
+// Keep elapsed tool time separate from signs of life: output and polling do not restart a test's clock.
+const toolsDir = sessionId => path.join(os.tmpdir(), `claude-retro-${safe(sessionId)}.tools`);
+export function timedTools(sessionId) {
+  let files = [];
+  try { files = fs.readdirSync(toolsDir(sessionId)); } catch {}
+  return files.filter(f => f.endsWith('.json')).flatMap(f => {
+    const file = path.join(toolsDir(sessionId), f);
+    try {
+      const rec = JSON.parse(read(file));
+      return Number.isFinite(rec?.at) && rec.at > 0 ? [{ ...rec, file }] : [];
+    } catch { return []; }
+  });
+}
+export function trackTool(input, goal, now = Date.now()) {
+  if (!goal?.active) return;
+  const ev = input.hook_event_name, name = String(input.tool_name || '').split('.').at(-1);
+  if (!['PreToolUse', 'PostToolUse', 'PostToolUseFailure'].includes(ev)) return;
+  const args = input.tool_input || {}, sid = input.session_id;
+  let result = input.tool_response || {};
+  if (typeof result === 'string') { try { result = JSON.parse(result); } catch {} }
+  result ||= {};
+  const output = typeof result === 'string' ? result : String(result.output || '');
+  const exit = result.exit_code ?? output.match(/Process exited with code (-?\d+)/)?.[1];
+  const finish = rec => {
+    rec.ended ||= now;
+    if (rec.ended - rec.at >= C.SLOW_TOOL) {
+      const { file, ...data } = rec;
+      fs.writeFileSync(file, JSON.stringify(data));
+    } else try { fs.unlinkSync(rec.file); } catch {}
+  };
+  if (/^(write_stdin|TaskOutput|TaskStop)$/.test(name)) {
+    if (ev !== 'PostToolUse') return;
+    const job = args.session_id ?? args.task_id;
+    const ended = name === 'TaskStop' || (name === 'write_stdin' ? exit != null : /^(completed|failed|stopped)$/.test(result.task?.status));
+    if (job != null && ended) for (const rec of timedTools(sid)) if (rec.job === String(job)) finish(rec);
+    return;
+  }
+  if (/^(wait|wait_agent|sleep)$/.test(name) || !input.tool_use_id) return;
+  const command = args.command || args.cmd || args.description || name;
+  // These are monitors/drivers, whose underlying commands are timed separately.
+  if (/retro\.mjs["']?\s+watch\b|codex-worker\.mjs["']?\s+(run|resume)\b/.test(command)) return;
+  const file = path.join(toolsDir(sid), `${safe(input.tool_use_id)}.json`);
+  let rec;
+  try { rec = JSON.parse(read(file)); } catch {}
+  if (rec && rec.goal !== goal.start && ev !== 'PreToolUse') {
+    try { fs.unlinkSync(file); } catch {}
+    return;
+  }
+  if (!rec || rec.goal !== goal.start) rec = {
+    id: input.tool_use_id, goal: goal.start, agent: input.agent_id || '', type: input.agent_type || '',
+    name: clip(command, 200), at: now - (ev === 'PreToolUse' ? 0 : Math.max(0, Number(input.duration_ms) || 0)),
+  };
+  fs.mkdirSync(toolsDir(sid), { recursive: true });
+  if (ev === 'PreToolUse') {
+    fs.writeFileSync(file, JSON.stringify(rec));
+    return;
+  }
+  const job = result.backgroundTaskId ?? result.shellId ?? (exit == null ? result.session_id ?? output.match(/Process running with session ID (\d+)/)?.[1] : null);
+  if (job != null && ev !== 'PostToolUseFailure') {
+    rec.job = String(job);
+    fs.writeFileSync(file, JSON.stringify(rec));
+  } else finish({ ...rec, file });
+}
 // External workers: executors another harness runs for this project, registered by their driver (codex-worker.mjs, or
 // `retro.mjs worker start|beat|stop`). .retro/workers/<id>.json holds {desc, type, driver, seg, stopAt, pid (the
 // driver process), child (the codex process) and childAt (when it started, if after seg), thread, rollout, cwd, cmd (the
@@ -393,6 +457,23 @@ export function rolloutStep(o, out, at) {
 export function executorNotes(running, { now = Date.now(), sessionId, root, codex = false, wcmd, wake = false }) {
   const notes = [], min = t => Math.round((now - t) / 60e3), had = said(sessionId);
   const once = key => (wake ? !had[key] && claimSaid(sessionId, `wake ${key}`, l => !l, now) : claimSaid(sessionId, key, l => !l, now));
+  const goal = goalCache(sessionId);
+  const timed = timedTools(sessionId).filter(t => goal?.active && t.goal === goal.start);
+  // A driver's oldest running command has a stable start even while Codex keeps polling it.
+  for (const a of running) if (a.worker && a.cmd && a.cmdAt) timed.push({
+    id: `worker ${a.id} ${a.seg}`, at: a.cmdAt, agent: a.id, type: a.type, name: a.cmd,
+  });
+  for (const t of timed) {
+    const elapsed = (t.ended || now) - t.at;
+    if (elapsed < C.SLOW_TOOL) continue;
+    const key = `slow ${t.id} ${t.at}`;
+    const who = t.agent ? `执行者「${t.agent}」` : '主 agent';
+    if (once(key)) {
+      notes.push({ who, text: `瓶颈检查：${who}的「${t.name}」${t.ended ? '已返回，用时' : '启动后尚未收到完成记录，已经'} ${Math.floor(elapsed / 60e3)} 分钟。输出或轮询不会重置这段计时。立即查看输出和 CPU/GPU/内存占用，核对预计剩余时间；让执行者回报是否卡在测试、构建、资源排队或重复验证，并决定继续等待、缩小验证或优化流程。把耗时、证据和决定记进 notes.md；有正常进度的长任务不要仅因这条提醒而停止或重跑。` });
+      if (!wake) log(root, sessionId, 'tool-slow', `${t.agent || 'main'} ${Math.floor(elapsed / 60e3)}min ${t.name}`);
+    }
+    if (!wake && t.ended && (had[key] || said(sessionId)[key])) try { fs.unlinkSync(t.file); } catch {}
+  }
   for (const a of running) {
     const driven = a.driver === 'codex-worker', over = now - a.seg >= C.SEGMENT_MAX;
     // Silence counts from its last sign of life, never earlier than its last tool call.

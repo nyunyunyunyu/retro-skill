@@ -35,6 +35,7 @@ retro 只在会话有活跃的 `/goal` 时生效，目标结束就自动停。
 | 记下名额 | 目标开始 10 分钟还没运行 `retro.mjs slots` | 每 10 分钟一次 |
 | 名额空着 | 在跑的执行者（子代理和 Codex 执行者）少于名额超过 5 分钟（从最近一次空出名额或派任务算起） | 每 10 分钟一次 |
 | 一段超时 | 一个执行者连续跑了 1 小时还没交回 | 每段一次 |
+| 慢测试等瓶颈 | 工具或后台命令启动满 10 分钟、还没收到完成记录；输出、心跳和轮询不重置计时。让主 agent 检查进度、预计剩余时间、资源占用和更便宜的验证方案；不自动杀任务。已经返回但耗时超过门槛的也会报告 | 每次调用一次，写入 `tool-slow` 日志 |
 | 没动静 | 一个执行者 5 分钟什么都没做、也没有在等工具，或者一个工具调用 15 分钟没返回：打断它问一句，它带着上下文接着做；问过之后还是没动静，就换人。驱动跑的 Codex 线程由驱动自己问（见下面） | 每次一次 |
 | 工具调用太久 | 一个 Claude 子代理的工具调用跑了 5 分钟以上：直接问这个子代理为什么这么久，让它记进 notes.md | 每次 |
 | 没开 watch | Claude Code 里一轮结束时有执行者在跑（或者刚派了任务），后台却没有 `retro.mjs watch` | 一轮结束时拦 |
@@ -43,6 +44,8 @@ retro 只在会话有活跃的 `/goal` 时生效，目标结束就自动停。
 | 进度台转达 | 用户在进度台说了话 | 送到一次 |
 
 hook 只能在主 agent 调用工具之后和一轮结束时说话；主 agent 长时间等待时，提醒在它下一次活动时送到。Claude Code 里主 agent 结束一轮后，靠后台的 `retro.mjs watch` 叫醒它：watch 一直盯着执行者，有超时、没动静要处理就结束，命令结束会把主 agent 叫醒。主 agent 看不到后台命令的输出，所以要处理什么仍由 hook 在它下一次调用工具或结束这一轮时说。
+
+瓶颈提醒后的分析流程见 [retro skill 第 7 节](skills/retro/SKILL.md#7-瓶颈分析和迭代速度)：按阶段定位耗时，用实际进度和资源证据决定继续、缩小验证或优化，并在任务笔记里留下复查点。多次短调用累计的等待也要分析；加速前后核对结果和必要覆盖，避免把少测当成变快。
 
 ## 安装
 
@@ -60,6 +63,7 @@ node retro-skill/install.mjs
 
 安装后：
 - **Codex**：在 `/hooks` 里信任安装脚本新加的条目，Codex 不运行没被信任的条目。以后升级脚本不用重新信任。再把子代理上限调到至少 5，建议 12（见下表）。
+- **升级慢工具检测**：新增的 `PreToolUse` 负责在命令开始前计时，Codex 需要在 `/hooks` 里单独信任这条新记录。主 agent 等待结果每次不超过 5 分钟，正常运行时在 10 分钟门槛之后的下次活动收到提醒，给 20 分钟内处理留出余量；权限请求、长前台工具调用等阻塞仍会延迟送达。
 - **Claude Code**：如果 `~/.claude/agents/` 是这次新建的，已经在运行的会话要重启一次。
 - **（可选）** 在 `~/.claude/settings.json` 的 `env` 里加 `"CLAUDE_CODE_GOAL_CHECKIN_MINUTES": "10"`，让 `/goal` 等后台任务时第一次检查提前到 10 分钟（需要 Claude Code v2.1.234 以上）。
 - **（可选）** 在 `~/.claude/CLAUDE.md` 或 `~/.codex/AGENTS.md` 加上[常驻规则](#常驻规则)。
@@ -85,7 +89,7 @@ node retro-skill/install.mjs
   - 报告之外，细节写在 `.retro/probes/` 下，报告最后一行给出路径。
   - `route-reviewer`：对照想法池给出结论：保持、调整优先级、先探测、换路线，默认保持；也看名额流动、迭代速度和验证占的时间。限 20 分钟。
   - `idea-scout`：从差距分解、假设审计、外部经验、换个问法、从零开始、复查死路六个角度找想法，只提不拍板。限 40 分钟。
-- **提醒 hook**（`scripts/retro-nudge.mjs`）：注册 PostToolUse、Stop、SubagentStop、SessionStart（只在压缩后）。从会话记录判断有没有活跃的 `/goal`（Codex 以目标数据库 `~/.codex/goals_1.sqlite` 为准），追踪子代理，检测 `/goal` 被替换或误用 `/goal resume`。
+- **提醒 hook**（`scripts/retro-nudge.mjs`）：注册 PreToolUse、PostToolUse、Stop、SubagentStop、SessionStart（只在压缩后），Claude Code 另注册 PostToolUseFailure。分别记录工具起止和执行者活动，失败的慢调用也上报。从会话记录判断有没有活跃的 `/goal`（Codex 以目标数据库 `~/.codex/goals_1.sqlite` 为准），追踪子代理，检测 `/goal` 被替换或误用 `/goal resume`。
 - **辅助脚本**（`scripts/retro.mjs`）：`watch` 在后台盯着执行者，需要时叫醒主 agent（Claude Code）；`worker start|beat|stop` 给别的驱动登记外部执行者；`done` 标记检查点完成；`inbox` 列出上次检查点以来的回报（后台子代理用 `--since-last review|scout` 看上一轮以来的）；`slots` 记下名额；`request review|scout` 提前要一次后台评审；`status` 进度快照；`metrics [--since <时间>]` 整个运行的统计，供事后分析；`tell` 进度台转达用户的话；`spawned`、`finish`、`abort` 给后台子代理用。
 - **Codex 执行驱动**（`scripts/codex-worker.mjs`）：Claude Code 当主 agent 时，把执行任务交给 Codex 线程，见下面的“Claude Code 调度、Codex 执行”。
 - **进度台 skill**（`skills/retro-status`）：在另一个会话里只读地回答“现在进度怎样”，把用户的指令转给主 agent。
@@ -97,7 +101,7 @@ node retro-skill/install.mjs
 | 装到哪 | `~/.claude/skills`、`~/.claude/agents`、`~/.claude/settings.json` | `~/.agents/skills`、`~/.codex/agents/*.toml`、`~/.codex/hooks.json` |
 | hook 生效 | 安装后马上生效 | 新加的条目要在 `/hooks` 里信任一次 |
 | 子代理上限（名额最多是上限减 3） | 默认 20，环境变量 `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` | 默认 3，**不够用**：在 `~/.codex/config.toml` 加 `[agents]` 和 `max_concurrent_threads_per_session = 12` |
-| 主 agent 怎么等 | 结束这一轮，子代理交回、`retro.mjs watch` 退出或 `/goal` 定期检查时被唤醒 | `wait_agent` 加不超过 10 分钟的超时 |
+| 主 agent 怎么等 | 结束这一轮，子代理交回、`retro.mjs watch` 退出或 `/goal` 定期检查时被唤醒 | `wait_agent` 加不超过 5 分钟的超时（环境上限更短时按更短的） |
 | 判断目标达成 | 独立的模型看对话 | agent 自己标记完成 |
 | 进度台转达 | 桌面版里用 SendMessage，立刻送到；否则走 `retro.mjs tell` | 走 `retro.mjs tell`，主 agent 下一次调用工具时送到 |
 
