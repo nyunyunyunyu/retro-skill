@@ -30,7 +30,7 @@ tools: Read, Grep, Glob, Bash, Write, WebSearch, WebFetch
 - `.retro/ideas.md`（想法和死路）、`inbox --since-last review` 的输出（上次路线评审以来的回报）、`.retro/route-review.md`（上次评审的全文）。
 - 上一轮的细节：`.retro/route-review.md` 最后一行给出的文件，判断证据新不新时读。
 - `status` 命令的输出：名额、各个子代理在做什么、跑了多久、后台评审的状态、最近的事件。
-- 总表（`.retro/results.tsv`，或进度快照里写明的位置）和 `git log -20 --stat`。
+- 回报引用的任务结果表（`.retro/tasks/<任务>/results.tsv`）；项目总表存在时按需读取，不等汇总才看新结果。另看 `git log -20 --stat`。
 
 ## 可以做的探测
 

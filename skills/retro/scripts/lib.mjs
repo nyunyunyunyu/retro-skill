@@ -1,7 +1,6 @@
 // Shared by the hook (retro-nudge.mjs) and the helper CLI (retro.mjs). All project state lives in <root>/.retro/:
 //   slot             one line, the background slot (route review or idea scout), "key=value ..." — see readSlot
-//   slots            the executor slots the main agent chose for its goal (`retro.mjs slots`), JSON {n, at, why}
-//   checkpoints/<session>/<goal-start>/   retro-done, inbox-at and previous review/scout starts, scoped to a goal
+//   checkpoints/<session>/<goal-start>/   retro-done, inbox-at, review/scout starts, slots {n, at, why}, request
 //   probes/          background agents' probe scripts and the notes behind their reports
 //   workers/<task>.json   executors another harness runs (Codex threads driven by codex-worker.mjs), see workers()
 //   log.tsv          append-only event log (time, session, event, detail), for the progress desk and later analysis
@@ -28,7 +27,7 @@ export const C = {
   // A backstop: codex-worker.mjs stops a Codex turn this long. The hook asks the main agent at SEGMENT_MAX.
   WORKER_MAX: 120 * MIN,
   CODEX_LIMIT: 3, CLAUDE_LIMIT: 20,
-  PROGRESS_MAX: 4096, OPEN_IDEAS_MIN: 3, LOCK_STALE: 60e3, SAME_GOAL_GAP: 12 * 60 * MIN,
+  PROGRESS_MAX: 4096, OPEN_IDEAS_MIN: 3, SAME_GOAL_GAP: 12 * 60 * MIN,
 };
 export const limitOf = type => (type === 'scout' ? C.SCOUT_MAX : C.REVIEW_MAX);
 export const slotExpired = (slot, now) => now >= (slot.spawned
@@ -68,7 +67,7 @@ export function progressFile(root) {
 }
 
 // Files the scripts and agents generate; kept out of git so worktrees don't carry stale copies.
-const GENERATED = ['slot', 'slot.lock', 'slots', 'retro-done', 'inbox-at', 'review-start', 'scout-start', 'checkpoints/', 'log.tsv', 'sessions/', 'tasks/', 'reviews/', 'probes/', 'workers/', 'recovery/', 'PROGRESS.md', 'RUNBOOK.md', 'runbook/', 'ideas.md', 'backlog.md', 'results.tsv', 'route-review.md', 'user-inbox.jsonl', 'user-said.md'];
+const GENERATED = ['slot', 'slot.lock', 'slot.lock.db', 'slot.lock.db-journal', 'slots', 'retro-done', 'inbox-at', 'review-start', 'scout-start', 'checkpoints/', 'log.tsv', 'sessions/', 'tasks/', 'reviews/', 'probes/', 'workers/', 'recovery/', 'PROGRESS.md', 'RUNBOOK.md', 'runbook/', 'ideas.md', 'backlog.md', 'results.tsv', 'route-review.md', 'user-inbox.jsonl', 'user-said.md'];
 // A new .retro/ ignores everything. An existing one (some projects commit parts of it) gets a .gitignore for the
 // generated files only, unless it already has one. A list we wrote earlier picks up names added since.
 export function ensureDir(root) {
@@ -102,23 +101,33 @@ export function writeSlot(root, kv) {
   fs.writeFileSync(path.join(dir(root), 'slot'), line + '\n');
 }
 
-// Run fn(slot) under an exclusive lock file, so concurrent runs (other sessions, parallel tool calls, the CLI) can't
-// interleave. Returns fn's result, or undefined when the lock stays busy; a lock older than LOCK_STALE is removed.
-// withLock does the same for any lock file.
+let DatabaseSync;
+function database(file, options = {}) {
+  if (!DatabaseSync) {
+    process.removeAllListeners('warning'); // node:sqlite is experimental in Node 22 and would say so on stderr
+    ({ DatabaseSync } = createRequire(import.meta.url)('node:sqlite'));
+  }
+  return new DatabaseSync(file, options);
+}
+
+// Run a synchronous callback under a SQLite write transaction. The OS releases it on process exit; never unlink
+// the database or steal an old lock. Returns undefined when busy. Legacy lock files block entry until cleared.
 export function locked(root, fn, tries = 1) {
   return withLock(path.join(ensureDir(root), 'slot.lock'), () => fn(readSlot(root)), tries);
 }
 export function withLock(lock, fn, tries = 1) {
-  for (let i = 0; i < tries; i++) {
-    try {
-      fs.closeSync(fs.openSync(lock, 'wx'));
-    } catch (e) {
-      try { if (e.code === 'EEXIST' && Date.now() - fs.statSync(lock).mtimeMs > C.LOCK_STALE) fs.unlinkSync(lock); } catch {}
+  const db = database(lock + '.db');
+  try {
+    for (let i = 0; i < tries; i++) {
+      let held = false;
+      if (!fs.existsSync(lock)) {
+        try { db.exec('BEGIN IMMEDIATE'); held = true; }
+        catch (e) { if (e.errcode !== 5 && e.errcode !== 6) throw e; } // SQLITE_BUSY / SQLITE_LOCKED
+      }
+      if (held) { try { return fn(); } finally { db.exec('ROLLBACK'); } }
       if (i + 1 < tries) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
-      continue;
     }
-    try { return fn(); } finally { try { fs.unlinkSync(lock); } catch {} }
-  }
+  } finally { db.close(); }
   return undefined;
 }
 
@@ -157,14 +166,14 @@ export const checkpointDir = (root, sessionId, start) => sessionId && start
   ? path.join(dir(root), 'checkpoints', safe(sessionId), String(start)) : dir(root);
 export const lastRetro = (root, sessionId, start) => Date.parse(read(path.join(checkpointDir(root, sessionId, start), 'retro-done')).trim().split(/\s/)[0]) || 0;
 
-// Executor reports, newest first. Scout reports (tasks/scout-*) are flagged, since they aren't task progress.
-export function reports(root) {
+// Task artifacts, newest first. Scout artifacts are flagged, since they aren't task progress.
+function taskFiles(root, name) {
   const base = path.join(dir(root), 'tasks');
   let names = [];
   try { names = fs.readdirSync(base); } catch {}
   const out = [];
   for (const task of names) {
-    const file = path.join(base, task, 'report.md');
+    const file = path.join(base, task, name);
     try {
       const s = fs.statSync(file);
       out.push({ task, file, scout: task.startsWith('scout-'), mtime: s.mtimeMs });
@@ -172,6 +181,9 @@ export function reports(root) {
   }
   return out.sort((a, b) => b.mtime - a.mtime);
 }
+export const reports = root => taskFiles(root, 'report.md');
+export const resultFiles = root => [path.join(dir(root), 'results.tsv'), path.join(root, 'results.tsv'),
+  ...taskFiles(root, 'results.tsv').filter(r => !r.scout).map(r => r.file)];
 
 // Untested ideas in the pool ("- [ ] ..." lines), or null when the project has no pool.
 export function openIdeas(root) {
@@ -190,19 +202,23 @@ export function codexGoal(thread) {
     const home = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
     const db = fs.readdirSync(home).filter(f => /^goals_\d+\.sqlite$/.test(f)).sort((a, b) => parseInt(a.slice(6), 10) - parseInt(b.slice(6), 10)).pop();
     if (!db) return undefined;
-    process.removeAllListeners('warning'); // node:sqlite is experimental in Node 22 and would say so on stderr
-    const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite');
-    const h = new DatabaseSync(path.join(home, db), { readOnly: true });
+    const h = database(path.join(home, db), { readOnly: true });
     try { return h.prepare('SELECT objective, status, created_at_ms FROM thread_goals WHERE thread_id = ?').get(String(thread)) ?? null; } finally { h.close(); }
   } catch { return undefined; }
 }
 
 // The executor slots chosen for the current goal ({n, at, why}), or null.
-export function readSlots(root) {
+export function readSlots(root, sessionId, start) {
+  if (!sessionId || !start) return null;
   try {
-    const s = JSON.parse(read(path.join(dir(root), 'slots')));
+    const s = JSON.parse(read(path.join(checkpointDir(root, sessionId, start), 'slots')));
     return s.n > 0 ? { ...s, at: Date.parse(s.at) || 0 } : null;
   } catch { return null; }
+}
+export function readRequest(root, sessionId, start) {
+  if (!sessionId || !start) return '';
+  const type = read(path.join(checkpointDir(root, sessionId, start), 'request')).trim();
+  return type === 'review' || type === 'scout' ? type : '';
 }
 
 // How many subagents the harness lets a session run at once. Claude Code: CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS, else
@@ -348,37 +364,38 @@ export function codexCommand(env = process.env, platform = process.platform) {
 export function readWorker(root, id) {
   try { return JSON.parse(fs.readFileSync(path.join(workersDir(root), `${safe(id)}.json`), 'utf8')); } catch { return null; }
 }
-export function writeWorker(root, id, kv) {
+function updateWorker(root, id, change) {
   ensureDir(root);
   fs.mkdirSync(workersDir(root), { recursive: true });
-  const w = { ...readWorker(root, id), ...kv };
   const f = path.join(workersDir(root), `${safe(id)}.json`), tmp = `${f}.${process.pid}.tmp`;
-  try { fs.writeFileSync(tmp, JSON.stringify(w)); fs.renameSync(tmp, f); } catch { try { fs.unlinkSync(tmp); } catch {} fs.writeFileSync(f, JSON.stringify(w)); }
-  return w;
+  const result = withLock(f + '.lock', () => {
+    const w = change(readWorker(root, id));
+    if (!w) return false;
+    try { fs.writeFileSync(tmp, JSON.stringify(w)); fs.renameSync(tmp, f); }
+    finally { try { fs.unlinkSync(tmp); } catch {} }
+    return w;
+  }, 50);
+  if (result === undefined) throw new Error(`Worker state is busy: ${id}`);
+  return result;
 }
 // A new segment: what the last one said and how it ended don't carry over. thread: undefined keeps the old one.
 export function workerStart(root, id, { desc, type = 'external', driver = '', pid = null, child = null, thread, cwd } = {}) {
-  const prev = readWorker(root, id) || {};
-  const w = writeWorker(root, id, {
-    desc: desc || prev.desc || '', type, driver, seg: Date.now(), stopAt: 0, pid, child, thread: thread === undefined ? prev.thread ?? null : thread,
-    cwd: cwd ?? prev.cwd ?? null, rollout: '', childAt: 0, cmd: null, cmdAt: 0, said: '', asks: 0, exit: null, why: null, activityAt: 0, waiting: null,
-  });
+  const w = updateWorker(root, id, prev => ({
+    desc: desc || prev?.desc || '', type, driver, seg: Math.max(Date.now(), (prev?.seg || 0) + 1), stopAt: 0, pid, child,
+    thread: thread === undefined ? prev?.thread ?? null : thread,
+    cwd: cwd ?? prev?.cwd ?? null, rollout: '', childAt: 0, cmd: null, cmdAt: 0, said: '', asks: 0, exit: null, why: null, activityAt: 0, waiting: null,
+  }));
   log(root, '-', 'agent-start', `${safe(id)} ${type}`);
   return w;
 }
-// A sign of life, with what changed (cmd, said, thread…). False once it stopped.
-export function workerBeat(root, id, kv = {}) {
-  const w = readWorker(root, id);
-  if (!w || w.stopAt) return false;
-  writeWorker(root, id, kv);
-  return true;
+// A driver passes its segment so callbacks from a previous run cannot update a restarted task.
+export function workerBeat(root, id, kv = {}, seg) {
+  return !!updateWorker(root, id, w => !w || w.stopAt || (seg != null && w.seg !== seg) ? null : { ...w, ...kv });
 }
-export function workerStop(root, id, kv = {}) {
-  const w = readWorker(root, id);
-  if (!w || w.stopAt) return false;
-  writeWorker(root, id, { ...kv, stopAt: Date.now(), cmd: null });
-  log(root, '-', 'agent-stop', safe(id));
-  return true;
+export function workerStop(root, id, kv = {}, seg) {
+  const stopped = !!updateWorker(root, id, w => !w || w.stopAt || (seg != null && w.seg !== seg) ? null : { ...w, ...kv, stopAt: Date.now(), cmd: null });
+  if (stopped) log(root, '-', 'agent-stop', safe(id));
+  return stopped;
 }
 const seen = new Map(); // the hook asks several times per call; the watch once per tick
 export function workers(root) {
@@ -401,8 +418,13 @@ export function workers(root) {
   seen.set(root, { at: now, out });
   return out;
 }
-const forget = (sessionId, root, a) => {
+const forget = (sessionId, root, a, now) => {
   const base = path.join(a.worker ? workersDir(root) : agentsDir(sessionId), a.id);
+  if (a.worker) return withLock(base + '.json.lock', () => {
+    const current = readWorker(root, a.id);
+    if (current && now - Math.max(mtime(base + '.json'), current.seg || 0, current.stopAt || 0) > 864e5) fs.unlinkSync(base + '.json');
+    // The driver's launch lock owns .stop; a later run clears it before starting.
+  });
   for (const ext of ['json', 'stop']) try { fs.unlinkSync(`${base}.${ext}`); } catch {}
 };
 
@@ -411,7 +433,7 @@ const forget = (sessionId, root, a) => {
 // SubagentStop looks like this). Read-only callers leave expired records for hook/watch maintenance.
 export function goalAgents(sessionId, since, now = Date.now(), root = null, prune = true) {
   const all = [...trackedAgents(sessionId), ...(root ? workers(root) : [])];
-  if (prune) for (const a of all) if (now - Math.max(a.last, a.stopAt) > 864e5) forget(sessionId, root, a);
+  if (prune) for (const a of all) if (now - Math.max(a.last, a.stopAt) > 864e5) forget(sessionId, root, a, now);
   const agents = all.filter(a => Math.max(a.seg, a.last, a.stopAt) >= since && now - Math.max(a.last, a.stopAt) <= 864e5);
   return { agents, running: agents.filter(a => a.active && (a.worker || now - a.last < C.GONE)) };
 }
@@ -580,7 +602,7 @@ export function sessions(root) {
 // one of `extra` (times subagents finished).
 export function newestResult(root, extra = []) {
   return Math.max(0, ...extra, ...reports(root).filter(r => !r.scout).map(r => r.mtime),
-    mtime(path.join(dir(root), 'results.tsv')), mtime(path.join(root, 'results.tsv')), gitActivity(root));
+    ...resultFiles(root).map(mtime), gitActivity(root));
 }
 
 function gitActivity(root) {

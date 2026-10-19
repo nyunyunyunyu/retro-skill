@@ -26,8 +26,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  C, SLOT_AGENTS, agentName, agentsDir, claimSaid, codexGoal, ensureDir, executorNotes, goalAgents, handbacks, harnessLimit, iso, lastRetro,
-  locked, log, mainCheckout, newestResult, openIdeas, progressFile, progressGoal, read, readSlot, readSlots, safe, said, sessions,
+  C, SLOT_AGENTS, agentName, agentsDir, checkpointDir, claimSaid, codexGoal, ensureDir, executorNotes, goalAgents, handbacks, harnessLimit, iso, lastRetro,
+  locked, log, mainCheckout, newestResult, openIdeas, progressFile, progressGoal, read, readRequest, readSlot, readSlots, safe, said, sessions,
   slotExpired, trackTool, watching, writeSlot,
 } from './lib.mjs';
 
@@ -275,16 +275,16 @@ function executors() {
   if (!goal.codex && (running.length || now - launch < C.IDLE_GRACE) && !watching(input.session_id)) {
     if (timely('watch', goal.start)) notes.push(`有执行者在跑，后台却没有 retro 的 watch：需要后台监控时，用 Bash 在后台（run_in_background）运行 ${watch}。它发现慢调用或活动异常会结束；收到结束通知后查看 ${cmd('status')}，hook 会在工具事件给出待判断的事项。`);
   }
-  const set = readSlots(root);
+  const set = readSlots(root, input.session_id, goal.start);
   if (!set || set.at < goal.start) {
-    if (timely('slots', goal.start + C.SLOTS_BY)) notes.push(`还没有记下这个目标的名额。按资源、用户约束和 ${tool} 的子代理上限 ${harnessLimit(goal.codex, root)} 决定并发计划，用 ${cmd('slots <N> <理由>')} 记录；后台评审也计入平台容量。一个执行名额也可以推进，不要求填满。`);
+    if (timely('slots', goal.start + C.SLOTS_BY)) notes.push(`还没有记下这个目标的名额。按资源、用户约束和 ${tool} 的子代理上限 ${harnessLimit(goal.codex, root)} 决定并发计划，用 ${cmd(`slots <N> <理由> --session ${input.session_id}`)} 记录；后台评审也计入平台容量。一个执行名额也可以推进，不要求填满。`);
     return;
   }
   if (running.length >= set.n) return;
   // Idle since the last time a slot freed up (approximately, when several are idle), or since the last launch.
   const freed = Math.max(set.at, goal.start, launch, ...agents.map(a => a.stopAt || (a.active && !a.worker && now - a.last >= C.GONE ? a.last + C.GONE : 0)));
   if (timely('idle', freed + C.IDLE_GRACE)) {
-    notes.push(`名额空着：这个目标的名额是 ${set.n} 个，现在在跑的执行子代理只有 ${running.length} 个${running.length ? `（${running.map(agentName).join('、')}）` : ''}。核对是否在有意等待、受资源限制，或有值得派出的工作；不要求补满，也不要求固定探索比例。计划变化时用 ${cmd('slots <N> <理由>')} 更新。`);
+    notes.push(`名额空着：这个目标的名额是 ${set.n} 个，现在在跑的执行子代理只有 ${running.length} 个${running.length ? `（${running.map(agentName).join('、')}）` : ''}。核对是否在有意等待、受资源限制，或有值得派出的工作；不要求补满，也不要求固定探索比例。计划变化时用 ${cmd(`slots <N> <理由> --session ${input.session_id}`)} 更新。`);
   }
 }
 
@@ -334,8 +334,8 @@ function slot() {
   const finished = handbacks(input.session_id, root);
   const plan = t => {
     if (t.state === 'running') return null;
-    // `retro.mjs request`, made during this goal
-    if ((t.kv.want === 'scout' || t.kv.want === 'review') && Date.parse(t.kv.wantAt) >= goal.start) return { type: t.kv.want, asked: true };
+    const requested = readRequest(root, input.session_id, goal.start);
+    if (requested) return { type: requested, asked: true };
     const first = t.start < goal.start; // nothing reserved yet for this goal
     if (!first && now - t.start < C.SLOT_EVERY) return null;
     if (!first && newestResult(root, finished) < t.start) return { stall: true };
@@ -351,6 +351,7 @@ function slot() {
     const start = iso(now);
     if (p.stall) writeSlot(root, { state: 'stalled', type: 'stall', start, by: sid, lastScout: t.kv.lastScout });
     else writeSlot(root, { state: 'running', type: p.type, start, by: sid, goalStart: goal.start, lastScout: p.type === 'scout' ? start : t.kv.lastScout });
+    if (p.asked) fs.unlinkSync(path.join(checkpointDir(root, input.session_id, goal.start), 'request'));
     return { ...p, start };
   });
   if (!got) return;

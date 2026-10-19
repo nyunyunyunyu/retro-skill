@@ -8,8 +8,8 @@
 //                          window starts where this checkpoint's inbox looked, so reports landing meanwhile count next time
 //   inbox [--session <id>] [--since-last review|scout]   what came back since the last checkpoint (or since the previous route
 //                          review / scout started, for the background agents): task reports, the latest review, ledger rows
-//   slots <n> [why]        the main agent records its executor slots for the goal; the hook checks for idle ones
-//   request review|scout   ask for a background review/scout now; the hook reserves it at the next tool call
+//   slots <n> [why] [--session <id>]   record this goal's executor plan; the hook checks for idle slots
+//   request review|scout [--session <id>]   request a background round for this session's active goal
 //   spawned <start>        a review/scout subagent marks itself started and learns its deadline
 //   finish <start> <file>  a review/scout subagent hands in its report (file, or - for stdin)
 //   abort <start>          the main agent couldn't start the subagent; frees the slot
@@ -30,7 +30,7 @@ import { fileURLToPath } from 'node:url';
 import {
   C, EXIT_BUSY, EXIT_GONE, WATCH_TICK, activity, agentName, alive, checkpointDir, dir, ensureDir, executorNotes, goalAgents, goalCache,
   harnessLimit, headOf, iso, lastRetro, lastWrite, limitOf, locked, log, mainCheckout, mtime, openIdeas, progressFile, read, readSlot,
-  readSlots, reports, safe, sessions, slotExpired, tailRecords, timedTools, watchFile, workerBeat, workerStart, workerStop, writeSlot,
+  readRequest, readSlots, reports, resultFiles, safe, sessions, slotExpired, tailRecords, timedTools, watchFile, workerBeat, workerStart, workerStop, writeSlot,
 } from './lib.mjs';
 
 const args = process.argv.slice(2);
@@ -46,7 +46,7 @@ const fail = (msg, code = 1) => { console.log(msg); process.exit(code); };
 const busy = () => fail('状态文件被其他进程占用：等几秒后重试同一条命令。', EXIT_BUSY);
 
 const commands = { init, done, inbox, slots, request, spawned, finish, abort, status, metrics, tell, watch, worker, root: () => console.log(root) };
-if (!commands[cmd]) fail('用法：node retro.mjs <init|done [--session <id>]|inbox [--session <id>] [--since-last review|scout]|slots <N> <理由>|request review|scout|spawned <start>|finish <start> <file>|abort <start>|status|metrics [--since <ISO>]|tell <话>|watch [--session <id>]|worker start|beat|stop <id>> [--root <项目>]');
+if (!commands[cmd]) fail('用法：node retro.mjs <init|done [--session <id>]|inbox [--session <id>] [--since-last review|scout]|slots <N> <理由> [--session <id>]|request review|scout [--session <id>]|spawned <start>|finish <start> <file>|abort <start>|status|metrics [--since <ISO>]|tell <话>|watch [--session <id>]|worker start|beat|stop <id>> [--root <项目>]');
 commands[cmd]();
 
 // Same mapping as the hook: a worktree path stands for the same place in the main checkout.
@@ -110,7 +110,7 @@ function checkpointSession(kind) {
   if (!selected) {
     const active = all.filter(s => goalCache(s.session_id)?.active);
     const choices = active.length ? active : all;
-    if (choices.length > 1) fail('项目有多个主会话，请用 --session <会话 ID> 指定读取或标记哪个目标；没有推进读取位置。');
+    if (choices.length > 1) fail('项目有多个主会话，请用 --session <会话 ID> 指定哪个目标；没有修改状态或推进读取位置。');
     selected = choices[0];
   }
   const id = selected?.session_id;
@@ -118,6 +118,12 @@ function checkpointSession(kind) {
   const start = (owner && Number(slot.kv.goalStart)) || (id && Number(goalCache(id)?.start)) || Date.parse(selected?.goal_start) || 0;
   if (id && !(start > 0 && Number.isFinite(start))) fail('会话记录缺少有效的目标开始时间，无法确定读取位置。');
   return { id, start };
+}
+
+function activeSession() {
+  const owner = checkpointSession();
+  if (!owner.id || !goalCache(owner.id)?.active) fail('需要已被 hook 记录的活跃目标；在目标会话触发一次工具调用后重试。');
+  return owner;
 }
 
 function done() {
@@ -164,37 +170,53 @@ function inbox() {
   for (const { r, body } of shown) console.log(`\n## ${r.scout ? '侦察' : '任务'} ${r.task}（${clock(r.mtime)}）\n${body}`);
   if (list.length > shown.length) console.log(`\n（更早的 ${list.length - shown.length} 份回报超出长度没有列出，需要时直接读 .retro/tasks/*/report.md）`);
   if (mtime(review) > R) console.log(`\n## 路线评审（${clock(mtime(review))}）\n${clip(read(review), 2000)}`);
-  for (const f of [path.join(dir(root), 'results.tsv'), path.join(root, 'results.tsv')]) {
-    if (mtime(f) <= R) continue;
+  const tables = resultFiles(root).filter(f => mtime(f) > R);
+  let shownTables = 0;
+  for (const f of tables) {
     const rows = read(f).split('\n').filter(Boolean);
-    console.log(`\n## 总表 ${path.relative(root, f)}（共 ${rows.length} 行，最后更新 ${clock(mtime(f))}），第一行和最后 5 行：\n${[rows[0], '…', ...rows.slice(-5)].join('\n')}`);
+    const body = clip([rows[0], '…', ...rows.slice(-5)].join('\n'), 2000);
+    if (body.length > budget) break;
+    budget -= body.length; shownTables++;
+    console.log(`\n## 结果表 ${path.relative(root, f)}（共 ${rows.length} 行，最后更新 ${clock(mtime(f))}），第一行和最后 5 行：\n${body}`);
   }
+  if (tables.length > shownTables) console.log(`\n另有 ${tables.length - shownTables} 份结果表超出长度，需要时按任务读取 .retro/tasks/*/results.tsv 或项目总表。`);
   if (!list.length && mtime(review) <= R) console.log('\n没有新的任务回报或评审。');
 }
 
-// The executor slots the main agent chose for its goal. Checked against the harness limit of the session it most
-// likely belongs to (the most recently active one).
+// The executor plan belongs to one session and goal, including its harness capacity check.
 function slots() {
+  const { id, start } = activeSession();
   const n = Number(rest[0]);
   if (!Number.isInteger(n) || n < 1) fail('用法：slots <N> <理由>，N 是同时在跑的执行子代理数（不含后台评审）');
   const why = rest.slice(1).join(' ').trim();
-  ensureDir(root);
-  fs.writeFileSync(path.join(dir(root), 'slots'), JSON.stringify({ n, at: iso(now), why }) + '\n');
-  log(root, '', 'slots', `${n} ${why}`);
-  const ms = sessions(root)[0];
-  const codex = ms ? !!goalCache(ms.session_id)?.codex : false;
+  const d = checkpointDir(root, id, start);
+  const r = locked(root, () => {
+    fs.mkdirSync(d, { recursive: true });
+    const file = path.join(d, 'slots');
+    fs.writeFileSync(file + '.tmp', JSON.stringify({ n, at: iso(now), why }) + '\n');
+    fs.renameSync(file + '.tmp', file);
+    return true;
+  }, 50);
+  if (r === undefined) busy();
+  log(root, id, 'slots', `${n} ${why}`);
+  const codex = !!goalCache(id)?.codex;
   const room = harnessLimit(codex, root);
   console.log(`已记下名额 ${n} 个。这是并发计划，不要求填满；后台评审也计入平台容量。${n > room ? `注意：${codex ? 'Codex' : 'Claude Code'} 的子代理上限是 ${room} 个，超出的会启动失败。` : ''}`);
 }
 
-// Ask for a background review or scout now instead of at the hourly turn. Kept in the slot line until the hook
-// reserves it, right away or, while one is running, as soon as that one ends.
+// Keep pending requests separate from the shared background slot, so other sessions cannot consume them.
 function request() {
+  const { id, start } = activeSession();
   const type = rest[0];
   if (type !== 'review' && type !== 'scout') fail('用法：request review|scout');
-  const r = locked(root, s => { writeSlot(root, { ...s.kv, want: type, wantAt: iso(now) }); return s.state; }, 50);
+  const r = locked(root, s => {
+    const d = checkpointDir(root, id, start);
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, 'request'), type + '\n');
+    return s.state;
+  }, 50);
   if (r === undefined) busy();
-  log(root, '', 'requested', type);
+  log(root, id, 'requested', type);
   console.log(r === 'running'
     ? '已记下请求。现在有一轮后台评审/侦察在跑，它结束后，你的下一次工具调用时 hook 会登记。'
     : '已记下请求。你下一次调用工具时 hook 会登记，照提醒在后台启动。');
@@ -434,7 +456,7 @@ function status() {
   if (ms.transcript_path) out.push(...mainAgent(ms.transcript_path), ...subagents(ms));
   const start = Date.parse(ms.goal_start) || 0;
   out.push(`\n## 检查点和名额\n上次检查点：${ago(lastRetro(root, ms.session_id, start))}`);
-  const set = readSlots(root);
+  const set = readSlots(root, ms.session_id, start);
   out.push(`名额：${set && set.at >= start ? `${set.n} 个（${set.why || '没写理由'}，记于 ${ago(set.at)}）` : '这个目标还没记下'}`);
   // From the hook's subagent tracker: executors of this goal, running ones first.
   const { agents, running } = goalAgents(ms.session_id || '-', start, now, root, false);
@@ -449,15 +471,17 @@ function status() {
   if (slow.length) out.push(`工具耗时：${slow.slice(0, 5).map(t => `${t.agent || '主 agent'} — ${t.name}（${t.ended ? '已返回，用时' : '未见完成记录，启动至今'} ${Math.floor(((t.ended || now) - t.at) / 60e3)} 分钟）`).join('；')}`);
   const s = readSlot(root);
   const kind = { review: '路线评审', scout: '全局侦察', stall: '停滞提醒' }[s.type] || s.type;
-  out.push(`后台评审：${s.state === 'none' ? '还没用过' : `${kind} ${s.state}，登记于 ${ago(s.start)}${s.spawned ? `，启动于 ${ago(s.spawnedAt)}` : ''}`}${s.kv.want ? `；已请求一次${s.kv.want === 'scout' ? '侦察' : '评审'}` : ''}`);
+  const pending = readRequest(root, ms.session_id, start);
+  out.push(`后台评审：${s.state === 'none' ? '还没用过' : `${kind} ${s.state}，登记于 ${ago(s.start)}${s.spawned ? `，启动于 ${ago(s.spawnedAt)}` : ''}`}${pending ? `；当前目标已请求一次${pending === 'scout' ? '侦察' : '评审'}` : ''}`);
   const reps = reports(root);
   out.push(`\n## 任务回报（${reps.length} 份，最近 8 份）`);
   for (const r of reps.slice(0, 8)) out.push(`- ${r.task}（${ago(r.mtime)}）：${firstLine(read(r.file))}`);
-  for (const f of [path.join(dir(root), 'results.tsv'), path.join(root, 'results.tsv')]) {
-    if (!mtime(f)) continue;
+  const tables = resultFiles(root).filter(f => mtime(f));
+  for (const f of tables.slice(0, 8)) {
     const rows = read(f).split('\n').filter(Boolean);
-    out.push(`\n## 总表 ${path.relative(root, f)}（${rows.length} 行，更新于 ${ago(mtime(f))}）\n${[rows[0], ...rows.slice(-3)].join('\n')}`);
+    out.push(`\n## 结果表 ${path.relative(root, f)}（${rows.length} 行，更新于 ${ago(mtime(f))}）\n${clip([rows[0], ...rows.slice(-3)].join('\n'), 2000)}`);
   }
+  if (tables.length > 8) out.push(`\n另有 ${tables.length - 8} 份结果表，按需读取对应任务的 results.tsv。`);
   const progressPath = progressFile(root), progress = read(progressPath);
   if (progress) out.push(`\n## ${path.relative(root, progressPath)}（更新于 ${ago(mtime(progressPath))}，前 20 行）\n${progress.split('\n').slice(0, 20).join('\n')}`);
   const events = read(path.join(dir(root), 'log.tsv')).split('\n').filter(Boolean).slice(-8);

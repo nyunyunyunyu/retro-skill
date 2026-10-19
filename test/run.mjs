@@ -52,11 +52,24 @@ function setup(name, { goalAgo = 5, cond = 'tests pass', extra = [], sid: sidArg
   const setTime = (f, mins) => { const t = (Date.now() - mins * MIN) / 1000; fs.utimesSync(f, t, t); };
   // A new row in the project's ledger: something came back.
   const fresh = () => fs.appendFileSync(path.join(proj, 'results.tsv'), 'row\n');
-  return { proj, tmp, sid, transcript, hook, hookAsync, cli, text, retro, slot, addTranscript, state, age, sub, agentFile, setTime, fresh, env };
+  const control = (file, owner = sid) => {
+    const { start } = JSON.parse(fs.readFileSync(path.join(tmp, `claude-retro-${owner}.goal`), 'utf8'));
+    const d = retro(`checkpoints/${owner}/${start}`);
+    fs.mkdirSync(d, { recursive: true });
+    return path.join(d, file);
+  };
+  return { proj, tmp, sid, transcript, hook, hookAsync, cli, text, retro, slot, addTranscript, state, age, sub, agentFile, setTime, fresh, env, control };
 }
 const goalLine = (cond, t, extra = {}) => ({ type: 'attachment', timestamp: new Date(t).toISOString(), attachment: { type: 'goal_status', met: false, sentinel: true, condition: cond, ...extra } });
 const iso = t => new Date(t).toISOString();
 const until = async (ok, ms = 10000) => { const safeOk = () => { try { return ok(); } catch { return false; } }; for (const t0 = Date.now(); !safeOk(); ) { if (Date.now() - t0 > ms) throw new Error('timed out waiting'); await new Promise(r => setTimeout(r, 50)); } };
+const libUrl = pathToFileURL(path.join(here, '..', 'skills', 'retro', 'scripts', 'lib.mjs')).href;
+function childEval(t, script) {
+  const p = spawn(process.execPath, ['--input-type=module', '-e', `import fs from 'node:fs'; import * as lib from ${JSON.stringify(libUrl)}; const root = process.argv[1]; ${script}`, t.proj], { env: t.env, windowsHide: true });
+  let output = '';
+  p.stdout.on('data', b => { output += b; }); p.stderr.on('data', b => { output += b; });
+  return { p, done: new Promise(resolve => p.on('close', code => resolve({ code, output }))) };
+}
 const codexGoal = (objective, createdAt, status = 'active') => ({ timestamp: iso(Date.now()), type: 'event_msg', payload: { type: 'thread_goal_updated', goal: { objective, status, createdAt } } });
 const codexMeta = (id, source = 'vscode') => ({ timestamp: iso(Date.now()), type: 'session_meta', payload: { session_id: id, id, source, base_instructions: { text: 'x' } } });
 
@@ -64,7 +77,7 @@ const codexMeta = (id, source = 'vscode') => ({ timestamp: iso(Date.now()), type
 async function test(name, fn) {
   if (process.env.TEST_ONLY && !name.includes(process.env.TEST_ONLY)) return;
   n++;
-  try { await fn(); console.log(`ok   ${name}`); } catch (e) { failed++; console.log(`FAIL ${name}\n     ${e.stack.split('\n').slice(0, 3).join('\n     ')}`); }
+  try { await fn(); console.log(`ok   ${name}`); } catch (e) { failed++; console.log(`FAIL ${name}\n     ${e.stack.split('\n').slice(0, 9).join('\n     ')}`); }
 }
 
 await test('no goal: silent, nothing written', () => {
@@ -157,8 +170,8 @@ await test('slots: reminded to record them 10 min into a goal; idle slots report
   assert.doesNotMatch(u.text(u.hook()), /名额/);
   assert.match(t.cli('slots', '2', 'one GPU').stdout, /已记下名额 2 个/);
   assert.doesNotMatch(t.text(t.hook()), /名额空着/); // just set: grace
-  const set = JSON.parse(fs.readFileSync(t.retro('slots'), 'utf8'));
-  fs.writeFileSync(t.retro('slots'), JSON.stringify({ ...set, at: iso(Date.now() - 6 * MIN) }));
+  const set = JSON.parse(fs.readFileSync(t.control('slots'), 'utf8'));
+  fs.writeFileSync(t.control('slots'), JSON.stringify({ ...set, at: iso(Date.now() - 6 * MIN) }));
   assert.match(t.text(t.hook()), /名额是 2 个，现在在跑的执行子代理只有 0 个/);
   const meta = t.transcript.replace(/\.jsonl$/, '') + '/subagents';
   fs.mkdirSync(meta, { recursive: true });
@@ -434,7 +447,7 @@ await test('idle slots: a launch restarts the grace; reminders never block Stop'
   const t = setup('idlelaunch', { goalAgo: 30 });
   t.hook(); t.cli('spawned', t.slot().start);
   const set = { n: 2, at: iso(Date.now() - 6 * MIN), why: 'x' };
-  fs.writeFileSync(t.retro('slots'), JSON.stringify(set));
+  fs.writeFileSync(t.control('slots'), JSON.stringify(set));
   // Launching an executor: it is tracked only from its first tool call, so neither this call nor the Stop says idle.
   assert.doesNotMatch(t.text(t.hook({ tool_name: 'Agent', tool_input: { subagent_type: 'general-purpose', prompt: 'x', run_in_background: true } })), /名额空着/);
   assert.doesNotMatch(t.text(t.hook({ hook_event_name: 'Stop' })), /名额空着/);
@@ -1172,7 +1185,7 @@ await test('codex-worker: a process codex leaves behind holding its output does 
 await test('codex-worker stop: the process tree goes, the run exits 1 with a resume hint; while it runs the hook counts it and a second run is refused', async () => {
   const t = setup('cw-stop', { goalAgo: 30 });
   t.hook(); t.cli('spawned', t.slot().start);
-  fs.writeFileSync(t.retro('slots'), JSON.stringify({ n: 1, at: iso(Date.now() - 6 * MIN), why: 'x' }));
+  fs.writeFileSync(t.control('slots'), JSON.stringify({ n: 1, at: iso(Date.now() - 6 * MIN), why: 'x' }));
   const c = codex(t);
   c.brief('long', 'SLEEP');
   const p = c.start('run', 'long');
@@ -1242,7 +1255,7 @@ await test('codex-worker: a timeout stops the turn; a failed turn and a missing 
     c.brief('cmdx', 'x');
     const r2 = spawnSync(process.execPath, [WORKER, 'run', 'cmdx', '--root', t.proj], { env: { ...c.env, RETRO_CODEX: path.join(t.tmp, 'codex.cmd') }, encoding: 'utf8' });
     assert.equal(r2.status, 1); assert.match(r2.stdout, /没能启动 codex（EINVAL）.*不能是 \.cmd/);
-    assert.ok(!fs.existsSync(t.retro('workers/cmdx.json')));
+    assert.ok(c.worker('cmdx').stopAt > 0, 'a synchronous launch failure left the worker running');
   }
 });
 
@@ -1259,7 +1272,7 @@ await test('workers in the hook: heartbeat is distinct from activity; old driver
   // Silence alone never ends a worker with a live driver: all four still run.
   t.setTime(file('busy'), 10); t.setTime(file('other'), 25);
   fs.writeFileSync(file('torn'), ''); // caught mid-write: ignored
-  fs.writeFileSync(t.retro('slots'), JSON.stringify({ n: 4, at: iso(Date.now() - 6 * MIN), why: 'x' }));
+  fs.writeFileSync(t.control('slots'), JSON.stringify({ n: 4, at: iso(Date.now() - 6 * MIN), why: 'x' }));
   const r = t.text(t.hook());
   assert.doesNotMatch(r, /torn/);
   assert.doesNotMatch(t.cli('status').stdout, /torn/);
@@ -1277,7 +1290,7 @@ await test('workers in the hook: heartbeat is distinct from activity; old driver
   // A driver that died without saying so: not running, and its slot is free.
   const dead = spawnSync(process.execPath, ['-e', '0']).pid;
   for (const id of ['long', 'quiet', 'busy', 'other']) { patch(id, { pid: dead }); t.setTime(file(id), 6); }
-  fs.writeFileSync(t.retro('slots'), JSON.stringify({ n: 4, at: iso(Date.now() - 6 * MIN), why: 'x' }));
+  fs.writeFileSync(t.control('slots'), JSON.stringify({ n: 4, at: iso(Date.now() - 6 * MIN), why: 'x' }));
   t.age(11);
   assert.match(t.text(t.hook()), /名额是 4 个，现在在跑的执行子代理只有 0 个/);
   assert.match(t.cli('status').stdout, /任务 long［codex long］（驱动已经不在了/);
@@ -1751,6 +1764,158 @@ await test('regression: rounds in the same minute retain separate reports and pr
     assert.equal(files.length, 2);
     const bodies = files.map(f => fs.readFileSync(path.join(base, f, ...(type === 'scout' ? ['report.md'] : [])), 'utf8')).join('\n');
     assert.match(bodies, /报告 100/); assert.match(bodies, /报告 200/);
+  }
+});
+
+await test('concurrency: old live locks cannot be stolen; process exit and exceptions release them', async () => {
+  const t = setup('lock-owner');
+  const held = childEval(t, `lib.withLock(root + '/mutex', () => {
+    fs.writeFileSync(root + '/ready', '');
+    for (;;) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+  });`);
+  try {
+    await until(() => fs.existsSync(path.join(t.proj, 'ready')));
+    const file = path.join(t.proj, fs.existsSync(path.join(t.proj, 'mutex')) ? 'mutex' : 'mutex.db');
+    t.setTime(file, 10);
+    const contender = childEval(t, `console.log(lib.withLock(root + '/mutex', () => 'entered', 3) ?? 'busy');`);
+    const r = await contender.done;
+    assert.equal(r.code, 0, r.output);
+    assert.equal(r.output.trim(), 'busy', 'an aged but live lock was stolen');
+  } finally { held.p.kill('SIGKILL'); await held.done; }
+  const next = childEval(t, `
+    try { lib.withLock(root + '/mutex', () => { throw new Error('test'); }); } catch (e) { if (e.message !== 'test') throw e; }
+    console.log(lib.withLock(root + '/mutex', () => 'recovered', 3));`);
+  const r = await next.done;
+  assert.equal(r.code, 0, r.output); assert.equal(r.output.trim(), 'recovered');
+});
+
+await test('concurrency: worker heartbeat cannot undo stop or write into a restarted segment', async () => {
+  const t = setup('worker-serialization');
+  const started = t.cli('worker', 'start', 'w');
+  assert.equal(started.status, 0, started.stdout + started.stderr);
+  const first = JSON.parse(fs.readFileSync(t.retro('workers/w.json'), 'utf8')).seg;
+  const beat = childEval(t, `
+    const write = fs.writeFileSync;
+    fs.writeFileSync = (file, ...args) => {
+      if (String(file).endsWith('w.json.' + process.pid + '.tmp')) {
+        write(root + '/beat-ready', '');
+        const deadline = Date.now() + 5000;
+        while (!fs.existsSync(root + '/release') && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+      }
+      return write(file, ...args);
+    };
+    lib.workerBeat(root, 'w', { said: 'heartbeat', cmd: 'test' }, ${first});`);
+  let stop;
+  try {
+    await until(() => fs.existsSync(path.join(t.proj, 'beat-ready')));
+    stop = childEval(t, `fs.writeFileSync(root + '/stop-ready', ''); lib.workerStop(root, 'w', {}, ${first});`);
+    await until(() => fs.existsSync(path.join(t.proj, 'stop-ready')));
+    await new Promise(r => setTimeout(r, 200));
+  } finally {
+    fs.writeFileSync(path.join(t.proj, 'release'), '');
+    const a = await beat.done, b = stop && await stop.done;
+    assert.equal(a.code, 0, a.output); if (b) assert.equal(b.code, 0, b.output);
+  }
+  const stopped = JSON.parse(fs.readFileSync(t.retro('workers/w.json'), 'utf8'));
+  assert.ok(stopped.stopAt, 'a delayed heartbeat resurrected the worker'); assert.equal(stopped.cmd, null);
+  assert.equal(t.cli('worker', 'start', 'w').status, 0);
+  const stale = childEval(t, `console.log(lib.workerBeat(root, 'w', { said: 'stale' }, ${first}), lib.workerStop(root, 'w', {}, ${first}));`);
+  const r = await stale.done;
+  assert.equal(r.code, 0, r.output); assert.equal(r.output.trim(), 'false false');
+  const current = JSON.parse(fs.readFileSync(t.retro('workers/w.json'), 'utf8'));
+  assert.equal(current.stopAt, 0); assert.equal(current.said, '');
+});
+
+await test('concurrency: stale cleanup cannot delete a worker restarted after its snapshot', async () => {
+  const t = setup('worker-prune');
+  t.cli('worker', 'start', 'w');
+  const f = t.retro('workers/w.json'), old = Date.now() - 2 * 864e5;
+  fs.writeFileSync(f, JSON.stringify({ seg: old, stopAt: old }));
+  fs.utimesSync(f, old / 1000, old / 1000);
+  const cleaner = childEval(t, `
+    lib.workers(root);
+    fs.writeFileSync(root + '/snapshot', '');
+    const deadline = Date.now() + 5000;
+    while (!fs.existsSync(root + '/release') && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    lib.goalAgents('unused', 0, Date.now(), root);`);
+  try {
+    await until(() => fs.existsSync(path.join(t.proj, 'snapshot')));
+    assert.equal(t.cli('worker', 'start', 'w').status, 0);
+  } finally {
+    fs.writeFileSync(path.join(t.proj, 'release'), '');
+    const r = await cleaner.done; assert.equal(r.code, 0, r.output);
+  }
+  assert.ok(fs.existsSync(f), 'stale cleanup removed the new segment');
+  assert.equal(JSON.parse(fs.readFileSync(f, 'utf8')).stopAt, 0);
+});
+
+await test('concurrency: installer refuses runtimes without supported SQLite before copying files', async () => {
+  for (const version of ['20.19.0', '22.12.0']) {
+    const t = setup('old-node-' + version);
+    t.env.USERPROFILE = t.env.HOME = path.join(t.proj, 'installer-home');
+    const r = await childEval(t, `
+      Object.defineProperty(process.versions, 'node', { value: ${JSON.stringify(version)} });
+      process.argv = [process.execPath, 'install.mjs', '--codex'];
+      await import(${JSON.stringify(pathToFileURL(path.join(here, '..', 'install.mjs')).href)});`).done;
+    assert.equal(r.code, 1, r.output); assert.match(r.output, /Node.js 22.13/);
+    assert.ok(!fs.existsSync(t.env.USERPROFILE), 'unsupported runtime installed unusable hooks');
+  }
+});
+
+await test('concurrency: requests and executor plans stay with their session and goal', () => {
+  const t = setup('scoped-controls', { sid: 'A', cond: 'Goal A', goalAgo: 90 });
+  t.hook();
+  const b = path.join(t.proj, 'b.jsonl');
+  fs.writeFileSync(b, JSON.stringify(goalLine('Goal B', Date.now() - 30 * MIN)) + '\n');
+  const bHook = () => t.hook({ session_id: 'B', transcript_path: b });
+  bHook();
+  for (const args of [['slots', '1'], ['request', 'review']]) {
+    assert.notEqual(t.cli(...args).status, 0, 'ambiguous mutation selected another session');
+    assert.notEqual(t.cli(...args, '--session', 'missing').status, 0);
+  }
+  for (const [id, n] of [['A', 1], ['B', 5]]) {
+    const recorded = t.cli('slots', String(n), 'plan-' + id, '--session', id);
+    assert.equal(recorded.status, 0, recorded.stdout + recorded.stderr);
+    const f = t.control('slots', id), rec = JSON.parse(fs.readFileSync(f, 'utf8'));
+    fs.writeFileSync(f, JSON.stringify({ ...rec, at: iso(Date.now() - 6 * MIN) }));
+  }
+  t.age(11);
+  assert.match(t.text(t.hook()), /名额是 1 个/); assert.match(t.text(bHook()), /名额是 5 个/);
+  assert.equal(t.cli('request', 'review', '--session', 'A').status, 0);
+  t.cli('abort', t.slot().start);
+  assert.doesNotMatch(t.text(bHook()), /按你的请求/);
+  assert.ok(fs.existsSync(t.control('request', 'A')), 'another session consumed A request');
+  assert.equal(t.cli('request', 'scout', '--session', 'B').status, 0);
+  assert.match(t.text(bHook()), /后台侦察（按你的请求）/);
+  assert.ok(fs.existsSync(t.control('request', 'A')));
+  t.cli('abort', t.slot().start);
+  assert.match(t.text(t.hook()), /后台评审（按你的请求）/);
+  assert.ok(!fs.existsSync(t.control('request', 'A')));
+  t.cli('request', 'review', '--session', 'A');
+  t.cli('abort', t.slot().start);
+  t.addTranscript(goalLine('Goal C', Date.now()));
+  fs.writeFileSync(t.retro('slots'), JSON.stringify({ n: 9, at: iso(Date.now()), why: 'legacy' }));
+  assert.doesNotMatch(t.text(t.hook()), /按你的请求/);
+  assert.ok(!fs.existsSync(t.control('slots')), 'new goal inherited the old plan');
+  assert.doesNotMatch(t.cli('status').stdout, /9 个（legacy/);
+});
+
+await test('concurrency: per-task result files reach the checkpoint and progress desk before aggregation', () => {
+  const t = setup('task-results', { goalAgo: 61 });
+  t.hook();
+  fs.mkdirSync(t.retro('tasks/eval-a'), { recursive: true });
+  fs.writeFileSync(t.retro('tasks/eval-a/results.tsv'), 'task\tmetric\neval-a\t42\n');
+  assert.match(t.text(t.hook()), /检查点到期/);
+  assert.match(t.cli('inbox').stdout, /eval-a[\s\S]*42/);
+  assert.match(t.cli('status').stdout, /eval-a[\s\S]*42/);
+  for (let i = 0; i < 30; i++) {
+    fs.mkdirSync(t.retro(`tasks/part-${i}`), { recursive: true });
+    fs.writeFileSync(t.retro(`tasks/part-${i}/results.tsv`), 'task\tmetric\n' + 'x'.repeat(3000));
+  }
+  for (const command of ['inbox', 'status']) {
+    const output = t.cli(command).stdout;
+    assert.ok(output.length < 20000, `${command} flooded the context with task tables`);
+    assert.match(output, /另有 \d+ 份结果表/);
   }
 });
 

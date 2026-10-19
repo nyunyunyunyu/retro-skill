@@ -83,8 +83,15 @@ const ro = { file: '', off: 0, rest: Buffer.alloc(0), lookedAt: 0, saved: '' };
 const got = withLock(lockFile, () => {
   if (isRunning(readWorker(root, task))) return 'busy';
   for (const f of [lastFile, stopFile]) try { fs.unlinkSync(f); } catch {}
-  try { launch(thread0, prompt); } catch (e) { return e; } // e.g. EINVAL for a .cmd on Windows
-  seg = workerStart(root, task, { desc, type: 'codex', driver: 'codex-worker', pid: process.pid, child: child.pid ?? null, thread: thread0, cwd }).seg;
+  seg = workerStart(root, task, { desc, type: 'codex', driver: 'codex-worker', pid: process.pid, thread: thread0, cwd }).seg;
+  try {
+    launch(thread0, prompt);
+    workerBeat(root, task, { child: child.pid ?? null }, seg);
+  } catch (e) {
+    if (child) kill();
+    workerStop(root, task, { why: 'launch-failed' }, seg);
+    return e;
+  }
   try { fs.appendFileSync(eventsFile, JSON.stringify({ type: 'retro.run', cwd, at: new Date(started).toISOString() }) + '\n'); } catch {}
   return 'ok';
 }, 20);
@@ -158,7 +165,7 @@ function ping(kv = {}) {
   beat = Date.now();
   const command = [...inflight.values()][0];
   const waiting = [...out.values()][0] || (command ? { name: command.cmd, at: command.at } : null);
-  workerBeat(root, task, { ...kv, activityAt: sign, waiting, childAt: launchedAt });
+  workerBeat(root, task, { ...kv, activityAt: sign, waiting, childAt: launchedAt }, seg);
 }
 
 // The thread's rollout: every step Codex takes, including each poll of a command still running, which the --json
@@ -208,8 +215,14 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => end('st
 
 function finish(code) {
   clearTimeout(timer); clearInterval(ticker);
-  workerStop(root, task, { exit: code, why });
-  try { fs.unlinkSync(stopFile); } catch {}
+  // Serialize stop-file cleanup with run/resume, so an old driver cannot erase a new segment's stop request.
+  const saved = withLock(lockFile, () => {
+    if (readWorker(root, task)?.seg !== seg) return false;
+    workerStop(root, task, { exit: code, why }, seg);
+    try { fs.unlinkSync(stopFile); } catch {}
+    return true;
+  }, 50);
+  if (saved === undefined) fail(`无法登记 ${task} 的结束状态：状态仍被占用，请用 status 核对。`);
   const report = path.join(taskDir, 'report.md');
   const how = spawnError ? `没能启动 codex（${spawnError.code || spawnError.message}）：检查 RETRO_CODEX 和工作目录 ${cwd}`
     : why === 'timeout' ? `超过 ${Math.round(timeout / 60e3)} 分钟，已停止` : why === 'stopped' ? '已被停止'
@@ -233,7 +246,13 @@ function finish(code) {
 function stop() {
   if (!prev || prev.stopAt) fail(`${task} 没有在跑。`);
   fs.mkdirSync(workersDir, { recursive: true });
-  fs.writeFileSync(stopFile, String(prev.seg));
+  const requested = withLock(lockFile, () => {
+    if (readWorker(root, task)?.seg !== prev.seg) return false;
+    fs.writeFileSync(stopFile, String(prev.seg));
+    return true;
+  }, 50);
+  if (requested === undefined) fail(`${task} 状态被占用，请重试 stop。`);
+  if (!requested) fail(`${task} 已经开始了新的一段，没有停它；要停就再运行一次 stop。`);
   const live = isRunning(prev);
   const cur = () => readWorker(root, task);
   for (const t0 = Date.now(); live && Date.now() - t0 < 15e3 && !cur()?.stopAt && cur()?.seg === prev.seg; ) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
@@ -241,8 +260,14 @@ function stop() {
   if (cur()?.stopAt) { console.log(`已停止 ${task}。在后台跑它的 run/resume 会交出输出。`); process.exit(0); }
   const own = !win && sameProcess(prev.child, prev.childAt || prev.seg);
   if (own) killTree(prev.child);
-  workerStop(root, task, { why: 'stopped' });
-  try { fs.unlinkSync(stopFile); } catch {}
+  const stopped = withLock(lockFile, () => {
+    if (readWorker(root, task)?.seg !== prev.seg) return false;
+    workerStop(root, task, { why: 'stopped' }, prev.seg);
+    try { fs.unlinkSync(stopFile); } catch {}
+    return true;
+  }, 50);
+  if (stopped === undefined) fail(`${task} 状态被占用，请重试 stop。`);
+  if (!stopped) fail(`${task} 已经开始了新的一段，没有停它；要停就再运行一次 stop。`);
   const what = win ? (live ? '没有结束任何进程（这个进程号可能已经是别的程序）' : 'Codex 进程随它一起结束；它起的命令如果还在跑，要手动结束')
     : own ? '直接结束了 Codex 进程组' : 'Codex 进程也已经不在了';
   console.log(`已停止 ${task}：${live ? '驱动没有响应' : '驱动已经不在了'}，${what}。`);

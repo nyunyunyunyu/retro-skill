@@ -16,7 +16,7 @@ retro 把长任务中的执行、观察和决定分开，让主 agent 能及时�
 
 ## 安装与使用
 
-需要 PATH 上的 Node.js；读取 Codex 目标数据库需要 Node 22.13 以上（无需额外的 SQLite 实验开关）。
+两个平台都需要 PATH 上的 Node.js 22.13 以上；脚本使用内置 SQLite 做进程互斥和读取 Codex 目标数据库，无需额外依赖或 SQLite 实验开关。
 
 ```bash
 git clone https://github.com/nyunyunyunyu/retro-skill
@@ -25,6 +25,8 @@ node retro-skill/install.mjs
 ```
 
 只安装一个平台用 `--codex` 或 `--claude`。安装器会复制两个 skill 及其参考文件、安装评审角色，并合并缺少的 hook；Claude 配置修改前备份为 `.bak-retro`，已有 Codex hook 条目保留。
+
+从旧版文件锁升级时，先停止旧的 worker、watch、恢复监控及使用这些脚本的会话，再更新所有共用项目状态的安装副本。新锁使用持久的 `*.lock.db`，进程退出自动释放，不能按文件年龄删除；新旧锁协议不能混跑。遗留的旧 `*.lock` 会阻止新脚本写入，只有确认没有旧进程后才能清理对应旧锁文件，保留 `.db` 文件。
 
 | 内容 | Claude Code | Codex |
 |---|---|---|
@@ -91,8 +93,8 @@ Claude Code 可在后台运行 `retro.mjs watch`，让待判断的事件结束�
 | `retro.mjs init` | 配置过程记录的 Git 本地排除，列出已经被跟踪的记录路径 |
 | `retro.mjs status` | 目标、回报、执行者、评审和近期事件 |
 | `retro.mjs inbox --session <会话>` / `done "<决定>" --session <会话>` | 该会话当前目标尚未处理的结果 / 标记检查点完成 |
-| `retro.mjs slots <N> <理由>` | 记录并发计划，不强制用满或固定预留 |
-| `retro.mjs request review\|scout` | 请求评审机会；仍由主 agent 启动 |
+| `retro.mjs slots <N> <理由> --session <会话>` | 记录该目标的并发计划，不强制用满或固定预留 |
+| `retro.mjs request review\|scout --session <会话>` | 为该目标请求评审机会；仍由主 agent 启动 |
 | `retro.mjs spawned <开始时间>` / `finish <开始时间> <报告文件>` / `abort <开始时间>` | 后台评审的归属、交付和取消 |
 | `retro.mjs watch --session <会话>` | Claude 后台运行监控 |
 | `retro.mjs metrics [--since <时间>]` | 事后统计，不能单独证明进展或正确性 |
@@ -103,9 +105,11 @@ Claude Code 可在后台运行 `retro.mjs watch`，让待判断的事件结束�
 
 并行执行者各自在任务 `notes.md` 记录方法和踩坑，回报后由主 agent 按需要指派一名执行者合并到共享 RUNBOOK；其他执行者只读手册。影响当前工作的发现及时回报，不等到收尾才共享。
 
+项目指定一个协调主会话写共享进度和想法；backlog 委托期间主会话停写，确认交回或停止后才收回写入权。任务 ID 在项目内唯一。各评测写自己的任务结果表，再由唯一汇总者合并项目总表；hook 和进度台直接识别任务表。独立目标需要各自维护共享状态时使用独立 clone，worktree 不隔离 `.retro/`。
+
 过程记录默认不纳入版本控制。Git 项目写记录前运行 `retro.mjs init --root <项目>`，将 `.retro/` 和旧布局的 PROGRESS.md、RUNBOOK.md、runbook/、results.tsv 加入本地 `info/exclude`；不修改项目 `.gitignore`，同仓库 worktree 共用。新进度与工作手册分别放 `.retro/PROGRESS.md`、`.retro/RUNBOOK.md`，中间笔记与报告也留在 `.retro/`。已跟踪文件会被列出，确认属于过程记录后仅取消索引跟踪，保留本地文件。代码、测试、AGENTS.md 中的项目规则和正式交付文档照常按需提交。
 
-检查点及上轮评审的读取位置按会话和目标分别保存。`inbox`、`done` 在只有一个候选主会话时可以省略 `--session`，多个候选时会要求明确指定；后台 `inbox --since-last review|scout` 从当前登记取得归属。升级后无法归属的旧读取位置不沿用，首次可能重读当前目标已有的回报。报告和结果表仍在项目内共享，读取位置不代表报告归属。
+检查点、评审读取位置、名额与待处理评审请求按会话和目标分别保存。`inbox`、`done`、`slots`、`request` 只有一个候选主会话时可以省略 `--session`，多个候选时必须明确指定；后台 `inbox --since-last review|scout` 从当前登记取得归属。升级后无法归属的旧读取位置、名额和请求不沿用，首次可能重读回报，需重新记录名额或请求。报告和结果表仍在项目内共享，读取位置不代表报告归属。
 
 `tell` 排队时绑定会话和目标身份；交付时目标已变更，或旧格式消息缺少目标身份，会存入 `.retro/user-said.md` 并标为未送达，不自动交给新目标执行。
 
