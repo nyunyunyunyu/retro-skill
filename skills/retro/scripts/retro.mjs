@@ -3,9 +3,9 @@
 // project is CLAUDE_PROJECT_DIR, else the nearest directory up from here holding .retro/, else the current directory;
 // inside a git worktree, the same place in the main checkout (so worktrees share one .retro/). Exit codes: 2 = slot
 // voided/replaced, 3 = busy.
-//   done                   mark a checkpoint finished; the next is due 60 min later, once something came back. Its
+//   done [--session <id>]  mark a checkpoint finished; the next is due 60 min later, once something came back. Its
 //                          window starts where this checkpoint's inbox looked, so reports landing meanwhile count next time
-//   inbox [--since-last review|scout]   what came back since the last checkpoint (or since the previous route
+//   inbox [--session <id>] [--since-last review|scout]   what came back since the last checkpoint (or since the previous route
 //                          review / scout started, for the background agents): task reports, the latest review, ledger rows
 //   slots <n> [why]        the main agent records its executor slots for the goal; the hook checks for idle ones
 //   request review|scout   ask for a background review/scout now; the hook reserves it at the next tool call
@@ -26,9 +26,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  C, EXIT_BUSY, EXIT_GONE, WATCH_TICK, activity, agentName, alive, dir, ensureDir, executorNotes, goalAgents, goalCache,
+  C, EXIT_BUSY, EXIT_GONE, WATCH_TICK, activity, agentName, alive, checkpointDir, dir, ensureDir, executorNotes, goalAgents, goalCache,
   harnessLimit, headOf, iso, lastRetro, lastWrite, limitOf, locked, log, mainCheckout, mtime, openIdeas, read, readSlot,
-  readSlots, reports, safe, sessions, tailRecords, timedTools, watchFile, workerBeat, workerStart, workerStop, writeSlot,
+  readSlots, reports, safe, sessions, slotExpired, tailRecords, timedTools, watchFile, workerBeat, workerStart, workerStop, writeSlot,
 } from './lib.mjs';
 
 const args = process.argv.slice(2);
@@ -44,7 +44,7 @@ const fail = (msg, code = 1) => { console.log(msg); process.exit(code); };
 const busy = () => fail('状态文件被其他进程占用：等几秒后重试同一条命令。', EXIT_BUSY);
 
 const commands = { done, inbox, slots, request, spawned, finish, abort, status, metrics, tell, watch, worker, root: () => console.log(root) };
-if (!commands[cmd]) fail('用法：node retro.mjs <done|inbox [--since-last review|scout]|slots <N> <理由>|request review|scout|spawned <start>|finish <start> <file>|abort <start>|status|metrics [--since <ISO>]|tell <话>|watch [--session <id>]|worker start|beat|stop <id>> [--root <项目>]');
+if (!commands[cmd]) fail('用法：node retro.mjs <done [--session <id>]|inbox [--session <id>] [--since-last review|scout]|slots <N> <理由>|request review|scout|spawned <start>|finish <start> <file>|abort <start>|status|metrics [--since <ISO>]|tell <话>|watch [--session <id>]|worker start|beat|stop <id>> [--root <项目>]');
 commands[cmd]();
 
 // Same mapping as the hook: a worktree path stands for the same place in the main checkout.
@@ -58,12 +58,43 @@ function findRoot(arg) {
   }
 }
 
+// Never infer a checkpoint's owner from which unrelated session happened to write most recently.
+function checkpointSession(kind) {
+  const si = rest.indexOf('--session'), want = si >= 0 ? rest[si + 1] : null;
+  if (si >= 0) {
+    if (!want || want.startsWith('--')) fail('--session 缺少会话 ID');
+    rest.splice(si, 2);
+  }
+  const all = sessions(root), slot = kind ? readSlot(root) : null;
+  let selected;
+  if (want) {
+    selected = all.find(s => s.session_id === want);
+    if (!selected) fail(`这个项目里没有会话 ${want} 的记录。`);
+  } else if (slot?.state === 'running' && slot.type === kind) {
+    selected = all.find(s => safe(s.session_id) === slot.by);
+  }
+  if (!selected) {
+    const active = all.filter(s => goalCache(s.session_id)?.active);
+    const choices = active.length ? active : all;
+    if (choices.length > 1) fail('项目有多个主会话，请用 --session <会话 ID> 指定读取或标记哪个目标；没有推进读取位置。');
+    selected = choices[0];
+  }
+  const id = selected?.session_id;
+  const owner = slot?.state === 'running' && slot.type === kind && slot.by === safe(id);
+  const start = (owner && Number(slot.kv.goalStart)) || (id && Number(goalCache(id)?.start)) || Date.parse(selected?.goal_start) || 0;
+  if (id && !(start > 0 && Number.isFinite(start))) fail('会话记录缺少有效的目标开始时间，无法确定读取位置。');
+  return { id, start };
+}
+
 function done() {
+  const { id, start } = checkpointSession();
+  const d = checkpointDir(root, id, start);
   ensureDir(root);
-  const looked = Date.parse(read(path.join(dir(root), 'inbox-at')).trim()) || 0;
-  fs.writeFileSync(path.join(dir(root), 'retro-done'), iso(looked > lastRetro(root) ? Math.min(looked, now) : now) + '\n');
-  log(root, '', 'checkpoint-done', rest.join(' ').trim());
-  log(root, '', 'snapshot', snapshot());
+  fs.mkdirSync(d, { recursive: true });
+  const looked = Date.parse(read(path.join(d, 'inbox-at')).trim()) || 0;
+  fs.writeFileSync(path.join(d, 'retro-done'), iso(looked > lastRetro(root, id, start) ? Math.min(looked, now) : now) + '\n');
+  log(root, id, 'checkpoint-done', rest.join(' ').trim());
+  log(root, id, 'snapshot', snapshot());
   const size = mtime(path.join(root, 'PROGRESS.md')) ? fs.statSync(path.join(root, 'PROGRESS.md')).size : 0;
   const open = openIdeas(root);
   const out = [`已记录检查点（${clock(now)}）。下一个最早在 60 分钟后，期间有新结果才会提醒。`];
@@ -75,18 +106,16 @@ function done() {
 }
 
 function inbox() {
-  // Since the last checkpoint, or since the goal of the session running it (the most recently active one) started.
+  // Since this goal's last checkpoint, or since this goal started.
   // A background agent asks for everything since its previous round, which the last checkpoint may have cut short.
   const review = path.join(dir(root), 'route-review.md');
   const si = rest.indexOf('--since-last'), kind = si >= 0 ? rest[si + 1] : null;
   if (si >= 0 && kind !== 'review' && kind !== 'scout') fail('用法：inbox [--since-last review|scout]');
-  // From when the previous round started, since it read its inbox then.
-  const scoutStart = r => Date.parse(r.task.slice(6).replace(/^(\d{4})(\d\d)(\d\d)T(\d\d)(\d\d)$/, '$1-$2-$3T$4:$5:00Z')) || r.mtime;
-  const from = kind === 'review' ? Date.parse(read(review).match(/<!-- route-review start=(\S+)/)?.[1]) || mtime(review)
-    : kind === 'scout' ? Math.max(0, ...reports(root).filter(r => r.scout).map(scoutStart))
-    : lastRetro(root);
-  const R = Math.max(from, Date.parse(sessions(root)[0]?.goal_start) || 0);
-  if (!kind) { ensureDir(root); fs.writeFileSync(path.join(dir(root), 'inbox-at'), iso(now) + '\n'); }
+  const { id, start } = checkpointSession(kind), d = checkpointDir(root, id, start);
+  // Old unscoped cursors cannot be attributed safely; replay from the goal start on first use.
+  const from = kind ? Date.parse(read(path.join(d, `${kind}-start`)).trim()) || 0 : lastRetro(root, id, start);
+  const R = Math.max(from, start);
+  if (!kind) { ensureDir(root); fs.mkdirSync(d, { recursive: true }); fs.writeFileSync(path.join(d, 'inbox-at'), iso(now) + '\n'); }
   console.log(`# ${{ review: '上次路线评审', scout: '上次侦察' }[kind] || '上次检查点'}以来交回的内容（从 ${ago(R)} 起）`);
   // The newest reports that fit, printed oldest first.
   const list = reports(root).filter(r => r.mtime > R);
@@ -224,14 +253,20 @@ function spawned() {
   const start = rest[0] || fail('缺少开始时间');
   const r = locked(root, s => {
     if (s.state !== 'running' || s.kv.start !== start) return 'gone';
-    const at = s.spawned ? s.spawnedAt : now;
-    if (!s.spawned) writeSlot(root, { ...s.kv, spawned: iso(now) });
+    const checked = Date.now();
+    if (slotExpired(s, checked)) {
+      writeSlot(root, { ...s.kv, state: 'aborted', end: iso(checked) });
+      log(root, s.by, s.spawned ? 'slot-timeout' : 'slot-unlaunched', `${s.type} ${start}`);
+      return 'gone';
+    }
+    const at = s.spawned ? s.spawnedAt : checked;
+    if (!s.spawned) writeSlot(root, { ...s.kv, spawned: iso(checked) });
     return { end: at + limitOf(s.type), type: s.type };
   }, 50);
   if (r === 'gone') fail('这一轮已作废、已完成或不是这个开始时间：不要继续，也不要写任何文件，直接结束。', EXIT_GONE);
   if (r === undefined) busy();
   log(root, '', 'spawned', start);
-  const notes = path.join(dir(root), 'probes', `${r.type}-${start.replace(/[-:]/g, '').slice(0, 13)}`, 'notes.md');
+  const notes = path.join(dir(root), 'probes', `${r.type}-${start.replace(/[-:]/g, '')}`, 'notes.md');
   fs.mkdirSync(path.dirname(notes), { recursive: true });
   console.log(`已标记启动。限时到 ${clock(r.end)}（${iso(r.end)}），超过就会作废。细节边做边写进 ${notes.replace(/\\/g, '/')}。`);
 }
@@ -243,11 +278,13 @@ function finish() {
   if (!text.trim()) fail('报告是空的。');
   const r = locked(root, s => {
     if (s.state !== 'running' || s.kv.start !== start) return 'gone';
-    if (s.spawned && now > s.spawnedAt + limitOf(s.type) + C.GRACE) {
-      writeSlot(root, { ...s.kv, state: 'aborted', end: iso(now) });
+    const checked = Date.now();
+    if (slotExpired(s, checked)) {
+      writeSlot(root, { ...s.kv, state: 'aborted', end: iso(checked) });
+      log(root, s.by, s.spawned ? 'slot-timeout' : 'slot-unlaunched', `${s.type} ${start}`);
       return 'gone';
     }
-    const stamp = start.replace(/[-:]/g, '').slice(0, 13); // 20261016T0812
+    const stamp = start.replace(/[-:]/g, '');
     let out;
     if (s.type === 'scout') {
       out = path.join(dir(root), 'tasks', `scout-${stamp}`, 'report.md');
@@ -260,6 +297,9 @@ function finish() {
       fs.writeFileSync(path.join(dir(root), 'reviews', `${stamp}.md`), body);
       fs.writeFileSync(out, body);
     }
+    const d = checkpointDir(root, s.by, Number(s.kv.goalStart));
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, `${s.type}-start`), start + '\n');
     writeSlot(root, { ...s.kv, state: 'done', end: iso(now) });
     return out;
   }, 50);
@@ -274,13 +314,13 @@ function finish() {
 function tell() {
   const text = (rest[0] === '-' ? fs.readFileSync(0, 'utf8') : rest.join(' ')).trim().replace(/\s*\n\s*/g, ' ');
   if (!text) fail('用法：tell <用户的原话>（或 tell - 从标准输入读）');
-  const target = sessions(root).find(s => goalCache(s.session_id)?.active);
+  const target = sessions(root).map(s => ({ ...s, current: goalCache(s.session_id) })).find(s => s.current?.active && s.current.start);
   if (!target) fail('没有找到目标还在进行的主会话（目标可能已结束或暂停），转达不了：请用户直接在主会话里说。', EXIT_GONE);
-  const line = JSON.stringify({ at: iso(now), to: target.session_id, text }) + '\n';
+  const line = JSON.stringify({ at: iso(now), to: target.session_id, goal_start: iso(target.current.start), goal: target.current.cond, text }) + '\n';
   if (!locked(root, () => { fs.appendFileSync(path.join(dir(root), 'user-inbox.jsonl'), line); return true; }, 50)) busy();
   log(root, '', 'tell', text);
   const idle = Math.round((now - target.active) / 60e3);
-  console.log(`已放进转达箱，交给目标是「${clip(target.goal, 40)}」的主会话：它下一次调用工具时会收到，送达后 .retro/log.tsv 里会出现 told 事件。${idle >= 10 ? `注意：这个会话已经 ${idle} 分钟没有活动，可能在长时间等待，也可能卡住了。` : ''}`);
+  console.log(`已放进转达箱，交给目标是「${clip(target.current.cond, 40)}」的主会话：目标仍匹配时，它下一次调用工具时会收到，送达后 .retro/log.tsv 里会出现 told 事件。${idle >= 10 ? `注意：这个会话已经 ${idle} 分钟没有活动，可能在长时间等待，也可能卡住了。` : ''}`);
 }
 
 function abort() {
@@ -359,7 +399,7 @@ function status() {
   }
   if (ms.transcript_path) out.push(...mainAgent(ms.transcript_path), ...subagents(ms));
   const start = Date.parse(ms.goal_start) || 0;
-  out.push(`\n## 检查点和名额\n上次检查点：${ago(lastRetro(root))}`);
+  out.push(`\n## 检查点和名额\n上次检查点：${ago(lastRetro(root, ms.session_id, start))}`);
   const set = readSlots(root);
   out.push(`名额：${set && set.at >= start ? `${set.n} 个（${set.why || '没写理由'}，记于 ${ago(set.at)}）` : '这个目标还没记下'}`);
   // From the hook's subagent tracker: executors of this goal, running ones first.

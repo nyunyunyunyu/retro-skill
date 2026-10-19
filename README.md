@@ -16,7 +16,7 @@ retro 把长任务中的执行、观察和决定分开，让主 agent 能及时�
 
 ## 安装与使用
 
-需要 PATH 上的 Node.js；读取 Codex 目标数据库需要 Node 22.5 以上。
+需要 PATH 上的 Node.js；读取 Codex 目标数据库需要 Node 22.13 以上（无需额外的 SQLite 实验开关）。
 
 ```bash
 git clone https://github.com/nyunyunyunyu/retro-skill
@@ -89,7 +89,7 @@ Claude Code 可在后台运行 `retro.mjs watch`，让待判断的事件结束�
 | 命令 | 作用 |
 |---|---|
 | `retro.mjs status` | 目标、回报、执行者、评审和近期事件 |
-| `retro.mjs inbox` / `done "<决定>"` | 尚未处理的结果 / 标记检查点完成 |
+| `retro.mjs inbox --session <会话>` / `done "<决定>" --session <会话>` | 该会话当前目标尚未处理的结果 / 标记检查点完成 |
 | `retro.mjs slots <N> <理由>` | 记录并发计划，不强制用满或固定预留 |
 | `retro.mjs request review\|scout` | 请求评审机会；仍由主 agent 启动 |
 | `retro.mjs spawned <开始时间>` / `finish <开始时间> <报告文件>` / `abort <开始时间>` | 后台评审的归属、交付和取消 |
@@ -99,6 +99,10 @@ Claude Code 可在后台运行 `retro.mjs watch`，让待判断的事件结束�
 | `codex-recover.mjs start\|status\|stop` | 为当前本机 Codex 目标启用、查看或停用临时故障恢复 |
 
 `PROGRESS.md` 是主 agent 的简短恢复快照，任务细节在 `.retro/tasks/<任务>/`。想法池、积压与结果表按需要维护，具体归属见 [state.md](skills/retro/references/state.md)。`.retro/` 由主 checkout 与 worktree 共用，新建时写入忽略规则；会话提醒和追踪文件在系统临时目录。不要手改脚本维护的登记和锁。
+
+检查点及上轮评审的读取位置按会话和目标分别保存。`inbox`、`done` 在只有一个候选主会话时可以省略 `--session`，多个候选时会要求明确指定；后台 `inbox --since-last review|scout` 从当前登记取得归属。升级后无法归属的旧读取位置不沿用，首次可能重读当前目标已有的回报。报告和结果表仍在项目内共享，读取位置不代表报告归属。
+
+`tell` 排队时绑定会话和目标身份；交付时目标已变更，或旧格式消息缺少目标身份，会存入 `.retro/user-said.md` 并标为未送达，不自动交给新目标执行。
 
 等待用户授权时，记录待授权事项并继续独立工作。有项目追问约定就按它安排真实的一次性提醒；没有可用定时能力时说明未设定，不能只写笔记就声称已安排。
 

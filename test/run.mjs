@@ -794,11 +794,17 @@ await test('inbox --since-last review|scout: a background agent sees everything 
     fs.writeFileSync(t.retro(`tasks/${name}/report.md`), `结果：${name}`);
     t.setTime(t.retro(`tasks/${name}/report.md`), mins);
   };
-  const stamp = mins => iso(Date.now() - mins * MIN).replace(/[-:]/g, '').slice(0, 13);
   // minutes ago: old task 90; previous review started 70, handed in 60; a task during it 65; scout started 58, handed in 45; mid 50
-  rep('old', 90); rep('during', 65); rep(`scout-${stamp(58)}`, 45); rep('mid', 50);
-  fs.writeFileSync(t.retro('route-review.md'), `<!-- route-review start=${iso(Date.now() - 70 * MIN)} end=x -->\n# 路线评审\n`);
-  t.setTime(t.retro('route-review.md'), 60);
+  rep('old', 90); rep('during', 65); rep('mid', 50);
+  const goalStart = JSON.parse(fs.readFileSync(t.state('goal'), 'utf8')).start;
+  for (const [type, mins, delivered] of [['review', 70, 60], ['scout', 58, 45]]) {
+    const start = iso(Date.now() - mins * MIN);
+    fs.writeFileSync(t.retro('slot'), `state=running type=${type} start=${start} by=${t.sid} goalStart=${goalStart} spawned=${iso(Date.now())}\n`);
+    const r = spawnSync(process.execPath, [CLI, 'finish', start, '-', '--root', t.proj], { env: t.env, input: `结果：${type}-previous`, encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stdout);
+    const file = type === 'review' ? 'route-review.md' : `tasks/${fs.readdirSync(t.retro('tasks')).find(n => n.startsWith('scout-'))}/report.md`;
+    t.setTime(t.retro(file), delivered);
+  }
   t.cli('inbox'); t.cli('done'); // a checkpoint just now leaves the plain inbox empty
   assert.doesNotMatch(t.cli('inbox').stdout, /结果：mid/);
   const r = t.cli('inbox', '--since-last', 'review').stdout;
@@ -819,7 +825,8 @@ await test('a report landing between the checkpoint\'s inbox and done counts nex
   const t = setup('gap', { goalAgo: 61 });
   t.fresh(); t.hook();
   t.cli('inbox');
-  fs.writeFileSync(t.retro('inbox-at'), iso(Date.now() - 5 * MIN) + '\n'); // inbox ran 5 min ago
+  const goalStart = JSON.parse(fs.readFileSync(t.state('goal'), 'utf8')).start;
+  fs.writeFileSync(t.retro(`checkpoints/${t.sid}/${goalStart}/inbox-at`), iso(Date.now() - 5 * MIN) + '\n'); // inbox ran 5 min ago
   fs.mkdirSync(t.retro('tasks/late'), { recursive: true }); fs.writeFileSync(t.retro('tasks/late/report.md'), '结果：late');
   t.setTime(t.retro('tasks/late/report.md'), 2);
   t.cli('done');
@@ -1501,6 +1508,134 @@ await test('tell: the user\'s words reach the main agent once, at its next tool 
   assert.doesNotMatch(t.text(t.hook()), /进度台/);
   assert.match(fs.readFileSync(t.retro('user-said.md'), 'utf8'), /换评估函数/);
   assert.match(fs.readFileSync(t.retro('log.tsv'), 'utf8'), /\ttold\t/);
+});
+
+await test('regression: queued instructions stay with their goal; legacy messages are retained but not delivered', () => {
+  for (const platform of ['claude', 'codex']) {
+    const created = Date.now() - 5 * MIN, name = 'tell-goal-' + platform;
+    const t = setup(name, platform === 'codex'
+      ? { goalAgo: null, extra: [codexMeta('sess-' + name), codexGoal('Goal A', created)] }
+      : { cond: 'Goal A' });
+    t.hook();
+    assert.equal(t.cli('tell', '立即停止 A 及其执行者').status, 0);
+    t.addTranscript(platform === 'codex' ? codexGoal('Goal B', Date.now()) : goalLine('Goal B', Date.now()));
+    assert.doesNotMatch(t.text(t.hook()), /立即停止 A 及其执行者/);
+    assert.match(fs.readFileSync(t.retro('user-said.md'), 'utf8'), /没有送达[^\n]*Goal A[^\n]*立即停止 A/);
+    assert.equal(fs.readFileSync(t.retro('user-inbox.jsonl'), 'utf8'), '');
+    fs.appendFileSync(t.retro('user-inbox.jsonl'), JSON.stringify({ to: t.sid, at: iso(Date.now()), text: '旧格式指令' }) + '\n');
+    assert.doesNotMatch(t.text(t.hook()), /旧格式指令/);
+    assert.match(fs.readFileSync(t.retro('user-said.md'), 'utf8'), /没有送达[^\n]*旧格式指令/);
+    assert.equal(t.cli('tell', '处理 B 的新指令').status, 0);
+    assert.match(t.text(t.hook()), /处理 B 的新指令/);
+  }
+});
+
+await test('regression: checkpoint readers and reminders are isolated by session and goal', () => {
+  const t = setup('inbox-goals', { goalAgo: 120, cond: 'Goal A', sid: 'A' });
+  t.hook();
+  fs.mkdirSync(t.retro('tasks/a'), { recursive: true });
+  fs.writeFileSync(t.retro('tasks/a/report.md'), 'A 的未处理回报');
+  t.setTime(t.retro('tasks/a/report.md'), 30);
+  const b = path.join(t.proj, 'b.jsonl');
+  fs.writeFileSync(b, JSON.stringify(goalLine('Goal B', Date.now() - 5 * MIN)) + '\n');
+  t.hook({ session_id: 'B', transcript_path: b });
+  assert.notEqual(t.cli('inbox').status, 0, 'ambiguous reader silently selected a session');
+  assert.notEqual(t.cli('done').status, 0, 'ambiguous checkpoint advanced a cursor');
+  assert.match(t.cli('inbox', '--session', 'A').stdout, /A 的未处理回报/);
+  assert.doesNotMatch(t.cli('inbox', '--session', 'B').stdout, /A 的未处理回报/);
+  assert.equal(t.cli('done', '--session', 'B').status, 0);
+  assert.match(t.cli('inbox', '--session', 'A').stdout, /A 的未处理回报/);
+  assert.match(t.text(t.hook()), /检查点到期/);
+  assert.equal(t.cli('done', '--session', 'A').status, 0);
+  assert.doesNotMatch(t.cli('inbox', '--session', 'A').stdout, /A 的未处理回报/);
+  assert.doesNotMatch(t.text(t.hook()), /检查点到期/);
+  t.addTranscript(goalLine('Goal C', Date.now() - 10 * MIN));
+  t.hook();
+  fs.writeFileSync(t.retro('tasks/a/report.md'), 'C 的新回报');
+  t.setTime(t.retro('tasks/a/report.md'), 5);
+  assert.match(t.cli('inbox', '--session', 'A').stdout, /C 的新回报/);
+});
+
+await test('regression: background inbox uses its owner and that goal\'s previous round', () => {
+  for (const type of ['review', 'scout']) {
+    const t = setup('review-goals-' + type, { goalAgo: 120, cond: 'Goal A', sid: 'A' });
+    t.hook();
+    const aStart = JSON.parse(fs.readFileSync(t.state('goal'), 'utf8')).start;
+    const bStart = Date.now() - 5 * MIN, b = path.join(t.proj, 'b.jsonl');
+    fs.writeFileSync(b, JSON.stringify(goalLine('Goal B', bStart)) + '\n');
+    t.hook({ session_id: 'B', transcript_path: b });
+    for (const [owner, goalStart, mins] of [['A', aStart, 70], ['B', bStart, 2]]) {
+      const start = iso(Date.now() - mins * MIN);
+      fs.writeFileSync(t.retro('slot'), `state=running type=${type} start=${start} by=${owner} goalStart=${goalStart} spawned=${iso(Date.now())}\n`);
+      const r = spawnSync(process.execPath, [CLI, 'finish', start, '-', '--root', t.proj], { env: t.env, input: `${owner} 的评审`, encoding: 'utf8' });
+      assert.equal(r.status, 0, r.stdout);
+    }
+    fs.mkdirSync(t.retro('tasks/a'), { recursive: true });
+    fs.writeFileSync(t.retro('tasks/a/report.md'), 'A 的未处理回报');
+    t.setTime(t.retro('tasks/a/report.md'), 30);
+    fs.mkdirSync(t.retro('tasks/old'), { recursive: true });
+    fs.writeFileSync(t.retro('tasks/old/report.md'), 'A 上轮已经读过的回报');
+    t.setTime(t.retro('tasks/old/report.md'), 90);
+    assert.match(t.cli('inbox', '--since-last', type, '--session', 'A').stdout, /A 的未处理回报/);
+    assert.doesNotMatch(t.cli('inbox', '--since-last', type, '--session', 'A').stdout, /A 上轮已经读过的回报/);
+    assert.doesNotMatch(t.cli('inbox', '--since-last', type, '--session', 'B').stdout, /A 的未处理回报/);
+    fs.writeFileSync(t.retro('slot'), `state=running type=${type} start=${iso(Date.now())} by=A goalStart=${aStart}\n`);
+    assert.match(t.cli('inbox', '--since-last', type).stdout, /A 的未处理回报/);
+  }
+});
+
+await test('regression: unscoped legacy cursors never hide a current goal\'s reports', () => {
+  const t = setup('legacy-cursors', { goalAgo: 120 });
+  t.hook();
+  for (const file of ['retro-done', 'inbox-at', 'review-start', 'scout-start']) fs.writeFileSync(t.retro(file), iso(Date.now()) + '\n');
+  fs.writeFileSync(t.retro('route-review.md'), `<!-- route-review start=${iso(Date.now())} -->\n旧评审\n`);
+  fs.mkdirSync(t.retro('tasks/old-scout'), { recursive: true });
+  fs.writeFileSync(t.retro('tasks/old-scout/report.md'), '需要重读的旧回报');
+  t.setTime(t.retro('tasks/old-scout/report.md'), 30);
+  for (const args of [[], ['--since-last', 'review'], ['--since-last', 'scout']]) {
+    assert.match(t.cli('inbox', ...args).stdout, /需要重读的旧回报/);
+  }
+});
+
+await test('regression: expired reservations cannot start or finish through any entry point', () => {
+  for (const entry of ['spawned', 'launched', 'finish']) {
+    const t = setup('expired-' + entry, { goalAgo: 90 });
+    t.hook();
+    const start = iso(Date.now() - 31 * MIN);
+    fs.writeFileSync(t.retro('slot'), `state=running type=review start=${start} by=${t.sid}\n`);
+    if (entry === 'launched') t.hook({ tool_name: 'Agent', tool_input: { subagent_type: 'route-reviewer', run_in_background: true } });
+    else {
+      const args = entry === 'spawned' ? ['spawned', start] : ['finish', start, '-'];
+      const r = spawnSync(process.execPath, [CLI, ...args, '--root', t.proj], { env: t.env, input: '过期报告', encoding: 'utf8' });
+      assert.equal(r.status, 2, r.stdout);
+    }
+    assert.equal(t.slot().state, 'aborted');
+    assert.ok(!t.slot().spawned);
+    assert.ok(!fs.existsSync(t.retro('route-review.md')));
+    assert.ok(!fs.existsSync(t.retro('probes')));
+  }
+});
+
+await test('regression: rounds in the same minute retain separate reports and probe directories', () => {
+  for (const type of ['review', 'scout']) {
+    const t = setup('archive-precision-' + type);
+    t.hook();
+    const goalStart = JSON.parse(fs.readFileSync(t.state('goal'), 'utf8')).start;
+    const minute = Math.floor((Date.now() - MIN) / MIN) * MIN;
+    for (const ms of [100, 200]) {
+      const start = iso(minute + ms);
+      fs.writeFileSync(t.retro('slot'), `state=running type=${type} start=${start} by=${t.sid} goalStart=${goalStart}\n`);
+      assert.equal(t.cli('spawned', start).status, 0);
+      const r = spawnSync(process.execPath, [CLI, 'finish', start, '-', '--root', t.proj], { env: t.env, input: `报告 ${ms}`, encoding: 'utf8' });
+      assert.equal(r.status, 0, r.stdout);
+    }
+    assert.equal(fs.readdirSync(t.retro('probes')).length, 2);
+    const base = t.retro(type === 'review' ? 'reviews' : 'tasks');
+    const files = fs.readdirSync(base);
+    assert.equal(files.length, 2);
+    const bodies = files.map(f => fs.readFileSync(path.join(base, f, ...(type === 'scout' ? ['report.md'] : [])), 'utf8')).join('\n');
+    assert.match(bodies, /报告 100/); assert.match(bodies, /报告 200/);
+  }
 });
 
 await test('hook stays fast on a 60 MB transcript (first scan, then cached)', () => {

@@ -27,8 +27,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   C, SLOT_AGENTS, agentName, agentsDir, claimSaid, codexGoal, ensureDir, executorNotes, goalAgents, handbacks, harnessLimit, iso, lastRetro,
-  limitOf, locked, log, mainCheckout, newestResult, openIdeas, progressGoal, read, readSlot, readSlots, safe, said, sessions,
-  trackTool, watching, writeSlot,
+  locked, log, mainCheckout, newestResult, openIdeas, progressGoal, read, readSlot, readSlots, safe, said, sessions,
+  slotExpired, trackTool, watching, writeSlot,
 } from './lib.mjs';
 
 const now = Date.now();
@@ -174,7 +174,7 @@ function launched() {
   if (s.state !== 'running' || s.spawned || s.by !== sid) return;
   if (!named.includes(s.type === 'scout' ? 'idea-scout' : 'route-reviewer')) return;
   if (locked(root, t => {
-    if (t.state !== 'running' || t.spawned || t.kv.start !== s.kv.start) return false;
+    if (t.state !== 'running' || t.spawned || t.kv.start !== s.kv.start || slotExpired(t, now)) return false;
     writeSlot(root, { ...t.kv, spawned: iso(now) });
     return true;
   })) log(root, sid, 'launched', `${s.type} ${s.kv.start}`);
@@ -187,19 +187,30 @@ function userInbox() {
   if (!fs.existsSync(inbox) || !fs.statSync(inbox).size) return;
   const mine = locked(root, () => {
     const keep = [], got = [], said = [];
+    let rejected = 0;
     for (const l of read(inbox).split('\n').filter(Boolean)) {
       let m;
       try { m = JSON.parse(l); } catch { continue; }
-      if (m.to === input.session_id) { got.push(m.text); said.push(`- ${m.at} ${m.text}`); }
+      if (m.to === input.session_id) {
+        if (m.goal_start === iso(goal.start)) { got.push(m.text); said.push(`- ${m.at} ${m.text}`); }
+        else {
+          rejected++;
+          said.push(`- ${m.at} （没有送达：${m.goal_start ? `目标已变更，原目标「${m.goal || '未知'}」 ${m.goal_start}` : '缺少目标身份'}）${m.text}`);
+        }
+      }
       else if (now - Date.parse(m.at) > 6 * 3600e3) said.push(`- ${m.at} （没有送达）${m.text}`);
       else keep.push(l + '\n');
     }
     if (said.length) fs.appendFileSync(path.join(root, '.retro', 'user-said.md'), said.join('\n') + '\n');
     fs.writeFileSync(inbox, keep.join(''));
-    return got;
+    return { got, rejected };
   });
-  if (!mine?.length) return;
-  const text = mine.join('\n');
+  if (mine?.rejected) {
+    log(root, sid, 'tell-undelivered', `${mine.rejected} 条消息的目标不匹配或身份缺失`);
+    notes.push(`${mine.rejected} 条进度台消息因目标变更或缺少目标身份没有送达，已保留在 .retro/user-said.md；需要用户确认后才能用于当前目标。`);
+  }
+  if (!mine?.got.length) return;
+  const text = mine.got.join('\n');
   log(root, sid, 'told', text);
   notes.push(`用户在进度台说了下面的话，转给你：优先分清并处理指令、想法或问题，保留原意；有效的长期约束记进 PROGRESS.md，需要回答的及时回答。转达不扩大授权。\n${text}`);
 }
@@ -237,7 +248,7 @@ function goalNote() {
 }
 
 function checkpoint() {
-  const R = Math.max(goal.start, lastRetro(root));
+  const R = Math.max(goal.start, lastRetro(root, input.session_id, goal.start));
   const due = R + C.CHECKPOINT_EVERY;
   // Only once something came back since the last one: with nothing to sort, the stall and idle-slot notes speak instead.
   if (now < due || newestResult(root, handbacks(input.session_id, root)) <= R) return;
@@ -245,7 +256,7 @@ function checkpoint() {
   if (!timely('checkpoint', due)) return;
   const mins = Math.round((now - R) / 60e3);
   if (first) log(root, sid, 'checkpoint-due', `${mins}min`);
-  let text = `检查点到期（距上次检查点或目标开始 ${mins} 分钟）。在可响应的断点运行 ${cmd('inbox')} 汇集尚未处理的结果，更新关键决定和 PROGRESS.md，再运行 ${cmd('done "<决定或核对结果>"')}。深入复盘或核实交给子代理；主 agent 继续处理用户和回报。`;
+  let text = `检查点到期（距上次检查点或目标开始 ${mins} 分钟）。在可响应的断点运行 ${cmd(`inbox --session ${input.session_id}`)} 汇集尚未处理的结果，更新关键决定和 PROGRESS.md，再运行 ${cmd(`done "<决定或核对结果>" --session ${input.session_id}`)}。深入复盘或核实交给子代理；主 agent 继续处理用户和回报。`;
   const size = fs.existsSync(path.join(root, 'PROGRESS.md')) ? fs.statSync(path.join(root, 'PROGRESS.md')).size : 0;
   if (size > C.PROGRESS_MAX) text += ` PROGRESS.md 现在 ${(size / 1024).toFixed(1)} KB，超过 4 KB：这次先压缩它（命令和环境移到手册，过程细节移到任务笔记）。`;
   notes.push(text);
@@ -298,11 +309,11 @@ function slot() {
     // My own reservation, never launched, left over from an earlier goal. A launched one runs to its deadline; another
     // session's waits out its 20 minutes. The deadline includes the grace `finish` allows.
     const stale = s.start < goal.start && !s.spawned && mine();
-    const late = s.spawned ? now - s.spawnedAt >= limitOf(s.type) + C.GRACE : now - s.start >= C.LAUNCH_MAX;
+    const late = slotExpired(s, now);
     if (stale || late) {
       // Any session may void it (keeping `spawned`, so the owner still learns to stop it).
       const voided = locked(root, t => {
-        if (t.state !== 'running' || t.kv.start !== s.kv.start) return false;
+        if (t.state !== 'running' || t.kv.start !== s.kv.start || !(slotExpired(t, now) || (t.start < goal.start && !t.spawned && t.by === sid))) return false;
         writeSlot(root, { ...t.kv, state: 'aborted', end: iso(now) });
         return true;
       });
@@ -338,7 +349,7 @@ function slot() {
     if (!p) return null;
     const start = iso(now);
     if (p.stall) writeSlot(root, { state: 'stalled', type: 'stall', start, by: sid, lastScout: t.kv.lastScout });
-    else writeSlot(root, { state: 'running', type: p.type, start, by: sid, lastScout: p.type === 'scout' ? start : t.kv.lastScout });
+    else writeSlot(root, { state: 'running', type: p.type, start, by: sid, goalStart: goal.start, lastScout: p.type === 'scout' ? start : t.kv.lastScout });
     return { ...p, start };
   });
   if (!got) return;
