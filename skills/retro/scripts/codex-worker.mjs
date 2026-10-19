@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Runs a retro executor task as a Codex thread (`codex exec --json`) for a main agent in another harness (Claude Code),
 // and registers it as a worker (.retro/workers/, see lib.mjs): the hook counts it in the slots and notices a long
-// segment, and the checkpoint sees it hand back. A thread gone silent (see check()) the driver asks by itself: it stops
-// the turn and resumes the thread with the question. Every command takes --root <project>.
+// segment, and the checkpoint sees it hand back. Silence is reported for the main agent to assess; only an explicit
+// stop or the hard timeout ends a running turn. Every command takes --root <project>.
 //   run <task> [--brief <file>] [--cd <dir>] [--desc <name>] [--timeout <min>]
 //                 a new thread on the brief (default .retro/tasks/<task>/brief.md), working in --cd (default the project)
 //   resume <task> <message> [--brief <file>] [--timeout <min>]   the same thread again, in the same directory: a
@@ -22,7 +22,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  C, alive, codexCommand, dir, log, mainCheckout, mtime, read, readWorker, rolloutStep, safe, withLock, workerBeat, workerStart, workerStop,
+  C, alive, codexCommand, dir, mainCheckout, mtime, read, readWorker, rolloutStep, safe, withLock, workerBeat, workerStart, workerStop,
 } from './lib.mjs';
 
 const args = process.argv.slice(2);
@@ -76,8 +76,7 @@ fs.mkdirSync(workersDir, { recursive: true });
 // Check and register under a lock, so two runs of the same task can't both start.
 const started = Date.now();
 let seg, child = null, thread = thread0, said = '', error = '', stderr = '', why = null, buf = '', exited = false, exitCode = null;
-let beat = 0, spawnError = null, launchedAt = 0, sign = 0, modelAt = 0, asking = null, askedAt = 0, asks = 0, quiet = 0, awaitAnswer = false;
-const answers = [];
+let beat = 0, spawnError = null, launchedAt = 0, sign = 0;
 const inflight = new Map(); // commands running now, by item id: Codex may run several at once
 const out = new Map(); // tool calls the rollout shows without their output yet
 const ro = { file: '', off: 0, rest: Buffer.alloc(0), lookedAt: 0, saved: '' };
@@ -92,7 +91,7 @@ const got = withLock(lockFile, () => {
 if (got === undefined || got === 'busy') fail(`${task} 正在由另一个 run/resume 启动或在跑。`);
 if (got !== 'ok') fail(`没能启动 codex（${got.code || got.message}）：RETRO_CODEX 要指向一个可执行文件（Windows 上是 .exe，不能是 .cmd）。`);
 
-// Starts codex on `text`: a new thread, or thread t again (a resume, or the driver asking why it went silent). Throws
+// Starts codex on `text`: a new thread, or an explicitly resumed thread t. Throws
 // when it can't be spawned.
 function launch(t, text) {
   const argv = [...pre, ...config, '-c', 'approval_policy="never"', 'exec', ...(t ? ['resume'] : []), '--json', '--skip-git-repo-check',
@@ -123,16 +122,6 @@ function launch(t, text) {
   c.on('close', code => {
     clearTimeout(drain);
     onLine(buf); buf = '';
-    if (asking && !why && !spawnError) {
-      const q = asking;
-      asking = null;
-      try {
-        launch(thread, q);
-        askedAt = Date.now(); awaitAnswer = true;
-        workerBeat(root, task, { child: child.pid ?? null, childAt: launchedAt, cmd: null, cmdAt: 0, asks });
-        return;
-      } catch (e) { spawnError = e; }
-    }
     finish(exitCode ?? code);
   });
 }
@@ -147,8 +136,6 @@ function onLine(line) {
   try { fs.appendFileSync(eventsFile, keep + '\n'); } catch {}
   if (!e) return;
   sign = Date.now();
-  // Its own steps: Codex also reports warnings as error items, at startup too.
-  if (String(e.type).startsWith('item.') && it.type !== 'error') modelAt = sign;
   if (e.type === 'thread.started' && e.thread_id) kv.thread = thread = e.thread_id;
   if (it.type === 'command_execution') {
     // Codex quotes the shell's full path ("C:\\…\\powershell.exe" -Command '…'): its name is enough.
@@ -159,7 +146,6 @@ function onLine(line) {
   }
   if (it.type === 'agent_message' && e.type === 'item.completed' && it.text?.trim()) {
     said = it.text; kv.said = clip(it.text, 300);
-    if (awaitAnswer) { answers.push(clip(it.text, 300)); awaitAnswer = false; }
   }
   if (it.type === 'error' && /code-mode host/i.test(it.message)) stderr += it.message;
   if (e.type === 'turn.failed' || e.type === 'error') error = e.error?.message || e.message || line;
@@ -170,7 +156,9 @@ function onLine(line) {
 function ping(kv = {}) {
   if (!Object.keys(kv).length && Date.now() - beat < 1000) return;
   beat = Date.now();
-  workerBeat(root, task, kv);
+  const command = [...inflight.values()][0];
+  const waiting = [...out.values()][0] || (command ? { name: command.cmd, at: command.at } : null);
+  workerBeat(root, task, { ...kv, activityAt: sign, waiting, childAt: launchedAt });
 }
 
 // The thread's rollout: every step Codex takes, including each poll of a command still running, which the --json
@@ -189,38 +177,19 @@ function follow() {
   ro.off = n;
   const all = Buffer.concat([ro.rest, b]), cut = all.lastIndexOf(10) + 1;
   ro.rest = all.subarray(cut);
-  sign = Date.now();
   for (const line of all.toString('utf8', 0, cut).split('\n')) {
     let o;
     try { o = JSON.parse(line); } catch { continue; }
-    if (rolloutStep(o, out, sign) === 'step') modelAt = sign;
+    if (rolloutStep(o, out, Date.now())) sign = Date.now();
   }
   ping();
-}
-
-// Silent (lib.mjs C.SILENT/STUCK): nothing for SILENT while no tool call is out, or a call out for STUCK. Without the
-// rollout, a command running counts as a call out. Codex can't be told anything mid-turn, so the driver stops the turn
-// and resumes the thread with the question; silent again before it did anything, and the turn ends as stuck.
-function check() {
-  if (why || asking || exited || !child) return;
-  const waiting = ro.file ? out.size > 0 : inflight.size > 0;
-  const ms = Date.now() - Math.max(sign, launchedAt);
-  if (ms < (waiting ? C.STUCK : C.SILENT)) return;
-  quiet = Math.round(ms / 60e3);
-  if (!thread || (askedAt && modelAt <= askedAt)) return end('stuck');
-  asks++;
-  log(root, '-', 'agent-asked', `${task} ${quiet}min${waiting ? ' tool' : ''}`);
-  asking = waiting
-    ? `（retro 驱动）你调用的工具 ${quiet} 分钟没有返回，这一轮被打断了，它起的命令也一起结束了。先用一两句话说明它在做什么、为什么卡住，然后接着做原来的任务；长命令放到后台跑，隔一会儿看一次输出。`
-    : `（retro 驱动）你已经 ${quiet} 分钟没有任何动静，这一轮被打断了。先用一两句话说明刚才在做什么、卡在哪里，然后接着做原来的任务。`;
-  kill();
 }
 
 // Only while it runs: once it exited, its pid may belong to another process. A stop landing after it exited (while
 // its output drains) doesn't change how the turn ended. Elsewhere than Windows, a codex that ignores SIGTERM gets
 // SIGKILL 10 s later.
 function end(reason) {
-  if (why || (exited && !asking)) return;
+  if (why || exited) return;
   why = reason;
   if (!exited) kill();
 }
@@ -233,28 +202,25 @@ const timer = setTimeout(() => end('timeout'), timeout);
 const ticker = setInterval(() => {
   if (read(stopFile).trim() === String(seg)) end('stopped');
   follow();
-  check();
+  ping();
 }, TICK);
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => end('stopped'));
 
 function finish(code) {
   clearTimeout(timer); clearInterval(ticker);
-  workerStop(root, task, { exit: code, why, asks });
+  workerStop(root, task, { exit: code, why });
   try { fs.unlinkSync(stopFile); } catch {}
   const report = path.join(taskDir, 'report.md');
   const how = spawnError ? `没能启动 codex（${spawnError.code || spawnError.message}）：检查 RETRO_CODEX 和工作目录 ${cwd}`
     : why === 'timeout' ? `超过 ${Math.round(timeout / 60e3)} 分钟，已停止` : why === 'stopped' ? '已被停止'
-    : why === 'stuck' ? (thread ? `卡住了：被打断追问之后又 ${quiet} 分钟没有任何动静，已停止` : `启动后 ${quiet} 分钟没有任何动静，线程都没开始，已停止`)
     : code === 0 ? '这一轮结束' : `异常结束（退出码 ${code}）`;
   const lines = [`Codex 执行者 ${task}：${how}。线程 ${thread || '无'}，用时 ${Math.round((Date.now() - started) / 60e3)} 分钟。`];
-  if (asks) lines.push(`中途没动静，被打断追问了 ${asks} 次${answers.length ? `。它的回答：${answers.join(' / ')}` : ''}`);
   if (error) lines.push(`错误：${clip(error, 600)}`);
   if (/code-mode host/i.test(stderr)) lines.push(`这个 codex（${exe}）缺 codex-code-mode-host，跑不了命令：装上 Codex 桌面版，或者把 RETRO_CODEX 指向带它的 codex（见 retro 的 README）。`);
   else if (code !== 0 && !why && stderr.trim()) lines.push(`codex 的报错（末尾）：${clip(stderr.slice(-1500), 1500)}`);
   if (writable.length && ownRoots) lines.push(`注意：RETRO_CODEX 自己设了 writable_roots，驱动没有加 ${writable.join('、')}：要提交或写回报，那里面得有它们。`);
   lines.push(mtime(report) >= started ? `回报：${report}` : '这一轮没有写 report.md。');
-  if (why === 'stuck') lines.push(`看看 ${eventsFile} 的最后几行；要再试就在后台运行 ${again(`resume ${task} "<话>"`)}，不然就按任务目录里的 notes.md 另派。`);
-  else if (why && thread) lines.push(`要它交阶段回报：在后台运行 ${again(`resume ${task} "到时间上限了：停下来，交阶段回报和继续申请"`)}`);
+  if (why && thread) lines.push(`需要补阶段回报时，可在后台运行 ${again(`resume ${task} "整理现有结果，交阶段回报，不继续执行"`)}。`);
   const last = read(lastFile).trim() || said.trim();
   lines.push(`最后的话：\n${last.length > 4000 ? `${last.slice(0, 4000)}…（全文见 ${lastFile}）` : last || '（无）'}`);
   console.log(lines.join('\n'));

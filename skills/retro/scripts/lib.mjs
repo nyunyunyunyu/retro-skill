@@ -10,7 +10,7 @@
 //   tasks/<task>/report.md   executor reports; ideas.md, backlog.md, results.tsv, route-review.md, reviews/ are written by agents
 //   user-inbox.jsonl what the user said at the progress desk, until the hook hands it over; then kept in user-said.md
 // Per session, in the system temp dir (claude-retro-<session>.*): the goal cache, what the hook and the watch said
-// when (.said, see claimSaid), the last main tool call (.call) and Stop block (.blocked), the subagent tracker
+// when (.said, see claimSaid), the subagent tracker
 // (.agents/, see trackedAgents), elapsed tool calls (.tools/, see timedTools), and the background watch (.watch).
 import fs from 'node:fs';
 import os from 'node:os';
@@ -23,15 +23,11 @@ export const C = {
   CHECKPOINT_EVERY: 60 * MIN, REPEAT: 10 * MIN,
   SLOT_EVERY: 60 * MIN, SCOUT_EVERY: 240 * MIN, LAUNCH_MAX: 20 * MIN, REVIEW_MAX: 20 * MIN, SCOUT_MAX: 40 * MIN, GRACE: 2 * MIN,
   SEGMENT_MAX: 60 * MIN, GONE: 60 * MIN, IDLE_GRACE: 5 * MIN, SLOTS_BY: 10 * MIN,
-  // An executor is silent when for SILENT it neither did anything nor waited on a tool, or when a tool call of its hasn't
-  // come back after STUCK: Claude Code moves a foreground command to the background at 10 min, and Codex returns from a
-  // poll of a running command within 5, so a live executor gets its tool back well within that.
+  // Observation thresholds, not proof of a stall: allow more time while a tool is outstanding.
   SILENT: 5 * MIN, STUCK: 15 * MIN, SLOW_TOOL: 10 * MIN,
   // A backstop: codex-worker.mjs stops a Codex turn this long. The hook asks the main agent at SEGMENT_MAX.
   WORKER_MAX: 120 * MIN,
-  // Subagents the harness allows at once, minus RESERVE (the background review/scout and two spare), must leave
-  // MIN_SLOTS executors. Defaults: Codex 3 ([agents] max_concurrent_threads_per_session), Claude Code 20.
-  RESERVE: 3, MIN_SLOTS: 2, CODEX_LIMIT: 3, CLAUDE_LIMIT: 20,
+  CODEX_LIMIT: 3, CLAUDE_LIMIT: 20,
   PROGRESS_MAX: 4096, OPEN_IDEAS_MIN: 3, LOCK_STALE: 60e3, SAME_GOAL_GAP: 12 * 60 * MIN,
 };
 export const limitOf = type => (type === 'scout' ? C.SCOUT_MAX : C.REVIEW_MAX);
@@ -303,7 +299,7 @@ export function trackTool(input, goal, now = Date.now()) {
 // External workers: executors another harness runs for this project, registered by their driver (codex-worker.mjs, or
 // `retro.mjs worker start|beat|stop`). .retro/workers/<id>.json holds {desc, type, driver, seg, stopAt, pid (the
 // driver process), child (the codex process) and childAt (when it started, if after seg), thread, rollout, cwd, cmd (the
-// command running now), cmdAt, said (its last words), asks (times its driver asked it why it went silent)}; its mtime
+// command running now), cmdAt, said (its last words), activityAt, waiting ({name, at})}; its mtime
 // is the last sign of life. Written whole (temp file, then rename), so a reader never sees half a record.
 // A worker whose driver process is gone (or, without a pid, silent for GONE) counts as stopped at its last sign.
 const workersDir = root => path.join(dir(root), 'workers');
@@ -343,7 +339,7 @@ export function workerStart(root, id, { desc, type = 'external', driver = '', pi
   const prev = readWorker(root, id) || {};
   const w = writeWorker(root, id, {
     desc: desc || prev.desc || '', type, driver, seg: Date.now(), stopAt: 0, pid, child, thread: thread === undefined ? prev.thread ?? null : thread,
-    cwd: cwd ?? prev.cwd ?? null, rollout: '', childAt: 0, cmd: null, cmdAt: 0, said: '', asks: 0, exit: null, why: null,
+    cwd: cwd ?? prev.cwd ?? null, rollout: '', childAt: 0, cmd: null, cmdAt: 0, said: '', asks: 0, exit: null, why: null, activityAt: 0, waiting: null,
   });
   log(root, '-', 'agent-start', `${safe(id)} ${type}`);
   return w;
@@ -377,7 +373,7 @@ export function workers(root) {
     return {
       id: f.slice(0, -5), worker: true, type: w.type || 'external', driver: w.driver || '', desc: w.desc || '', tp: '', seg: w.seg, last,
       stopAt: w.stopAt || (gone ? last : 0), active: !w.stopAt && !gone, gone, cmd: w.cmd || '', cmdAt: w.cmdAt || 0, said: w.said || '',
-      asks: w.asks || 0,
+      asks: w.asks || 0, activityAt: Number(w.activityAt) || last, waiting: w.waiting || null,
     };
   }).filter(Boolean);
   seen.set(root, { at: now, out });
@@ -418,7 +414,7 @@ export function agentName(a) {
 // without its result is out. Only its own steps and tool results count, not messages sent to it. The tail is long
 // enough to see past a big tool result written while another call is out.
 export function activity(a) {
-  if (a.worker) return { last: a.last, wait: a.cmd ? { name: a.cmd, at: a.cmdAt || a.last } : null };
+  if (a.worker) return { last: a.activityAt || a.last, wait: a.waiting || (a.cmd ? { name: a.cmd, at: a.cmdAt || a.last } : null) };
   const tp = String(a.tp || ''), own = path.join(tp.replace(/\.jsonl$/, ''), 'subagents', `agent-${a.id}.jsonl`);
   const file = fs.existsSync(own) ? own : /[\\/](agent-|rollout-)[^\\/]*\.jsonl$/.test(tp) ? tp : '';
   let last = a.last;
@@ -449,8 +445,7 @@ export function rolloutStep(o, out, at) {
 }
 
 // What the main agent should hear about its running executors, as [{who, text}]: a segment past SEGMENT_MAX; silence
-// (see C.SILENT), with how to interrupt it and ask, since it keeps its context; silence again after that, when it is
-// to be replaced. A Codex thread driven by codex-worker.mjs is asked by its driver. The hook says each once per session
+// (see C.SILENT), with optional follow-up actions for the main agent to choose. The hook says each once per session
 // and logs it. wake: for the background watch, which only wakes the main agent so that the hook says it (the main
 // agent doesn't see a background command's output): what the hook hasn't said yet, each once. codex: the main agent
 // runs in Codex. wcmd(sub): a codex-worker.mjs command line.
@@ -469,7 +464,7 @@ export function executorNotes(running, { now = Date.now(), sessionId, root, code
     const key = `slow ${t.id} ${t.at}`;
     const who = t.agent ? `执行者「${t.agent}」` : '主 agent';
     if (once(key)) {
-      notes.push({ who, text: `瓶颈检查：${who}的「${t.name}」${t.ended ? '已返回，用时' : '启动后尚未收到完成记录，已经'} ${Math.floor(elapsed / 60e3)} 分钟。输出或轮询不会重置这段计时。立即查看输出和 CPU/GPU/内存占用，核对预计剩余时间；让执行者回报是否卡在测试、构建、资源排队或重复验证，并决定继续等待、缩小验证或优化流程。把耗时、证据和决定记进 notes.md；有正常进度的长任务不要仅因这条提醒而停止或重跑。` });
+      notes.push({ who, text: `瓶颈检查：${who}的「${t.name}」${t.ended ? '已返回，用时' : '启动后尚未收到完成记录，已经'} ${Math.floor(elapsed / 60e3)} 分钟。输出或轮询不会重置这段计时。让执行者核对有效进度、预计剩余时间和 CPU/GPU/内存占用，回报测试、构建、资源排队或重复验证的耗时证据；主 agent 决定继续等待、缩小验证或优化流程。把证据、决定和复查点记进 notes.md；有正常进度的长任务不要仅因这条提醒而停止或重跑。` });
       if (!wake) log(root, sessionId, 'tool-slow', `${t.agent || 'main'} ${Math.floor(elapsed / 60e3)}min ${t.name}`);
     }
     if (!wake && t.ended && (had[key] || said(sessionId)[key])) try { fs.unlinkSync(t.file); } catch {}
@@ -477,33 +472,33 @@ export function executorNotes(running, { now = Date.now(), sessionId, root, code
   for (const a of running) {
     const driven = a.driver === 'codex-worker', over = now - a.seg >= C.SEGMENT_MAX;
     // Silence counts from its last sign of life, never earlier than its last tool call.
-    const quiet = !driven && now - a.last >= C.SILENT;
+    const quiet = now - (a.activityAt || a.last) >= C.SILENT;
     if (!over && !quiet) continue;
     const who = a.worker ? `${a.type === 'codex' ? 'Codex 执行者' : '外部执行者'}「${agentName(a)}」（任务 ${a.id}）` : `子代理「${agentName(a)}」（${a.type}）`;
     const say = (text, event = '', detail = '') => {
       if (event && !wake) log(root, sessionId, event, detail);
       notes.push({ who, text: who + text });
     };
-    // A worker hears nothing mid-turn: stop it and resume the same thread.
+    // Offer commands only after the main agent chooses interruption; the hook never stops an executor.
     const ask = what => a.worker
       ? `它跑着的时候收不到消息：${driven ? `用 ${wcmd(`stop ${a.id}`)} 停掉，再在后台运行 ${wcmd(`resume ${a.id} "${what}"`)}` : `用它的驱动停掉，再让同一个线程接着做：“${what}”`}，上下文还在。`
       : codex ? `用 interrupt_agent 打断它，再用 followup_task 对它说：“${what}”，它会带着上下文接着做。`
       : `用 TaskStop 停掉它（${a.id}），再用 SendMessage 对它说：“${what}”，它会带着上下文接着做。`;
     if (over && once(`over ${a.id} ${a.seg}`)) {
       say(a.worker
-        ? `这一段已经连续跑了 ${min(a.seg)} 分钟，超过一段 1 小时的上限，还没有交回。${a.cmd ? `它正在跑命令「${clip(a.cmd, 120)}」（${min(a.cmdAt)} 分钟）。` : ''}没有说得过去的理由，就要它交阶段回报：${ask('到时间上限了：停下来，交阶段回报和继续申请')}`
-        : `这一段已经连续跑了 ${min(a.seg)} 分钟，超过一段 1 小时的上限，还没有交阶段回报。问它一次进展；没有说得过去的理由，就停掉它，按它任务目录里的 notes.md 另派。`);
+        ? `这一段已经连续跑了 ${min(a.seg)} 分钟，还没有交回。${a.cmd ? `它正在跑命令「${clip(a.cmd, 120)}」（${min(a.cmdAt)} 分钟）。` : ''}核对约定预算和有效进度，再决定继续或要求阶段回报；一小时是观察提醒，不是统一停止期限。决定打断后可用：${ask('整理现有进度与剩余工作，交阶段回报')}`
+        : `这一段已经连续跑了 ${min(a.seg)} 分钟，还没有交阶段回报。核对约定预算和有效进度，再决定继续、追问或停止；不要只因一小时提醒而换人。`);
     }
     if (!quiet) continue;
     const { last, wait } = activity(a);
     const limit = wait ? C.STUCK : C.SILENT, key = `quiet ${a.id} ${a.seg} ${last}`, asked = had[key];
     if (!asked && now - last >= limit && once(key)) {
       say(wait
-        ? `在等的工具调用 ${wait.name} 已经 ${min(wait.at)} 分钟没有返回。打断它问一句：${ask(`你调用的 ${wait.name} ${min(wait.at)} 分钟没有返回，被打断了：先说一句它在做什么、为什么卡住，然后接着做`)}`
-        : `已经 ${min(last)} 分钟没有任何动静，也不在等工具。打断它问一句：${ask(`你已经 ${min(last)} 分钟没有动静，被打断了：先说一句刚才在做什么、卡在哪里，然后接着做`)}`,
+        ? `在等的工具调用 ${wait.name} 已经 ${min(wait.at)} 分钟没有返回。先核对进度、资源和预算；决定打断后可用：${ask(`说明 ${wait.name} 的进度、剩余时间和是否需要调整`)}`
+        : `已经 ${min(last)} 分钟没有任何动静，也不在等工具。这只是活动信号，先核对任务；决定打断后可用：${ask('说明当前进度、阻塞和下一步建议')}`,
       'agent-quiet', `${a.id} ${min(last)}min${wait ? ' tool' : ''}`);
     } else if (asked && now - Math.max(asked, last) >= limit && once(`stuck ${a.id} ${a.seg} ${last}`)) {
-      say(`被问过之后又 ${min(asked)} 分钟没有动静。停掉它，按它任务目录里的 notes.md 另派。`, 'agent-stuck', a.id);
+      say(`上次提醒之后又 ${min(asked)} 分钟没有动静。核对是否已处理以及 notes.md 中的进度，再决定继续等待、追问或另派；脚本没有自动停止它。`, 'agent-stuck', a.id);
     }
   }
   return notes;

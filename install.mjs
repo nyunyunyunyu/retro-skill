@@ -8,7 +8,6 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { C, harnessLimit } from './skills/retro/scripts/lib.mjs';
 
 const repo = path.dirname(fileURLToPath(import.meta.url));
 const home = os.homedir();
@@ -46,7 +45,6 @@ function readJson(f) {
 const hasRetro = groups => (groups || []).some(g => (g.hooks || []).some(h => JSON.stringify(h).includes('retro-nudge.mjs')));
 // The hook's events and their matchers. SessionStart only after a compaction.
 const EVENTS = { PreToolUse: '*', PostToolUse: '*', Stop: null, SubagentStop: null, SessionStart: 'compact' };
-const need = C.RESERVE + C.MIN_SLOTS;
 
 function installSkills(skillsDir) {
   for (const name of ['retro', 'retro-status']) {
@@ -77,8 +75,6 @@ if (want('claude')) {
   if (!s) say(`hooks not added to ${file}`);
   else if (changed) writeJson(file, s);
   else say(`hooks already in ${file}`);
-  const limit = parseInt(s?.env?.CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS ?? process.env.CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS, 10);
-  if (limit > 0 && limit < need) say(`WARNING: CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS is ${limit}; retro needs at least ${need} (the background review, two spare, ${C.MIN_SLOTS} executors). Raise it or remove it (default 20).`);
 }
 
 if (want('codex')) {
@@ -109,6 +105,4 @@ if (want('codex')) {
     writeJson(file, h);
     say(`hooks ${added.join(', ')} added to ${file} — open /hooks in Codex and trust them; until then Codex skips them`);
   }
-  const limit = harnessLimit(true, null);
-  if (limit < need) say(`WARNING: Codex lets a session run only ${limit} subagents at once; retro needs at least ${need} (the background review, two spare, ${C.MIN_SLOTS} executors) and stops a goal until it has them. Add to ~/.codex/config.toml:  [agents]  max_concurrent_threads_per_session = 12`);
 }

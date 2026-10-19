@@ -120,8 +120,8 @@ function slots() {
   log(root, '', 'slots', `${n} ${why}`);
   const ms = sessions(root)[0];
   const codex = ms ? !!goalCache(ms.session_id)?.codex : false;
-  const room = harnessLimit(codex, root) - C.RESERVE;
-  console.log(`已记下名额 ${n} 个。${n > room ? `注意：${codex ? 'Codex' : 'Claude Code'} 的子代理上限扣掉后台评审和余量后只剩 ${room} 个，超出的会启动失败。` : ''}`);
+  const room = harnessLimit(codex, root);
+  console.log(`已记下名额 ${n} 个。这是并发计划，不要求填满；后台评审也计入平台容量。${n > room ? `注意：${codex ? 'Codex' : 'Claude Code'} 的子代理上限是 ${room} 个，超出的会启动失败。` : ''}`);
 }
 
 // Ask for a background review or scout now instead of at the hourly turn. Kept in the slot line until the hook
@@ -298,7 +298,7 @@ function abort() {
 
 // Polls the tracker until an executor needs the main agent (lib executorNotes), then exits: Claude Code delivers a
 // background command's exit as a new turn, the one way to wake a main agent that ended its turn. It shows the main
-// agent only that the command ended, not its output, so the hook says what to do at the next tool call or Stop.
+// agent only that the command ended, not its output, so the hook says what to consider at the next tool event.
 async function watch() {
   const si = rest.indexOf('--session'), want = si >= 0 ? rest[si + 1] : null;
   const all = sessions(root), s = want ? all.find(x => x.session_id === want) : all[0];
@@ -319,8 +319,7 @@ async function watch() {
     const { running } = cache ? goalAgents(sid, cache.start, t, root) : { running: [] };
     const due = cache ? executorNotes(running, { now: t, sessionId: sid, root, codex: !!cache.codex, wcmd, wake: true }) : [];
     if (due.length) {
-      try { fs.writeFileSync(file.replace(/\.watch$/, '.woke'), String(Date.now())); } catch {}
-      out = `有执行者要处理：${[...new Set(due.map(n => n.who))].join('、')}。你下一次调用工具或结束这一轮时，hook 会说明怎么做。`;
+      out = `有执行者要处理：${[...new Set(due.map(n => n.who))].join('、')}。运行 retro.mjs status 查看现场；下一次工具事件中 hook 会说明待判断的事项。`;
       break;
     }
     // A new executor shows up only at its first tool call.
@@ -362,7 +361,7 @@ function status() {
   const mins = t => Math.round((now - t) / 60e3);
   const run = a => {
     const { last, wait } = activity(a);
-    return `在跑，这一段 ${mins(a.seg)} 分钟${wait ? `，${a.worker ? '正在跑命令' : '在等工具调用'}「${clip(wait.name, 80)}」（${mins(wait.at)} 分钟）` : now - last >= C.SILENT ? `，${mins(last)} 分钟没有动静` : ''}${a.asks ? `，没动静被驱动追问过 ${a.asks} 次` : ''}`;
+    return `在跑，这一段 ${mins(a.seg)} 分钟${wait ? `，${a.worker ? '正在跑命令' : '在等工具调用'}「${clip(wait.name, 80)}」（${mins(wait.at)} 分钟）` : now - last >= C.SILENT ? `，${mins(last)} 分钟没有动静` : ''}`;
   };
   const state = a => (running.includes(a) ? run(a) : a.active ? `${mins(a.last)} 分钟没有动静，可能已被停掉` : a.gone ? `驱动已经不在了（最后动静 ${clock(a.last)}）` : `已交回（${clock(a.stopAt)}）`) + (a.said ? `；最后说：${clip(a.said, 100)}` : '');
   if (agents.length) out.push(`执行者（外部执行者注明类型和任务名；在跑 ${running.length} 个）：${[...running, ...agents.filter(a => !running.includes(a)).sort((a, b) => b.last - a.last).slice(0, 5)].map(a => `${agentName(a)}${a.worker ? `［${a.type} ${a.id}］` : ''}（${state(a)}）`).join('；')}`);

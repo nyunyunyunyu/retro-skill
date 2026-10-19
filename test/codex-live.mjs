@@ -31,8 +31,8 @@ const env = { ...process.env, RETRO_CODEX: JSON.stringify(codexCmd) };
 const hookEnv = { ...env, TEMP: state, TMP: state, TMPDIR: state, CLAUDE_PROJECT_DIR: proj };
 const transcript = path.join(proj, '.transcript.jsonl');
 fs.writeFileSync(transcript, JSON.stringify({ type: 'attachment', timestamp: new Date(Date.now() - 61 * MIN).toISOString(), attachment: { type: 'goal_status', met: false, sentinel: true, condition: 'live test' } }) + '\n');
-const hook = () => {
-  const r = spawnSync(process.execPath, [path.join(SCRIPTS, 'retro-nudge.mjs')], { input: JSON.stringify({ session_id: 'live', transcript_path: transcript, cwd: proj, hook_event_name: 'PostToolUse', tool_name: 'Bash' }), env: hookEnv, encoding: 'utf8' });
+const hook = (extra = {}) => {
+  const r = spawnSync(process.execPath, [path.join(SCRIPTS, 'retro-nudge.mjs')], { input: JSON.stringify({ session_id: 'live', transcript_path: transcript, cwd: proj, hook_event_name: 'PostToolUse', tool_name: 'Bash' }), env: { ...hookEnv, ...extra }, encoding: 'utf8' });
   return r.stdout ? JSON.parse(r.stdout).hookSpecificOutput.additionalContext : '';
 };
 const cli = (...a) => spawnSync(process.execPath, [path.join(SCRIPTS, 'retro.mjs'), ...a, '--root', proj], { env: hookEnv, encoding: 'utf8' }).stdout;
@@ -111,9 +111,7 @@ try {
   assert.match(r4.out.split('最后的话：')[1], /\b200\b/);
   ok();
 
-  // Past the stuck limit, so it passes only if the driver sees each poll in the rollout: from the --json events alone
-  // a command running that long counts as stuck.
-  ok = step('a command running past the stuck limit is not stuck: each poll of it shows in the rollout (time scaled: 15 min = 6 min)');
+  ok = step('a long command completes without an automatic interruption (time scaled: 15 min = 6 min)');
   const sleep7 = process.platform === 'win32' ? 'Start-Sleep -Seconds 420' : 'sleep 420';
   brief('t4', `运行这条 shell 命令，等它结束后只回答 done：${sleep7}\n`);
   const r5 = await start('run', 't4', { RETRO_TIME_SCALE: '0.4' }).done;
@@ -122,19 +120,27 @@ try {
   assert.equal(worker('t4').asks, 0);
   ok();
 
-  ok = step('a Codex that hangs (its model endpoint never answers) is asked once on the same thread, then ends as stuck (time scaled: 5 min = 30 s)');
-  const hole = net.createServer(sock => sock.on('error', () => {})).listen(0, '127.0.0.1');
+  ok = step('a silent Codex is reported by the hook and remains running until explicitly stopped (time scaled: 5 min = 30 s)');
+  const hole = net.createServer(sock => { sock.on('error', () => {}); sock.unref(); }).listen(0, '127.0.0.1').unref();
   await new Promise(res => hole.on('listening', res));
   const url = `127.0.0.1:${hole.address().port}`;
   const hung = JSON.stringify([...codexCmd, '-c', 'model_provider="bh"', '-c', `model_providers.bh={name="bh",base_url="http://${url}/v1",wire_api="responses"}`]);
   brief('t5', '说一句 hi。\n');
-  const r6 = await start('run', 't5', { RETRO_TIME_SCALE: '0.1', RETRO_CODEX: hung }).done;
-  hole.close();
-  assert.equal(r6.code, 1, r6.out);
-  assert.match(r6.out, /Codex 执行者 t5：卡住了：被打断追问之后又 \d+ 分钟没有任何动静，已停止/);
-  assert.equal(worker('t5').asks, 1);
-  assert.match(fs.readFileSync(retro('log.tsv'), 'utf8'), /\tagent-asked\tt5 /);
-  assert.match(fs.readFileSync(worker('t5').rollout, 'utf8'), /（retro 驱动）你已经 \d+ 分钟没有任何动静/, 'the question went to the same thread');
+  const p5 = start('run', 't5', '--timeout', '2', { RETRO_TIME_SCALE: '0.1', RETRO_CODEX: hung });
+  try {
+    await until(() => worker('t5')?.activityAt && Date.now() - worker('t5').activityAt > 45e3, 90e3, 'no model activity past observation window');
+    assert.equal(p5.exitCode, null);
+    assert.equal(worker('t5').stopAt, 0);
+    assert.match(hook({ RETRO_TIME_SCALE: '0.1' }), /任务 t5）已经 \d+ 分钟没有任何动静/);
+    assert.doesNotMatch(fs.readFileSync(retro('log.tsv'), 'utf8'), /\tagent-asked\tt5 /);
+    assert.equal(spawnSync(process.execPath, [path.join(SCRIPTS, 'codex-worker.mjs'), 'stop', 't5', '--root', proj], { env }).status, 0);
+    const r6 = await p5.done;
+    assert.equal(r6.code, 1, r6.out);
+    assert.equal(worker('t5').why, 'stopped');
+  } finally {
+    if (!worker('t5')?.stopAt) spawnSync(process.execPath, [path.join(SCRIPTS, 'codex-worker.mjs'), 'stop', 't5', '--root', proj], { env });
+    hole.close();
+  }
   await until(() => !processesWith(url).length, 15e3, `processes left: ${processesWith(url).join(', ')}`);
   ok();
 

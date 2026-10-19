@@ -4,7 +4,7 @@
 // "Goal cleared" records; Codex: thread_goal_updated events, overruled by its goal database). These are internal
 // formats; if they change, it goes quiet.
 //
-// It speaks to the main agent at its tool calls and at a Stop (blocking it once per stretch of tool calls). At tool
+// It speaks to the main agent at tool events; native /goal owns continuation. At tool
 // calls each kind of message is said at most once per 10 minutes, or once, recorded in <tmp>/claude-retro-<session>.said:
 // - Checkpoint: due 60 min after max(goal start, last `retro.mjs done`) once something came back since (a task report,
 //   a ledger row, a commit, a subagent stop), repeated until marked done. Calls and result counts never trigger it;
@@ -13,14 +13,13 @@
 //   marks it stopped; workers another harness runs (.retro/workers/, Codex threads for a Claude main agent) count too.
 //   From that: slots left idle (against the count set with `retro.mjs slots`), and lib executorNotes: a segment past
 //   an hour, a silent or stuck executor. Claude Code's main agent sleeps between turns, so `retro.mjs watch` wakes it
-//   from the background when one is due, and this hook says it; a Stop with executors running and no watch is blocked. A subagent whose tool
+//   from the background when one is due, and this hook says it at the next tool event. A subagent whose tool
 //   call ran SILENT or longer is asked, right then, what took so long.
 // - Background slot: one route review or idea scout at a time per project, state in .retro/slot. Only this hook
 //   reserves it (under an exclusive lock): at goal start (a scout), then hourly; a scout when none ran for 4 h or the
 //   idea pool runs low, otherwise a review; or right away after `retro.mjs request`. If nothing new came back in the
 //   past hour it reserves nothing and reports a stall. A reservation must be launched within 20 min; the review/scout
 //   then has 20/40 min. Any session voids overdue ones.
-// - Harness limit: too few subagents allowed for the minimum slots stops the run until the user raises it.
 // After a compaction (SessionStart "compact") it tells the main agent to re-read the main loop.
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
@@ -63,6 +62,8 @@ if (event === 'SubagentStop' || input.agent_id) {
 
 const goal = goalState(input.transcript_path, base + '.goal');
 if (!goal.active || goal.child) process.exit(0);
+// Do not create another continuation loop or consume reminders that the main agent has not seen.
+if (event === 'Stop') process.exit(0);
 try { trackTool(input, goal, now); } catch {}
 if (event === 'PreToolUse') process.exit(0);
 
@@ -77,54 +78,33 @@ const tool = goal.codex ? 'Codex' : 'Claude Code';
 
 if (event === 'SessionStart') {
   if (input.source === 'compact') {
-    process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: `上下文刚被压缩。你在用 retro skill 推进 /goal「${goal.cond}」。接着做之前，先重读 ${SKILL} 的第 2 到 4 节（主循环、委派和回报、验证），再读 PROGRESS.md，并运行 ${cmd('status')} 看各个子代理在做什么，然后回到主循环。` } }));
+    process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: `上下文刚被压缩。你在用 retro 推进 /goal「${goal.cond}」。先重读精简入口 ${SKILL} 的职责边界和主循环，再读 PROGRESS.md，运行 ${cmd('status')} 核对任务。主 agent 保持响应，具体执行和深入复盘交给子代理；参考文件只按当前需要读取。` } }));
   }
   process.exit(0);
 }
 
-const stopping = event === 'Stop';
 const notes = [];
-
-// /goal blocks every unfinished Stop, so stop_hook_active stays true for the whole run and can't tell turns apart.
-// Speak at a Stop only if the main agent made a tool call since this hook last blocked, or the watch woke it (.woke):
-// a woken turn may end without a tool call, and its Stop is then the only place to say why. Otherwise change nothing.
-const lastBlock = read(base + '.blocked').trim();
-const lastTurn = Math.max(Number(read(base + '.call')) || 0, Number(read(base + '.woke')) || 0);
-if (stopping && lastBlock !== '' && lastTurn <= Number(lastBlock)) process.exit(0);
-if (!stopping) try { fs.writeFileSync(base + '.call', String(now)); } catch {}
 
 try { if (event === 'PostToolUse') launched(); } catch {}
 try { userInbox(); } catch {}
 try { goalNote(); } catch {}
 try { sessionFile(); } catch {}
-let enough = true;
-try { enough = harness(); } catch {}
-if (enough) {
-  try { checkpoint(); } catch {}
-  try { slot(); } catch {}
-  try { executors(); } catch {}
-}
+try { checkpoint(); } catch {}
+try { slot(); } catch {}
+try { executors(); } catch {}
 
 if (notes.length) {
   const text = notes.join('\n');
-  if (stopping) {
-    try { fs.writeFileSync(base + '.blocked', String(now)); } catch {}
-    process.stdout.write(JSON.stringify({ decision: 'block', reason: text }));
-  } else {
-    process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: event, additionalContext: text } }));
-  }
+  process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: event, additionalContext: text } }));
 }
 
 // What was said when (lib claimSaid): claim(key, ok) says yes, and records it, only if ok(last time said).
 function saidMap() { return said(input.session_id); }
 function claim(key, ok) { return claimSaid(input.session_id, key, ok, now); }
-// Due since `due`: say it, then again once 10 minutes have passed since it was last said. An urgent one (a due
-// checkpoint, an unlaunched reservation) is also said at every Stop the hook may speak at: ending the turn with it
-// still pending is when it matters most, and the Stop rule above keeps that from looping.
-function timely(key, due, urgent = false) {
-  return now >= due && claim(key, last => (stopping && urgent) || !(last >= due && now - last < C.REPEAT));
+// Due since `due`: say it, then again once 10 minutes have passed since it was last said.
+function timely(key, due) {
+  return now >= due && claim(key, last => !(last >= due && now - last < C.REPEAT));
 }
-function once(key) { return claim(key, last => !last); }
 
 // The subagent behind this event if it is an executor, while the main agent's goal was last seen active: not the
 // review/scout (the slot times those), not Codex's approval reviewers, and not Claude Code's internal agents (/btw,
@@ -177,8 +157,8 @@ function slowTool() {
 }
 
 // The main agent just launched a subagent. An executor in the background: remember when, since it is tracked only from
-// its first tool call and its slot shouldn't look idle meanwhile. The reserved review/scout: mark it started, so a Stop right after
-// isn't told otherwise. Only an exact agent name counts: Claude Code's Agent (formerly Task) tool names it in
+// its first tool call and its slot shouldn't look idle meanwhile. Mark the reserved review/scout started.
+// Only an exact agent name counts: Claude Code's Agent (formerly Task) tool names it in
 // subagent_type; another spawn tool (Codex) in some field. Todo tools (TaskCreate…) and prompts that merely mention
 // the name don't. Only the watch writes its liveness file: it may have exited before this hook runs.
 function launched() {
@@ -222,7 +202,7 @@ function userInbox() {
   if (!mine?.length) return;
   const text = mine.join('\n');
   log(root, sid, 'told', text);
-  notes.push(`用户在进度台说了下面的话，转给你（按 retro skill 第 1 节优先处理：先分清是指令、想法还是问题；长期有效的指令马上记进 PROGRESS.md 的“用户指令”；需要回答的，在回复里回答）：\n${text}`);
+  notes.push(`用户在进度台说了下面的话，转给你：优先分清并处理指令、想法或问题，保留原意；有效的长期约束记进 PROGRESS.md，需要回答的及时回答。转达不扩大授权。\n${text}`);
 }
 
 // Record the session holding the goal, so the progress desk can find its transcript.
@@ -257,38 +237,23 @@ function goalNote() {
   }
 }
 
-// The harness must allow the background review/scout, two spare and at least MIN_SLOTS executors at once. If it
-// doesn't, nothing else is said: the main agent is to stop and ask the user to raise the limit.
-function harness() {
-  const max = harnessLimit(goal.codex, root);
-  if (max - C.RESERVE >= C.MIN_SLOTS) return true;
-  const need = C.RESERVE + C.MIN_SLOTS;
-  if (timely('harness', goal.start)) {
-    if (once(`harness-log ${goal.start}`)) log(root, sid, 'harness-limit', String(max));
-    notes.push(goal.codex
-      ? `Codex 现在同时只能开 ${max} 个子代理（~/.codex/config.toml 里 [agents] 的 max_concurrent_threads_per_session，没设时是 3）。扣掉后台评审和余量 ${C.RESERVE} 个，执行名额不到 ${C.MIN_SLOTS} 个，retro 跑不起来。不要开始派任务：在回复里请用户把它改成至少 ${need}（建议 12），改完重启 Codex 再恢复目标。在那之前不要做别的；同一个阻塞按 update_goal 的规则连续出现三轮后，把目标标成 blocked。`
-      : `Claude Code 现在同时只能开 ${max} 个子代理（环境变量 CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS）。扣掉后台评审和余量 ${C.RESERVE} 个，执行名额不到 ${C.MIN_SLOTS} 个，retro 跑不起来。不要开始派任务：在回复里请用户把它调到至少 ${need}（或者删掉这个设置，默认是 20），先用 /goal clear 暂停目标，重启 Claude Code 后再设回来。`);
-  }
-  return false;
-}
-
 function checkpoint() {
   const R = Math.max(goal.start, lastRetro(root));
   const due = R + C.CHECKPOINT_EVERY;
   // Only once something came back since the last one: with nothing to sort, the stall and idle-slot notes speak instead.
   if (now < due || newestResult(root, handbacks(input.session_id, root)) <= R) return;
   const first = !(saidMap().checkpoint >= due);
-  if (!timely('checkpoint', due, true)) return;
+  if (!timely('checkpoint', due)) return;
   const mins = Math.round((now - R) / 60e3);
   if (first) log(root, sid, 'checkpoint-due', `${mins}min`);
-  let text = `检查点到期（距上次检查点或目标开始 ${mins} 分钟）。做完手头这一步后，按 retro skill（${SKILL}）第 2 节做检查点：先运行 ${cmd('inbox')}，最后运行 ${cmd('done "抽查 <任务>：一致"')}（对不上就写“不一致：<哪里>”）。没做之前每 10 分钟提醒一次。`;
+  let text = `检查点到期（距上次检查点或目标开始 ${mins} 分钟）。在可响应的断点运行 ${cmd('inbox')} 汇集尚未处理的结果，更新关键决定和 PROGRESS.md，再运行 ${cmd('done "<决定或核对结果>"')}。深入复盘或核实交给子代理；主 agent 继续处理用户和回报。`;
   const size = fs.existsSync(path.join(root, 'PROGRESS.md')) ? fs.statSync(path.join(root, 'PROGRESS.md')).size : 0;
   if (size > C.PROGRESS_MAX) text += ` PROGRESS.md 现在 ${(size / 1024).toFixed(1)} KB，超过 4 KB：这次先压缩它（命令和环境移到手册，过程细节移到任务笔记）。`;
   notes.push(text);
 }
 
 // The subagent tracker, read for the main agent: executors past their hour, silent or stuck (lib executorNotes); in
-// Claude Code, a turn ending with executors running and no watch to wake the main agent; slots left idle.
+// Claude Code, executors running with no watch to wake the main agent; slots left idle.
 function executors() {
   const { agents, running } = goalAgents(input.session_id, goal.start, now, root);
   const said = executorNotes(running, { now, sessionId: input.session_id, root, codex: goal.codex, wcmd }).map(n => n.text);
@@ -297,19 +262,18 @@ function executors() {
   const launch = Number(read(base + '.launch')) || 0;
   const watch = `\`node "${CLI}" watch --session ${input.session_id} --root "${root.replace(/\\/g, '/')}"\``;
   if (!goal.codex && (running.length || now - launch < C.IDLE_GRACE) && !watching(input.session_id)) {
-    if (stopping) notes.push(`有执行者在跑，后台却没有 retro 的 watch：先用 Bash 在后台（run_in_background）运行 ${watch}，再结束这一轮。执行者没动静、卡住或超时时它会结束，把你叫醒；要处理什么，这个 hook 会在你下一次调用工具或结束这一轮时告诉你。`);
-    else if (said.length) notes.push(`处理完，用 Bash 在后台（run_in_background）重新运行 ${watch}。`);
+    if (timely('watch', goal.start)) notes.push(`有执行者在跑，后台却没有 retro 的 watch：需要后台监控时，用 Bash 在后台（run_in_background）运行 ${watch}。它发现慢调用或活动异常会结束；收到结束通知后查看 ${cmd('status')}，hook 会在工具事件给出待判断的事项。`);
   }
   const set = readSlots(root);
   if (!set || set.at < goal.start) {
-    if (timely('slots', goal.start + C.SLOTS_BY)) notes.push(`还没有记下这个目标的名额。按 retro skill 第 3 节定下来（资源允许的数量、/goal 条件里写的上限、${tool} 的子代理上限 ${harnessLimit(goal.codex, root)} 减 ${C.RESERVE}，三者取最小），然后运行 ${cmd('slots <N> <理由>')}。hook 靠它检查名额有没有空着。`);
+    if (timely('slots', goal.start + C.SLOTS_BY)) notes.push(`还没有记下这个目标的名额。按资源、用户约束和 ${tool} 的子代理上限 ${harnessLimit(goal.codex, root)} 决定并发计划，用 ${cmd('slots <N> <理由>')} 记录；后台评审也计入平台容量。一个执行名额也可以推进，不要求填满。`);
     return;
   }
   if (running.length >= set.n) return;
   // Idle since the last time a slot freed up (approximately, when several are idle), or since the last launch.
   const freed = Math.max(set.at, goal.start, launch, ...agents.map(a => a.stopAt || (a.active && !a.worker && now - a.last >= C.GONE ? a.last + C.GONE : 0)));
   if (timely('idle', freed + C.IDLE_GRACE)) {
-    notes.push(`名额空着：这个目标的名额是 ${set.n} 个，现在在跑的执行子代理只有 ${running.length} 个${running.length ? `（${running.map(agentName).join('、')}）` : ''}。按主循环补位，从“下一步”或想法池派任务，别忘了探索。名额要变，就用 ${cmd('slots <N> <理由>')} 改。`);
+    notes.push(`名额空着：这个目标的名额是 ${set.n} 个，现在在跑的执行子代理只有 ${running.length} 个${running.length ? `（${running.map(agentName).join('、')}）` : ''}。核对是否在有意等待、受资源限制，或有值得派出的工作；不要求补满，也不要求固定探索比例。计划变化时用 ${cmd('slots <N> <理由>')} 更新。`);
   }
 }
 
@@ -348,7 +312,7 @@ function slot() {
       if (!stale) return;
       s = readSlot(root);
     } else {
-      if (!s.spawned && mine() && timely(`launch ${s.kv.start}`, s.start, true)) notes.push(`你登记的后台${s.type === 'scout' ? '侦察' : '评审'}还没有启动：${spawnText(s.type, s.kv.start)}已经启动过就不用管。`);
+      if (!s.spawned && mine() && timely(`launch ${s.kv.start}`, s.start)) notes.push(`你登记的后台${s.type === 'scout' ? '侦察' : '评审'}还没有启动。值得做且有容量时，${spawnText(s.type, s.kv.start)}不需要或资源不足时运行 ${cmd(`abort ${s.kv.start}`)} 释放；已经启动过就不用管。`);
       return;
     }
   }
@@ -381,11 +345,11 @@ function slot() {
   if (!got) return;
   if (got.stall) {
     log(root, sid, 'stall', '');
-    notes.push('过去 1 小时没有任何新结果（子代理交回、任务回报、总表、提交都没有），这一轮不做路线评审。先查原因：名额是不是空着、任务是不是太大又没有阶段回报、是不是在串行地等、资源是不是在排队；然后补上任务，并把原因写进下次检查点。');
+    notes.push('过去 1 小时没有可见的新结果（子代理交回、任务回报、总表、提交），这一轮不登记路线评审。这不等于没有进展：核对当前进度、资源等待和回报约定，再决定继续、补证据或调整任务；深入调查交给执行者。');
   } else {
     log(root, sid, 'slot-reserved', `${got.type} ${got.start}${got.asked ? ' requested' : ''}`);
     claim(`launch ${got.start}`, () => true);
-    notes.push(`已为你登记一次后台${got.type === 'scout' ? '侦察' : '评审'}${got.asked ? '（按你的请求）' : ''}（同一项目同一时间只有一个）：到下一个断点时${spawnText(got.type, got.start)}要在 20 分钟内启动，不要等它，接着调度。`);
+    notes.push(`已为你登记一次后台${got.type === 'scout' ? '侦察' : '评审'}${got.asked ? '（按你的请求）' : ''}（同一项目同一时间只有一个）。值得做且有容量时，${spawnText(got.type, got.start)}不需要或资源不足时运行 ${cmd(`abort ${got.start}`)} 释放。登记 20 分钟后过期；启动后主 agent 继续响应，不等待复盘完成。`);
   }
 }
 
