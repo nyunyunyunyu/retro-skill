@@ -22,12 +22,11 @@
 //   then has 20/40 min. Any session voids overdue ones.
 // After a compaction (SessionStart "compact") it tells the main agent to re-read the main loop.
 import fs from 'node:fs';
-import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  C, SLOT_AGENTS, agentName, agentsDir, claimSaid, ensureDir, executorNotes, goalAgents, handbacks, harnessLimit, iso, lastRetro,
+  C, SLOT_AGENTS, agentName, agentsDir, claimSaid, codexGoal, ensureDir, executorNotes, goalAgents, handbacks, harnessLimit, iso, lastRetro,
   limitOf, locked, log, mainCheckout, newestResult, openIdeas, progressGoal, read, readSlot, readSlots, safe, said, sessions,
   trackTool, watching, writeSlot,
 } from './lib.mjs';
@@ -351,21 +350,6 @@ function slot() {
     claim(`launch ${got.start}`, () => true);
     notes.push(`已为你登记一次后台${got.type === 'scout' ? '侦察' : '评审'}${got.asked ? '（按你的请求）' : ''}（同一项目同一时间只有一个）。值得做且有容量时，${spawnText(got.type, got.start)}不需要或资源不足时运行 ${cmd(`abort ${got.start}`)} 释放。登记 20 分钟后过期；启动后主 agent 继续响应，不等待复盘完成。`);
   }
-}
-
-// The thread's goal row in Codex's goal database (<CODEX_HOME>/goals_<n>.sqlite, table thread_goals): the agent
-// completing it, a token or usage limit, and /goal clear (which deletes the row) show only there. Returns the row,
-// null when the thread has none, undefined when the database can't be read (then the rollout is all there is).
-function codexGoal(thread) {
-  try {
-    const home = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
-    const db = fs.readdirSync(home).filter(f => /^goals_\d+\.sqlite$/.test(f)).sort((a, b) => parseInt(a.slice(6), 10) - parseInt(b.slice(6), 10)).pop();
-    if (!db) return undefined;
-    process.removeAllListeners('warning'); // node:sqlite is experimental in Node 22 and would say so on stderr
-    const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite');
-    const h = new DatabaseSync(path.join(home, db), { readOnly: true });
-    try { return h.prepare('SELECT objective, status, created_at_ms FROM thread_goals WHERE thread_id = ?').get(String(thread)) ?? null; } finally { h.close(); }
-  } catch { return undefined; }
 }
 
 // Latest goal state of the transcript. The cache keeps the byte offset already scanned, so each run reads only what

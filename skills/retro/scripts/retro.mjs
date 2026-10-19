@@ -351,6 +351,12 @@ function status() {
   if (ms.goal) out.push(`目标：${ms.goal}（开始于 ${ago(Date.parse(ms.goal_start))}）`);
   const cache = ms.session_id ? goalCache(ms.session_id) : null;
   if (cache) out.push(`目标状态：hook 最后一次看到时${cache.active ? '进行中' : '已结束或暂停'}。`);
+  if (ms.session_id) {
+    try {
+      const recovery = JSON.parse(read(path.join(dir(root), 'recovery', `${safe(ms.session_id)}.json`)));
+      out.push(`服务故障恢复：${recovery.enabled && alive(recovery.pid) ? '运行中' : '已停止'}；已尝试 ${recovery.sent.length}/3。${recovery.note}`);
+    } catch {}
+  }
   if (ms.transcript_path) out.push(...mainAgent(ms.transcript_path), ...subagents(ms));
   const start = Date.parse(ms.goal_start) || 0;
   out.push(`\n## 检查点和名额\n上次检查点：${ago(lastRetro(root))}`);

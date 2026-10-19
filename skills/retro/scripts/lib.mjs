@@ -13,6 +13,7 @@
 // when (.said, see claimSaid), the subagent tracker
 // (.agents/, see trackedAgents), elapsed tool calls (.tools/, see timedTools), and the background watch (.watch).
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -61,7 +62,7 @@ export const mtime = f => { try { return fs.statSync(f).mtimeMs; } catch { retur
 export const read = f => { try { return fs.readFileSync(f, 'utf8'); } catch { return ''; } };
 
 // Files the scripts and agents generate; kept out of git so worktrees don't carry stale copies.
-const GENERATED = ['slot', 'slot.lock', 'slots', 'retro-done', 'inbox-at', 'log.tsv', 'sessions/', 'tasks/', 'reviews/', 'probes/', 'workers/', 'ideas.md', 'backlog.md', 'results.tsv', 'route-review.md', 'user-inbox.jsonl', 'user-said.md'];
+const GENERATED = ['slot', 'slot.lock', 'slots', 'retro-done', 'inbox-at', 'log.tsv', 'sessions/', 'tasks/', 'reviews/', 'probes/', 'workers/', 'recovery/', 'ideas.md', 'backlog.md', 'results.tsv', 'route-review.md', 'user-inbox.jsonl', 'user-said.md'];
 // A new .retro/ ignores everything. An existing one (some projects commit parts of it) gets a .gitignore for the
 // generated files only, unless it already has one. A list we wrote earlier picks up names added since.
 export function ensureDir(root) {
@@ -173,6 +174,19 @@ export function openIdeas(root) {
 // The hook's cached goal state for a session ({active, cond, start, …} in the system temp dir), or null.
 export function goalCache(sessionId) {
   try { return JSON.parse(fs.readFileSync(path.join(os.tmpdir(), `claude-retro-${safe(sessionId)}.goal`), 'utf8')); } catch { return null; }
+}
+
+// Read only: null means no goal; undefined means the database is unavailable. Never infer permission to resume.
+export function codexGoal(thread) {
+  try {
+    const home = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+    const db = fs.readdirSync(home).filter(f => /^goals_\d+\.sqlite$/.test(f)).sort((a, b) => parseInt(a.slice(6), 10) - parseInt(b.slice(6), 10)).pop();
+    if (!db) return undefined;
+    process.removeAllListeners('warning'); // node:sqlite is experimental in Node 22 and would say so on stderr
+    const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite');
+    const h = new DatabaseSync(path.join(home, db), { readOnly: true });
+    try { return h.prepare('SELECT objective, status, created_at_ms FROM thread_goals WHERE thread_id = ?').get(String(thread)) ?? null; } finally { h.close(); }
+  } catch { return undefined; }
 }
 
 // The executor slots chosen for the current goal ({n, at, why}), or null.

@@ -1491,6 +1491,14 @@ await test('hook stays fast on a 60 MB transcript (first scan, then cached)', ()
   assert.ok(cached < 1500);
 });
 
+await test('Codex recovery: transient failure watchdog integration', async () => {
+  const child = spawn(process.execPath, [path.join(here, 'recovery.mjs')]);
+  let output = '';
+  child.stdout.on('data', b => { output += b; }); child.stderr.on('data', b => { output += b; });
+  const code = await new Promise(resolve => child.on('close', resolve));
+  assert.equal(code, 0, output);
+});
+
 try { fs.rmSync(TMP, { recursive: true, force: true, maxRetries: 3 }); } catch (e) { console.log(`(could not remove ${TMP}: ${e.code})`); }
 console.log(`\n${n - failed}/${n} passed`);
 process.exit(failed ? 1 : 0);

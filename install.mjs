@@ -3,7 +3,6 @@
 //   node install.mjs [--claude] [--codex] [--dry-run]     (no flag: every tool whose config dir exists)
 // Existing settings are kept; the hook entries are added only if missing, and the file is backed up first.
 // In Codex, each added entry needs trusting once in /hooks; entries already trusted stay trusted.
-// It also warns when the tool lets a session run too few subagents at once for retro's minimum slots.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
