@@ -614,6 +614,28 @@ await test('parallel calls: exactly one checkpoint reminder and one reservation'
   assert.equal(rs.filter(r => /已为你登记/.test(t.text(r))).length, 1);
 });
 
+await test('status and metrics are read-only, including expired executor records', () => {
+  const t = setup('status-readonly');
+  t.hook(); t.sub('old-agent'); t.cli('worker', 'start', 'old-worker', 'expired');
+  const old = Date.now() - 2 * 864e5;
+  fs.writeFileSync(t.agentFile('old-agent'), JSON.stringify({ type: 'executor', seg: old }));
+  fs.writeFileSync(t.agentFile('old-agent', 'stop'), '');
+  const worker = t.retro('workers/old-worker.json');
+  fs.writeFileSync(worker, JSON.stringify({ seg: old, stopAt: old, type: 'external' }));
+  for (const file of [t.agentFile('old-agent'), t.agentFile('old-agent', 'stop'), worker]) fs.utimesSync(file, old / 1000, old / 1000);
+  const snapshot = base => fs.readdirSync(base, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name)).flatMap(e => {
+    const file = path.join(base, e.name);
+    return e.isDirectory() ? snapshot(file) : [[file, fs.statSync(file).mtimeMs, fs.readFileSync(file).toString('base64')]];
+  });
+  const before = [snapshot(t.proj), snapshot(t.tmp)];
+  assert.equal(t.cli('status').status, 0);
+  assert.equal(t.cli('metrics').status, 0);
+  assert.deepEqual([snapshot(t.proj), snapshot(t.tmp)], before);
+  t.hook(); // Normal hook maintenance still cleans up expired records.
+  assert.ok(!fs.existsSync(t.agentFile('old-agent')));
+  assert.ok(!fs.existsSync(worker));
+});
+
 await test('goal replaced while unfinished -> one note; same goal re-recorded on compaction keeps its start', () => {
   const t = setup('replace', { goalAgo: 30, cond: 'long goal' });
   t.hook();

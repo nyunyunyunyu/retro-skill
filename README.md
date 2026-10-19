@@ -32,6 +32,8 @@ node retro-skill/install.mjs
 | 评审角色 | `~/.claude/agents/*.md` | `~/.codex/agents/*.toml`，由同一份 Markdown 生成 |
 | hook | `~/.claude/settings.json` | `~/.codex/hooks.json` |
 
+`agents/claude/` 是两个平台共用的角色源文件，目录名表示源文件采用 Claude 的 Markdown 格式。Claude 安装时直接复制；Codex 安装时从同一文件生成 `name`、`description`、推理强度和正文指令，不照搬 Claude 专有的工具列表、后台与轮数参数。它们注册在平台的 **agent 列表**，不是另外两个 skill。
+
 Codex 安装后在 `/hooks` 中信任新增条目，包括用于工具开始计时的 `PreToolUse`。旧条目的信任保留。新会话更适合确认 skill 和角色已经可用；旧会话是否发现新能力取决于平台刷新机制，fork 也不保证重新发现。
 
 设定可验证的目标，再调用 retro：Codex 用 `$retro`，Claude Code 用 `/retro`。建议在项目常驻规则中写：

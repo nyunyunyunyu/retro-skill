@@ -400,10 +400,10 @@ const forget = (sessionId, root, a) => {
 
 // The executors of a goal that started at `since` (tracked subagents, and the project's workers when root is given),
 // and which of them are running: not stopped, and for a subagent heard from within GONE (one stopped without a
-// SubagentStop looks like this). Entries idle for a day are removed.
-export function goalAgents(sessionId, since, now = Date.now(), root = null) {
+// SubagentStop looks like this). Read-only callers leave expired records for hook/watch maintenance.
+export function goalAgents(sessionId, since, now = Date.now(), root = null, prune = true) {
   const all = [...trackedAgents(sessionId), ...(root ? workers(root) : [])];
-  for (const a of all) if (now - Math.max(a.last, a.stopAt) > 864e5) forget(sessionId, root, a);
+  if (prune) for (const a of all) if (now - Math.max(a.last, a.stopAt) > 864e5) forget(sessionId, root, a);
   const agents = all.filter(a => Math.max(a.seg, a.last, a.stopAt) >= since && now - Math.max(a.last, a.stopAt) <= 864e5);
   return { agents, running: agents.filter(a => a.active && (a.worker || now - a.last < C.GONE)) };
 }

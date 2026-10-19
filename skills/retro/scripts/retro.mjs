@@ -363,7 +363,7 @@ function status() {
   const set = readSlots(root);
   out.push(`名额：${set && set.at >= start ? `${set.n} 个（${set.why || '没写理由'}，记于 ${ago(set.at)}）` : '这个目标还没记下'}`);
   // From the hook's subagent tracker: executors of this goal, running ones first.
-  const { agents, running } = goalAgents(ms.session_id || '-', start, now, root);
+  const { agents, running } = goalAgents(ms.session_id || '-', start, now, root, false);
   const mins = t => Math.round((now - t) / 60e3);
   const run = a => {
     const { last, wait } = activity(a);
