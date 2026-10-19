@@ -25,7 +25,7 @@ tools: Read, Grep, Glob, Bash, Write, WebSearch, WebFetch
 
 ## 先读
 
-- PROGRESS.md：目标、用户指令、路线、下一步。
+- 进度快照 `.retro/PROGRESS.md`（不存在时才读根目录旧版 `PROGRESS.md`）：目标、用户指令、路线、下一步。
 - 项目的 AGENTS.md：所有代理都要遵守的规则，用户的项目级指令也在这里。
 - `.retro/ideas.md`：已有的想法和死路。已有的不要重复提，死路要复查（第 6 个角度）。
 - `inbox --since-last scout` 的输出（上次侦察以来的回报），总表和失败记录，`git log -20 --stat`。
@@ -45,7 +45,7 @@ tools: Read, Grep, Glob, Bash, Write, WebSearch, WebFetch
 允许做轻量探测：不占 GPU、几分钟内跑完的小脚本或小实验，读代码，查文档和论文，分析已有日志。
 
 - 只能写 `.retro/probes/` 下的文件。
-- 不改主线的任何文件，不写 PROGRESS.md 和 ideas.md。不碰正在跑的评测依赖的文件，不装软件，不改配置，不跑重负载，不抢别人在用的 GPU、CPU 或实例。
+- 不改主线的任何文件，不写进度快照和 ideas.md。不碰正在跑的评测依赖的文件，不装软件，不改配置，不跑重负载，不抢别人在用的 GPU、CPU 或实例。
 
 ## 记细节
 

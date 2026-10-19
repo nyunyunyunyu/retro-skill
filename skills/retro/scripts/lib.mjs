@@ -62,8 +62,13 @@ export const safe = id => String(id).replace(/[^\w-]/g, '_');
 export const mtime = f => { try { return fs.statSync(f).mtimeMs; } catch { return 0; } };
 export const read = f => { try { return fs.readFileSync(f, 'utf8'); } catch { return ''; } };
 
+export function progressFile(root) {
+  const current = path.join(dir(root), 'PROGRESS.md'), legacy = path.join(root, 'PROGRESS.md');
+  return fs.existsSync(current) || !fs.existsSync(legacy) ? current : legacy;
+}
+
 // Files the scripts and agents generate; kept out of git so worktrees don't carry stale copies.
-const GENERATED = ['slot', 'slot.lock', 'slots', 'retro-done', 'inbox-at', 'review-start', 'scout-start', 'checkpoints/', 'log.tsv', 'sessions/', 'tasks/', 'reviews/', 'probes/', 'workers/', 'recovery/', 'RUNBOOK.md', 'runbook/', 'ideas.md', 'backlog.md', 'results.tsv', 'route-review.md', 'user-inbox.jsonl', 'user-said.md'];
+const GENERATED = ['slot', 'slot.lock', 'slots', 'retro-done', 'inbox-at', 'review-start', 'scout-start', 'checkpoints/', 'log.tsv', 'sessions/', 'tasks/', 'reviews/', 'probes/', 'workers/', 'recovery/', 'PROGRESS.md', 'RUNBOOK.md', 'runbook/', 'ideas.md', 'backlog.md', 'results.tsv', 'route-review.md', 'user-inbox.jsonl', 'user-said.md'];
 // A new .retro/ ignores everything. An existing one (some projects commit parts of it) gets a .gitignore for the
 // generated files only, unless it already has one. A list we wrote earlier picks up names added since.
 export function ensureDir(root) {
@@ -598,6 +603,6 @@ function gitActivity(root) {
 
 // The goal text recorded in PROGRESS.md ("目标（同 /goal）：… · 怎么证明：…"), for when a session lost track of it.
 export function progressGoal(root) {
-  const m = read(path.join(root, 'PROGRESS.md')).match(/^目标[^：:\n]*[：:]\s*(.+)$/m);
+  const m = read(progressFile(root)).match(/^目标[^：:\n]*[：:]\s*(.+)$/m);
   return m ? m[1].split(' · ')[0].trim() : '';
 }

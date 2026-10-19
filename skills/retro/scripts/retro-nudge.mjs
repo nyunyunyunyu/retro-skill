@@ -27,7 +27,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   C, SLOT_AGENTS, agentName, agentsDir, claimSaid, codexGoal, ensureDir, executorNotes, goalAgents, handbacks, harnessLimit, iso, lastRetro,
-  locked, log, mainCheckout, newestResult, openIdeas, progressGoal, read, readSlot, readSlots, safe, said, sessions,
+  locked, log, mainCheckout, newestResult, openIdeas, progressFile, progressGoal, read, readSlot, readSlots, safe, said, sessions,
   slotExpired, trackTool, watching, writeSlot,
 } from './lib.mjs';
 
@@ -77,7 +77,7 @@ const tool = goal.codex ? 'Codex' : 'Claude Code';
 
 if (event === 'SessionStart') {
   if (input.source === 'compact') {
-    process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: `上下文刚被压缩。你在用 retro 推进 /goal「${goal.cond}」。先重读精简入口 ${SKILL} 的职责边界和主循环，再读 PROGRESS.md，运行 ${cmd('status')} 核对任务。主 agent 保持响应，具体执行和深入复盘交给子代理；参考文件只按当前需要读取。` } }));
+    process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: `上下文刚被压缩。你在用 retro 推进 /goal「${goal.cond}」。先重读精简入口 ${SKILL} 的职责边界和主循环，再读 ${progressFile(root)}，运行 ${cmd('status')} 核对任务。主 agent 保持响应，具体执行和深入复盘交给子代理；参考文件只按当前需要读取。` } }));
   }
   process.exit(0);
 }
@@ -212,7 +212,7 @@ function userInbox() {
   if (!mine?.got.length) return;
   const text = mine.got.join('\n');
   log(root, sid, 'told', text);
-  notes.push(`用户在进度台说了下面的话，转给你：优先分清并处理指令、想法或问题，保留原意；有效的长期约束记进 PROGRESS.md，需要回答的及时回答。转达不扩大授权。\n${text}`);
+  notes.push(`用户在进度台说了下面的话，转给你：优先分清并处理指令、想法或问题，保留原意；有效的长期约束记进 ${progressFile(root)}，需要回答的及时回答。转达不扩大授权。\n${text}`);
 }
 
 // Record the session holding the goal, so the progress desk can find its transcript.
@@ -241,7 +241,7 @@ function goalNote() {
     const all = sessions(root);
     const orig = [progressGoal(root), goal.unfinished, ...all.map(s => s.unfinished), goal.prev, ...all.map(s => s.goal), ...goal.past.map(p => p.cond).reverse()]
       .find(g => g && !RESUME.test(g));
-    notes.push(`注意：当前 /goal 的条件只是字面上的「${goal.cond}」。Claude Code 的 /goal 没有恢复子命令，这样设的是一个新目标，评估器会按这几个字判断是否达成，原来的目标并没有恢复。请在回复里告诉用户：要恢复原目标，用 /goal 加原文重新设置。${orig ? `原目标是「${orig}」。` : '原文可以从 PROGRESS.md 的“目标”一栏找到。'}`);
+    notes.push(`注意：当前 /goal 的条件只是字面上的「${goal.cond}」。Claude Code 的 /goal 没有恢复子命令，这样设的是一个新目标，评估器会按这几个字判断是否达成，原来的目标并没有恢复。请在回复里告诉用户：要恢复原目标，用 /goal 加原文重新设置。${orig ? `原目标是「${orig}」。` : `原文可以从 ${progressFile(root)} 的“目标”一栏找到。`}`);
   } else {
     notes.push(`注意：/goal 刚被换成新条件，原来未完成的目标被替换了。原目标是「${goal.prev}」。如果新目标只是临时任务，完成时在回复里提醒用户用 /goal 加原文恢复。`);
   }
@@ -256,9 +256,10 @@ function checkpoint() {
   if (!timely('checkpoint', due)) return;
   const mins = Math.round((now - R) / 60e3);
   if (first) log(root, sid, 'checkpoint-due', `${mins}min`);
-  let text = `检查点到期（距上次检查点或目标开始 ${mins} 分钟）。在可响应的断点运行 ${cmd(`inbox --session ${input.session_id}`)} 汇集尚未处理的结果，更新关键决定和 PROGRESS.md，再运行 ${cmd(`done "<决定或核对结果>" --session ${input.session_id}`)}。深入复盘或核实交给子代理；主 agent 继续处理用户和回报。`;
-  const size = fs.existsSync(path.join(root, 'PROGRESS.md')) ? fs.statSync(path.join(root, 'PROGRESS.md')).size : 0;
-  if (size > C.PROGRESS_MAX) text += ` PROGRESS.md 现在 ${(size / 1024).toFixed(1)} KB，超过 4 KB：这次先压缩它（命令和环境移到手册，过程细节移到任务笔记）。`;
+  const file = progressFile(root);
+  let text = `检查点到期（距上次检查点或目标开始 ${mins} 分钟）。在可响应的断点运行 ${cmd(`inbox --session ${input.session_id}`)} 汇集尚未处理的结果，更新关键决定和 ${file}，再运行 ${cmd(`done "<决定或核对结果>" --session ${input.session_id}`)}。深入复盘或核实交给子代理；主 agent 继续处理用户和回报。`;
+  const size = fs.existsSync(file) ? fs.statSync(file).size : 0;
+  if (size > C.PROGRESS_MAX) text += ` ${file} 现在 ${(size / 1024).toFixed(1)} KB，超过 4 KB：这次先压缩它（命令和环境移到手册，过程细节移到任务笔记）。`;
   notes.push(text);
 }
 

@@ -29,7 +29,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   C, EXIT_BUSY, EXIT_GONE, WATCH_TICK, activity, agentName, alive, checkpointDir, dir, ensureDir, executorNotes, goalAgents, goalCache,
-  harnessLimit, headOf, iso, lastRetro, lastWrite, limitOf, locked, log, mainCheckout, mtime, openIdeas, read, readSlot,
+  harnessLimit, headOf, iso, lastRetro, lastWrite, limitOf, locked, log, mainCheckout, mtime, openIdeas, progressFile, read, readSlot,
   readSlots, reports, safe, sessions, slotExpired, tailRecords, timedTools, watchFile, workerBeat, workerStart, workerStop, writeSlot,
 } from './lib.mjs';
 
@@ -129,12 +129,12 @@ function done() {
   fs.writeFileSync(path.join(d, 'retro-done'), iso(looked > lastRetro(root, id, start) ? Math.min(looked, now) : now) + '\n');
   log(root, id, 'checkpoint-done', rest.join(' ').trim());
   log(root, id, 'snapshot', snapshot());
-  const size = mtime(path.join(root, 'PROGRESS.md')) ? fs.statSync(path.join(root, 'PROGRESS.md')).size : 0;
+  const file = progressFile(root), size = mtime(file) ? fs.statSync(file).size : 0;
   const open = openIdeas(root);
   const out = [`已记录检查点（${clock(now)}）。下一个最早在 60 分钟后，期间有新结果才会提醒。`];
   if (!/抽查/.test(rest.join(' '))) out.push('这次没有写抽查结果：下次检查点记得抽查一份回报，用 done "抽查 <任务>：一致" 记下。');
-  if (!size) out.push(`${root} 下还没有 PROGRESS.md。`);
-  else if (size > C.PROGRESS_MAX) out.push(`PROGRESS.md 有 ${(size / 1024).toFixed(1)} KB，超过 4 KB，请压缩。`);
+  if (!size) out.push(`${file} 缺失或为空。`);
+  else if (size > C.PROGRESS_MAX) out.push(`${file} 有 ${(size / 1024).toFixed(1)} KB，超过 4 KB，请压缩。`);
   out.push(open === null ? '还没有想法池 .retro/ideas.md。' : `想法池里未验证的想法 ${open} 条${open < C.OPEN_IDEAS_MIN ? '，偏少' : ''}。`);
   console.log(out.join(''));
 }
@@ -205,7 +205,7 @@ function snapshot() {
   const ideas = read(path.join(dir(root), 'ideas.md'));
   const dead = (ideas.split(/^#{2,}\s*死路.*$/m)[1] || '').split(/^#{1,}\s/m)[0].split(/\r?\n/).filter(l => /^[-*]\s/.test(l));
   const backlog = read(path.join(dir(root), 'backlog.md')).split('\n').filter(l => /^\s*[-*]\s/.test(l)).length;
-  const size = mtime(path.join(root, 'PROGRESS.md')) ? fs.statSync(path.join(root, 'PROGRESS.md')).size : 0;
+  const file = progressFile(root), size = mtime(file) ? fs.statSync(file).size : 0;
   return `想法 ${openIdeas(root) ?? 0} 死路 ${dead.length} 可疑 ${dead.filter(l => /可疑/.test(l)).length} 积压 ${backlog} PROGRESS ${(size / 1024).toFixed(1)}KB`;
 }
 
@@ -279,7 +279,7 @@ function metrics() {
 
   const snaps = rows.filter(r => r.ev === 'snapshot');
   if (snaps.length) out.push(`\n## 想法池和积压（检查点时的快照）\n第一次：${snaps[0].d}\n最近一次：${snaps.at(-1).d}`);
-  out.push('\n## 需要判断的\n主 agent 的决定被推翻了几次、任务说明是否要反复澄清、PROGRESS.md 是否和实际一致：派一个子代理读这份输出、.retro/reviews/、任务回报和 git log 来判断。');
+  out.push(`\n## 需要判断的\n主 agent 的决定被推翻了几次、任务说明是否要反复澄清、${progressFile(root)} 是否和实际一致：派一个子代理读这份输出、.retro/reviews/、任务回报和 git log 来判断。`);
   console.log(out.join('\n'));
 }
 
@@ -458,8 +458,8 @@ function status() {
     const rows = read(f).split('\n').filter(Boolean);
     out.push(`\n## 总表 ${path.relative(root, f)}（${rows.length} 行，更新于 ${ago(mtime(f))}）\n${[rows[0], ...rows.slice(-3)].join('\n')}`);
   }
-  const progress = read(path.join(root, 'PROGRESS.md'));
-  if (progress) out.push(`\n## PROGRESS.md（更新于 ${ago(mtime(path.join(root, 'PROGRESS.md')))}，前 20 行）\n${progress.split('\n').slice(0, 20).join('\n')}`);
+  const progressPath = progressFile(root), progress = read(progressPath);
+  if (progress) out.push(`\n## ${path.relative(root, progressPath)}（更新于 ${ago(mtime(progressPath))}，前 20 行）\n${progress.split('\n').slice(0, 20).join('\n')}`);
   const events = read(path.join(dir(root), 'log.tsv')).split('\n').filter(Boolean).slice(-8);
   if (events.length) out.push(`\n## 最近事件\n${events.join('\n')}`);
   console.log(out.join('\n'));

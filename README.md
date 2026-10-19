@@ -39,7 +39,7 @@ Codex 安装后在 `/hooks` 中信任新增条目，包括用于工具开始计�
 设定可验证的目标，再调用 retro：Codex 用 `$retro`，Claude Code 用 `/retro`。建议在项目常驻规则中写：
 
 ```text
-- 设了 /goal 的长任务，开始时调用 retro skill；项目根目录有 PROGRESS.md 时，开始工作前先读它。
+- 设了 /goal 的长任务，开始时调用 retro skill；开始工作前先读 .retro/PROGRESS.md，不存在时兼容读取根目录的 PROGRESS.md。
 - 评测或构建预计超过约 1 分钟时，放到后台运行，等待期间做不冲突的事；不要改它依赖的文件，也不要抢同一 GPU/CPU。
 ```
 
@@ -99,9 +99,9 @@ Claude Code 可在后台运行 `retro.mjs watch`，让待判断的事件结束�
 | `retro.mjs tell "<用户原话>"` | 进度台转达；下一次主 agent 工具事件交付 |
 | `codex-recover.mjs start\|status\|stop` | 为当前本机 Codex 目标启用、查看或停用临时故障恢复 |
 
-`PROGRESS.md` 是主 agent 的简短恢复快照，任务细节在 `.retro/tasks/<任务>/`。想法池、积压与结果表按需要维护，具体归属见 [state.md](skills/retro/references/state.md)。`.retro/` 由主 checkout 与 worktree 共用，新建时写入忽略规则；会话提醒和追踪文件在系统临时目录。不要手改脚本维护的登记和锁。
+`.retro/PROGRESS.md` 是主 agent 的简短恢复快照，不存在时兼容读取根目录旧版 `PROGRESS.md`。任务细节在 `.retro/tasks/<任务>/`。想法池、积压与结果表按需要维护，具体归属见 [state.md](skills/retro/references/state.md)。`.retro/` 由主 checkout 与 worktree 共用，新建时写入忽略规则；会话提醒和追踪文件在系统临时目录。不要手改脚本维护的登记和锁。
 
-过程记录默认不纳入版本控制。Git 项目写记录前运行 `retro.mjs init --root <项目>`，将 `.retro/`、PROGRESS.md 和旧布局的 RUNBOOK.md、runbook/、results.tsv 加入本地 `info/exclude`；不修改项目 `.gitignore`，同仓库 worktree 共用。新工作手册放 `.retro/RUNBOOK.md`，中间笔记与报告也留在 `.retro/`。已跟踪文件会被列出，确认属于过程记录后仅取消索引跟踪，保留本地文件。代码、测试、AGENTS.md 中的项目规则和正式交付文档照常按需提交。
+过程记录默认不纳入版本控制。Git 项目写记录前运行 `retro.mjs init --root <项目>`，将 `.retro/` 和旧布局的 PROGRESS.md、RUNBOOK.md、runbook/、results.tsv 加入本地 `info/exclude`；不修改项目 `.gitignore`，同仓库 worktree 共用。新进度与工作手册分别放 `.retro/PROGRESS.md`、`.retro/RUNBOOK.md`，中间笔记与报告也留在 `.retro/`。已跟踪文件会被列出，确认属于过程记录后仅取消索引跟踪，保留本地文件。代码、测试、AGENTS.md 中的项目规则和正式交付文档照常按需提交。
 
 检查点及上轮评审的读取位置按会话和目标分别保存。`inbox`、`done` 在只有一个候选主会话时可以省略 `--session`，多个候选时会要求明确指定；后台 `inbox --since-last review|scout` 从当前登记取得归属。升级后无法归属的旧读取位置不沿用，首次可能重读当前目标已有的回报。报告和结果表仍在项目内共享，读取位置不代表报告归属。
 

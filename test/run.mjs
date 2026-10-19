@@ -143,6 +143,7 @@ await test('SessionStart after a compaction re-points the main agent at the main
   const r = t.hook({ hook_event_name: 'SessionStart', source: 'compact' });
   assert.equal(r.hookSpecificOutput.hookEventName, 'SessionStart');
   assert.match(r.hookSpecificOutput.additionalContext, /主循环/); assert.match(r.hookSpecificOutput.additionalContext, /status/);
+  assert.ok(r.hookSpecificOutput.additionalContext.includes(t.retro('PROGRESS.md')));
   assert.equal(t.hook({ hook_event_name: 'SessionStart', source: 'startup' }), null);
   assert.ok(!fs.existsSync(t.retro('slot')), 'a SessionStart reserved something');
   const u = setup('compactnogoal', { goalAgo: null });
@@ -681,11 +682,56 @@ await test('Codex goal events: active with createdAt as start, paused = inactive
 });
 
 await test('PROGRESS.md over 4 KB is flagged in the retro nudge and by done', () => {
-  const t = setup('big', { goalAgo: 61 });
+  for (const layout of ['legacy', 'retro']) {
+    const t = setup('big-' + layout, { goalAgo: 61 });
+    t.fresh();
+    const file = layout === 'retro' ? t.retro('PROGRESS.md') : path.join(t.proj, 'PROGRESS.md');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, 'x'.repeat(5000));
+    assert.match(t.text(t.hook()), /超过 4 KB/, layout);
+    assert.match(t.cli('done').stdout, /超过 4 KB/, layout);
+    assert.match(fs.readFileSync(t.retro('log.tsv'), 'utf8'), /PROGRESS 4\.9KB/, layout);
+  }
+});
+
+await test('PROGRESS.md: status prefers .retro, falls back to legacy and never moves either file', () => {
+  const t = setup('progress-path', { goalAgo: 61 });
+  const legacy = path.join(t.proj, 'PROGRESS.md'), current = t.retro('PROGRESS.md');
+  const old = 'legacy progress\n' + 'x'.repeat(5000), next = 'current progress\n';
+  fs.writeFileSync(legacy, old);
+  const legacyTime = fs.statSync(legacy).mtimeMs;
+  assert.match(t.cli('status').stdout, /## PROGRESS\.md[\s\S]*legacy progress/);
+  assert.ok(!fs.existsSync(current), 'reading legacy progress created a new copy');
+  fs.mkdirSync(path.dirname(current), { recursive: true });
+  fs.writeFileSync(current, next);
+  const currentTime = fs.statSync(current).mtimeMs;
+  const status = t.cli('status');
+  assert.equal(status.status, 0, status.stderr);
+  assert.match(status.stdout, /## \.retro[/\\]PROGRESS\.md[\s\S]*current progress/);
+  assert.doesNotMatch(status.stdout, /legacy progress/);
+  for (const [file, content, time] of [[legacy, old, legacyTime], [current, next, currentTime]]) {
+    assert.equal(fs.readFileSync(file, 'utf8'), content);
+    assert.equal(fs.statSync(file).mtimeMs, time);
+  }
   t.fresh();
-  fs.writeFileSync(path.join(t.proj, 'PROGRESS.md'), 'x'.repeat(5000));
-  assert.match(t.text(t.hook()), /超过 4 KB/);
-  assert.match(t.cli('done').stdout, /超过 4 KB/);
+  assert.doesNotMatch(t.text(t.hook()), /超过 4 KB/);
+  assert.doesNotMatch(t.cli('done').stdout, /超过 4 KB|缺失或为空/);
+  assert.match(fs.readFileSync(t.retro('log.tsv'), 'utf8'), /PROGRESS 0\.0KB/);
+  fs.writeFileSync(current, '');
+  assert.doesNotMatch(t.cli('status').stdout, /legacy progress/, 'empty current progress must not revive stale legacy content');
+});
+
+await test('PROGRESS.md: goal recovery prefers .retro, even when the current file is empty', () => {
+  for (const content of ['目标（同 /goal）：current goal · 怎么证明：log\n', '']) {
+    const t = setup(content ? 'progress-goal' : 'progress-empty', { cond: 'resume' });
+    fs.writeFileSync(path.join(t.proj, 'PROGRESS.md'), '目标：stale legacy goal\n');
+    fs.mkdirSync(t.retro(''), { recursive: true });
+    fs.writeFileSync(t.retro('PROGRESS.md'), content);
+    const text = t.text(t.hook());
+    assert.doesNotMatch(text, /stale legacy goal/);
+    if (content) assert.match(text, /原目标是「current goal」/);
+    else assert.doesNotMatch(text, /原目标是/);
+  }
 });
 
 await test('status digest reads the main transcript and subagents', () => {
@@ -772,6 +818,7 @@ await test('an existing .retro/ without .gitignore gets one for generated files 
   t.hook();
   const gi = fs.readFileSync(t.retro('.gitignore'), 'utf8');
   assert.match(gi, /^slot$/m); assert.match(gi, /^sessions\/$/m); assert.match(gi, /^backlog\.md$/m); assert.doesNotMatch(gi, /^\*$/m);
+  assert.match(gi, /^PROGRESS\.md$/m);
 });
 
 await test('a generated-files .gitignore picks up new names; a project-owned one is left alone', () => {
@@ -781,6 +828,7 @@ await test('a generated-files .gitignore picks up new names; a project-owned one
   t.hook();
   const gi = fs.readFileSync(t.retro('.gitignore'), 'utf8');
   assert.ok(gi.startsWith('slot\nideas.md\n')); assert.match(gi, /^backlog\.md$/m); assert.equal(gi.match(/^slot$/gm).length, 1);
+  assert.match(gi, /^PROGRESS\.md$/m);
   fs.writeFileSync(t.retro('.gitignore'), 'slot\nmy-notes/\n');
   t.hook();
   assert.equal(fs.readFileSync(t.retro('.gitignore'), 'utf8'), 'slot\nmy-notes/\n');
@@ -803,7 +851,7 @@ await test('local records: init excludes process records in the checkout and its
   assert.equal(t.cli('init').status, 0);
   assert.equal(fs.readFileSync(exclude, 'utf8'), configured, 'init is not idempotent');
   assert.equal(fs.readFileSync(path.join(t.proj, '.gitignore'), 'utf8'), 'node_modules/\n');
-  const records = ['PROGRESS.md', 'RUNBOOK.md', 'runbook/trace.md', 'results.tsv', '.retro/tasks/a/report.md', '.retro/RUNBOOK.md'];
+  const records = ['PROGRESS.md', 'RUNBOOK.md', 'runbook/trace.md', 'results.tsv', '.retro/tasks/a/report.md', '.retro/PROGRESS.md', '.retro/RUNBOOK.md'];
   const writeRecords = cwd => { for (const f of records) { const p = path.join(cwd, f); fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, 'local evidence\n'); } };
   writeRecords(t.proj);
   git(t.proj, 'add', '-A');
@@ -1356,6 +1404,10 @@ await test('retro.mjs finds the main checkout from inside a worktree', () => {
   const input = { session_id: 'wt', transcript_path: t.transcript, cwd: wt, hook_event_name: 'PostToolUse', tool_name: 'Bash' };
   spawnSync(process.execPath, [HOOK], { input: JSON.stringify(input), env: { ...t.env, CLAUDE_PROJECT_DIR: wt }, encoding: 'utf8' });
   assert.ok(fs.existsSync(path.join(repo, '.retro', 'slot')) && !fs.existsSync(path.join(wt, '.retro')));
+  fs.writeFileSync(path.join(repo, '.retro', 'PROGRESS.md'), 'shared current progress\n');
+  const status = spawnSync(process.execPath, [CLI, 'status', '--root', wt], { env, encoding: 'utf8' });
+  assert.equal(status.status, 0, status.stderr);
+  assert.match(status.stdout, /## \.retro[/\\]PROGRESS\.md[\s\S]*shared current progress/);
 });
 
 await test('install.mjs: BOM is fine, JSONC is refused untouched, CRLF agents convert', () => {
