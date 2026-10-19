@@ -29,7 +29,7 @@ tools: Read, Grep, Glob, Bash, Write, WebSearch, WebFetch
 - 项目的 AGENTS.md：所有代理都要遵守的规则，用户的项目级指令也在这里。
 - `.retro/ideas.md`：已有的想法和死路。已有的不要重复提，死路要复查（第 6 个角度）。
 - `inbox --since-last scout` 的输出（上次侦察以来的回报），总表和失败记录，`git log -20 --stat`。
-- 需要时读代码和手册（RUNBOOK.md 及其索引的子文件）。
+- 需要时读代码和手册（`.retro/RUNBOOK.md` 及其索引的子文件，或项目已有的正式手册）。
 
 ## 从六个角度找
 

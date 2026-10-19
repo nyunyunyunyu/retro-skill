@@ -786,6 +786,70 @@ await test('a generated-files .gitignore picks up new names; a project-owned one
   assert.equal(fs.readFileSync(t.retro('.gitignore'), 'utf8'), 'slot\nmy-notes/\n');
 });
 
+await test('local records: init excludes process records in the checkout and its worktrees', () => {
+  const t = setup('local-records');
+  const git = (cwd, ...args) => {
+    const r = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stderr); return r.stdout;
+  };
+  git(t.proj, 'init', '-q');
+  fs.writeFileSync(path.join(t.proj, '.gitignore'), 'node_modules/\n');
+  fs.writeFileSync(path.join(t.proj, 'README.md'), 'deliverable\n');
+  fs.writeFileSync(path.join(t.proj, 'AGENTS.md'), 'project rules\n');
+  const exclude = path.join(t.proj, '.git/info/exclude'), before = fs.readFileSync(exclude, 'utf8');
+  assert.equal(t.cli('init').status, 0);
+  const configured = fs.readFileSync(exclude, 'utf8');
+  assert.ok(configured.startsWith(before));
+  assert.equal(t.cli('init').status, 0);
+  assert.equal(fs.readFileSync(exclude, 'utf8'), configured, 'init is not idempotent');
+  assert.equal(fs.readFileSync(path.join(t.proj, '.gitignore'), 'utf8'), 'node_modules/\n');
+  const records = ['PROGRESS.md', 'RUNBOOK.md', 'runbook/trace.md', 'results.tsv', '.retro/tasks/a/report.md', '.retro/RUNBOOK.md'];
+  const writeRecords = cwd => { for (const f of records) { const p = path.join(cwd, f); fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, 'local evidence\n'); } };
+  writeRecords(t.proj);
+  git(t.proj, 'add', '-A');
+  const tracked = git(t.proj, 'ls-files', '-z').split('\0');
+  for (const f of records) assert.ok(!tracked.includes(f), `${f} entered the index`);
+  assert.ok(tracked.includes('README.md') && tracked.includes('AGENTS.md'));
+  git(t.proj, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'base');
+  const wt = path.join(TMP, 'local-records-worktree');
+  git(t.proj, 'worktree', 'add', '-q', '--detach', wt);
+  writeRecords(wt);
+  git(wt, 'add', '-A');
+  assert.equal(git(wt, 'diff', '--cached', '--name-only'), '', 'a worktree staged process records');
+  assert.equal(spawnSync(process.execPath, [CLI, 'init', '--root', wt], { env: t.env, encoding: 'utf8' }).status, 0);
+  assert.equal(fs.readFileSync(exclude, 'utf8'), configured);
+});
+
+await test('local records: init scopes escaped paths to a project subdirectory', () => {
+  const t = setup('nested-records');
+  assert.equal(spawnSync('git', ['init', '-q', t.proj]).status, 0);
+  const sub = path.join(t.proj, 'module[one]');
+  fs.mkdirSync(sub);
+  const r = spawnSync(process.execPath, [CLI, 'init', '--root', sub], { env: t.env, encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  for (const p of [t.proj, sub]) fs.writeFileSync(path.join(p, 'PROGRESS.md'), 'notes');
+  assert.equal(spawnSync('git', ['-C', t.proj, 'check-ignore', '-q', 'module[one]/PROGRESS.md']).status, 0);
+  assert.equal(spawnSync('git', ['-C', t.proj, 'check-ignore', '-q', 'PROGRESS.md']).status, 1, 'another project was hidden');
+});
+
+await test('local records: tracked files and conflicting repository rules are reported without changing them', () => {
+  const t = setup('tracked-records');
+  assert.equal(spawnSync('git', ['init', '-q', t.proj]).status, 0);
+  const progress = path.join(t.proj, 'PROGRESS.md');
+  fs.writeFileSync(progress, 'previously tracked notes\n');
+  assert.equal(spawnSync('git', ['-C', t.proj, 'add', 'PROGRESS.md']).status, 0);
+  const r = t.cli('init');
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /已跟踪[\s\S]*PROGRESS\.md/);
+  assert.equal(fs.readFileSync(progress, 'utf8'), 'previously tracked notes\n');
+  assert.equal(spawnSync('git', ['-C', t.proj, 'ls-files', '--error-unmatch', 'PROGRESS.md']).status, 0);
+  fs.writeFileSync(path.join(t.proj, '.gitignore'), '!/PROGRESS.md\n');
+  const blocked = t.cli('init');
+  assert.notEqual(blocked.status, 0, 'a repository rule overrode the local exclusion silently');
+  assert.match(blocked.stdout, /PROGRESS\.md/);
+  assert.equal(fs.readFileSync(path.join(t.proj, '.gitignore'), 'utf8'), '!/PROGRESS.md\n');
+});
+
 await test('inbox --since-last review|scout: a background agent sees everything since its previous round', () => {
   const t = setup('inboxsince', { goalAgo: 120 });
   t.hook();

@@ -63,7 +63,7 @@ export const mtime = f => { try { return fs.statSync(f).mtimeMs; } catch { retur
 export const read = f => { try { return fs.readFileSync(f, 'utf8'); } catch { return ''; } };
 
 // Files the scripts and agents generate; kept out of git so worktrees don't carry stale copies.
-const GENERATED = ['slot', 'slot.lock', 'slots', 'retro-done', 'inbox-at', 'review-start', 'scout-start', 'checkpoints/', 'log.tsv', 'sessions/', 'tasks/', 'reviews/', 'probes/', 'workers/', 'recovery/', 'ideas.md', 'backlog.md', 'results.tsv', 'route-review.md', 'user-inbox.jsonl', 'user-said.md'];
+const GENERATED = ['slot', 'slot.lock', 'slots', 'retro-done', 'inbox-at', 'review-start', 'scout-start', 'checkpoints/', 'log.tsv', 'sessions/', 'tasks/', 'reviews/', 'probes/', 'workers/', 'recovery/', 'RUNBOOK.md', 'runbook/', 'ideas.md', 'backlog.md', 'results.tsv', 'route-review.md', 'user-inbox.jsonl', 'user-said.md'];
 // A new .retro/ ignores everything. An existing one (some projects commit parts of it) gets a .gitignore for the
 // generated files only, unless it already has one. A list we wrote earlier picks up names added since.
 export function ensureDir(root) {

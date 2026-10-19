@@ -3,6 +3,7 @@
 // project is CLAUDE_PROJECT_DIR, else the nearest directory up from here holding .retro/, else the current directory;
 // inside a git worktree, the same place in the main checkout (so worktrees share one .retro/). Exit codes: 2 = slot
 // voided/replaced, 3 = busy.
+//   init                   keep process records local using Git's shared info/exclude; report already tracked files
 //   done [--session <id>]  mark a checkpoint finished; the next is due 60 min later, once something came back. Its
 //                          window starts where this checkpoint's inbox looked, so reports landing meanwhile count next time
 //   inbox [--session <id>] [--since-last review|scout]   what came back since the last checkpoint (or since the previous route
@@ -23,6 +24,7 @@
 //                          the hook counts it in the slots and the checkpoint sees it hand back. --pid: the driver's
 //                          process; when it is gone the worker counts as stopped (without one: silent for an hour)
 import fs from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -43,8 +45,8 @@ const ago = t => (t ? `${clock(t)}（${Math.max(0, Math.round((now - t) / 60e3))
 const fail = (msg, code = 1) => { console.log(msg); process.exit(code); };
 const busy = () => fail('状态文件被其他进程占用：等几秒后重试同一条命令。', EXIT_BUSY);
 
-const commands = { done, inbox, slots, request, spawned, finish, abort, status, metrics, tell, watch, worker, root: () => console.log(root) };
-if (!commands[cmd]) fail('用法：node retro.mjs <done [--session <id>]|inbox [--session <id>] [--since-last review|scout]|slots <N> <理由>|request review|scout|spawned <start>|finish <start> <file>|abort <start>|status|metrics [--since <ISO>]|tell <话>|watch [--session <id>]|worker start|beat|stop <id>> [--root <项目>]');
+const commands = { init, done, inbox, slots, request, spawned, finish, abort, status, metrics, tell, watch, worker, root: () => console.log(root) };
+if (!commands[cmd]) fail('用法：node retro.mjs <init|done [--session <id>]|inbox [--session <id>] [--since-last review|scout]|slots <N> <理由>|request review|scout|spawned <start>|finish <start> <file>|abort <start>|status|metrics [--since <ISO>]|tell <话>|watch [--session <id>]|worker start|beat|stop <id>> [--root <项目>]');
 commands[cmd]();
 
 // Same mapping as the hook: a worktree path stands for the same place in the main checkout.
@@ -56,6 +58,38 @@ function findRoot(arg) {
     if (fs.existsSync(path.join(d, '.retro'))) return d;
     if (path.dirname(d) === d) return cwd;
   }
+}
+
+function init() {
+  // Query the caller's index, while Git resolves info/exclude to the directory shared by its worktrees.
+  const project = path.resolve(rootArg || process.env.CLAUDE_PROJECT_DIR || root);
+  const git = (args, input) => spawnSync('git', args, { cwd: project, input, encoding: 'utf8', windowsHide: true });
+  const meta = git(['rev-parse', '--path-format=absolute', '--git-path', 'info/exclude', '--show-prefix']);
+  if (meta.status !== 0) fail(`无法定位 Git 本地排除文件：${meta.error?.message || meta.stderr.trim()}`);
+  const [file, prefix = ''] = meta.stdout.trimEnd().split(/\r?\n/);
+  const records = ['.retro/', 'PROGRESS.md', 'RUNBOOK.md', 'runbook/', 'results.tsv'];
+  const rules = records.map(p => '/' + (prefix + p).replace(/([\\*?\[\]])/g, '\\$1'));
+  try {
+    const raw = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+    const have = raw.split(/\r?\n/), add = rules.filter(r => !have.includes(r));
+    if (add.length) {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.appendFileSync(file, `${raw && !raw.endsWith('\n') ? '\n' : ''}# retro local records\n${add.join('\n')}\n`);
+    }
+  } catch (e) { fail(`无法写入本地排除规则 ${file}：${e.message}`); }
+  // Repository .gitignore rules take precedence over info/exclude; verify instead of claiming protection.
+  const probes = records.map(p => p.endsWith('/') ? p + '__retro_ignore_probe__' : p);
+  const checked = git(['check-ignore', '--no-index', '-z', '--stdin'], probes.join('\0') + '\0');
+  if (checked.status !== 0 && checked.status !== 1) fail(`无法核对排除规则：${checked.error?.message || checked.stderr.trim()}`);
+  const ignored = new Set(checked.stdout.split('\0'));
+  const exposed = records.filter((_, i) => !ignored.has(probes[i]));
+  if (exposed.length) fail(`仓库的忽略规则覆盖了本地排除，以下路径仍未忽略：${exposed.join('、')}。先调整项目规则，再写过程记录。`);
+  const tracked = git(['ls-files', '-z', '--', ...records.map(p => p.replace(/\/$/, ''))]);
+  if (tracked.status !== 0) fail(`无法核对已跟踪记录：${tracked.error?.message || tracked.stderr.trim()}`);
+  ensureDir(root);
+  console.log(`本地排除规则已就绪：${records.join('、')}。同仓库 worktree 共用，不修改项目 .gitignore。`);
+  const files = tracked.stdout.split('\0').filter(Boolean);
+  if (files.length) console.log(`以下路径已跟踪，忽略规则不会阻止它们继续进入提交；确认是过程记录后按具体路径移出索引，保留本地文件：\n${files.slice(0, 40).join('\n')}${files.length > 40 ? `\n另有 ${files.length - 40} 个，可用 git ls-files 查看。` : ''}`);
 }
 
 // Never infer a checkpoint's owner from which unrelated session happened to write most recently.
