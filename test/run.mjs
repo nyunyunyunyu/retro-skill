@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -18,7 +19,8 @@ function setup(name, { goalAgo = 5, cond = 'tests pass', extra = [], sid: sidArg
   fs.mkdirSync(proj, { recursive: true });
   fs.mkdirSync(tmp, { recursive: true });
   const transcript = path.join(proj, 'transcript.jsonl');
-  const lines = goalAgo == null ? [] : [goalLine(cond, Date.now() - goalAgo * MIN)];
+  const initialStart = Date.now() - (goalAgo || 0) * MIN;
+  const lines = goalAgo == null ? [] : [goalLine(cond, initialStart)];
   fs.writeFileSync(transcript, [...lines, ...extra].map(l => JSON.stringify(l)).join('\n') + '\n');
   const env = { ...process.env, TEMP: tmp, TMP: tmp, TMPDIR: tmp, CLAUDE_PROJECT_DIR: proj, CODEX_HOME: path.join(tmp, 'codex-home') };
   delete env.RETRO_TIME_SCALE;
@@ -41,7 +43,18 @@ function setup(name, { goalAgo = 5, cond = 'tests pass', extra = [], sid: sidArg
   });
   const cli = (...a) => spawnSync(process.execPath, [CLI, ...a, '--root', proj], { env, encoding: 'utf8' });
   const text = r => (r ? r.hookSpecificOutput?.additionalContext || r.reason || '' : '');
-  const retro = p => path.join(proj, '.retro', p);
+  const records = (owner = sid) => {
+    let start = initialStart;
+    for (const o of fs.readFileSync(transcript, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l))) {
+      if (o.payload?.type === 'thread_goal_updated' && o.payload.goal?.createdAt) start = o.payload.goal.createdAt * 1000;
+    }
+    try { start = JSON.parse(fs.readFileSync(path.join(tmp, 'claude-retro-' + owner + '.goal'), 'utf8')).start; } catch {}
+    let id;
+    try { id = fs.readFileSync(path.join(proj, '.retro', 'checkpoints', owner, String(start), 'record-id'), 'utf8').trim(); } catch {}
+    id ||= new Date(start).toISOString().slice(0, 10).replaceAll('-', '') + '-' + createHash('sha256').update(JSON.stringify([owner, start])).digest('hex').slice(0, 12);
+    return path.join(proj, '.retro', 'goals', id);
+  };
+  const retro = p => path.join(/^(PROGRESS\.md|RUNBOOK\.md|runbook|ideas\.md|backlog\.md|results\.tsv|route-review\.md|tasks|reviews|probes)([\\/]|$)/.test(p) ? records() : path.join(proj, '.retro'), p);
   const slot = () => Object.fromEntries([...fs.readFileSync(retro('slot'), 'utf8').matchAll(/(\w+)=(\S+)/g)].map(m => [m[1], m[2]]));
   const addTranscript = (...ls) => fs.appendFileSync(transcript, ls.map(l => JSON.stringify(l)).join('\n') + '\n');
   const state = ext => path.join(tmp, `claude-retro-${sid}.${ext}`);
@@ -51,14 +64,14 @@ function setup(name, { goalAgo = 5, cond = 'tests pass', extra = [], sid: sidArg
   const agentFile = (id, ext = 'json') => path.join(tmp, `claude-retro-${sid}.agents`, `${id}.${ext}`);
   const setTime = (f, mins) => { const t = (Date.now() - mins * MIN) / 1000; fs.utimesSync(f, t, t); };
   // A new row in the project's ledger: something came back.
-  const fresh = () => fs.appendFileSync(path.join(proj, 'results.tsv'), 'row\n');
+  const fresh = () => { fs.mkdirSync(records(), { recursive: true }); fs.appendFileSync(retro('results.tsv'), 'row\n'); };
   const control = (file, owner = sid) => {
     const { start } = JSON.parse(fs.readFileSync(path.join(tmp, `claude-retro-${owner}.goal`), 'utf8'));
     const d = retro(`checkpoints/${owner}/${start}`);
     fs.mkdirSync(d, { recursive: true });
     return path.join(d, file);
   };
-  return { proj, tmp, sid, transcript, hook, hookAsync, cli, text, retro, slot, addTranscript, state, age, sub, agentFile, setTime, fresh, env, control };
+  return { proj, tmp, sid, initialStart, transcript, hook, hookAsync, cli, text, retro, slot, addTranscript, state, age, sub, agentFile, setTime, fresh, env, control, records };
 }
 const goalLine = (cond, t, extra = {}) => ({ type: 'attachment', timestamp: new Date(t).toISOString(), attachment: { type: 'goal_status', met: false, sentinel: true, condition: cond, ...extra } });
 const iso = t => new Date(t).toISOString();
@@ -349,6 +362,7 @@ await test('bottleneck: a slow failed tool is reported to its executor and main;
 await test('bottleneck: a driven worker with fresh heartbeats is reported; monitor and driver wrappers are excluded', () => {
   const t = setup('slow-worker');
   t.hook();
+  t.hook();
   t.cli('worker', 'start', 'eval', 'long evaluation', '--pid', String(process.pid), '--type', 'codex');
   const file = t.retro('workers/eval.json'), rec = JSON.parse(fs.readFileSync(file, 'utf8'));
   fs.writeFileSync(file, JSON.stringify({ ...rec, driver: 'codex-worker', cmd: 'python eval.py', cmdAt: Date.now() - 11 * MIN }));
@@ -536,7 +550,7 @@ await test('overdue review is voided; owner told once to stop it', () => {
   const t = setup('void', { goalAgo: 50 });
   fs.mkdirSync(t.retro(''), { recursive: true });
   const start = iso(Date.now() - 25 * MIN);
-  fs.writeFileSync(t.retro('slot'), `state=running type=review start=${start} by=${t.sid} spawned=${start} lastScout=${iso(Date.now() - MIN)}\n`);
+  fs.writeFileSync(t.retro('slot'), `state=running recordId=${path.basename(t.records())} goalStart=${t.initialStart} type=review start=${start} by=${t.sid} spawned=${start} lastScout=${iso(Date.now() - MIN)}\n`);
   assert.match(t.text(t.hook()), /超过时间上限/);
   assert.equal(t.slot().state, 'aborted');
   assert.doesNotMatch(t.text(t.hook()), /超过时间上限/);
@@ -549,7 +563,7 @@ await test('another session voids it; the owner learns once on its next call', (
   const owner = setup('voidA', { sid: 'owner', goalAgo: 60 }), other = setup('voidA', { sid: 'other', goalAgo: 60 }); // same project and transcript
   const start = iso(Date.now() - 45 * MIN);
   fs.mkdirSync(owner.retro(''), { recursive: true });
-  fs.writeFileSync(owner.retro('slot'), `state=running type=scout start=${start} by=owner spawned=${start} lastScout=${start}\n`);
+  fs.writeFileSync(owner.retro('slot'), `state=running recordId=${path.basename(owner.records())} goalStart=${owner.initialStart} type=scout start=${start} by=owner spawned=${start} lastScout=${start}\n`);
   assert.doesNotMatch(other.text(other.hook()), /超过时间上限/);
   assert.equal(owner.slot().state, 'aborted'); assert.ok(owner.slot().spawned);
   assert.match(owner.text(owner.hook()), /超过时间上限/);
@@ -561,7 +575,7 @@ await test('scout lasts 40 min: not voided at 25 min', () => {
   const t = setup('scoutlimit', { goalAgo: 50 });
   fs.mkdirSync(t.retro(''), { recursive: true });
   const start = iso(Date.now() - 25 * MIN);
-  fs.writeFileSync(t.retro('slot'), `state=running type=scout start=${start} by=${t.sid} spawned=${start} lastScout=${start}\n`);
+  fs.writeFileSync(t.retro('slot'), `state=running recordId=${path.basename(t.records())} goalStart=${t.initialStart} type=scout start=${start} by=${t.sid} spawned=${start} lastScout=${start}\n`);
   t.hook();
   assert.equal(t.slot().state, 'running');
 });
@@ -615,7 +629,7 @@ await test('scout finish goes to tasks/scout-*/report.md', () => {
   t.hook();
   const s = t.slot();
   const r = spawnSync(process.execPath, [CLI, 'finish', s.start, '-', '--root', t.proj], { env: t.env, input: '想法：A', encoding: 'utf8' });
-  assert.equal(r.status, 0, r.stdout);
+  assert.equal(r.status, 0, r.stdout + r.stderr);
   const dirs = fs.readdirSync(t.retro('tasks'));
   assert.equal(dirs.length, 1); assert.match(dirs[0], /^scout-/);
 });
@@ -695,34 +709,37 @@ await test('Codex goal events: active with createdAt as start, paused = inactive
 });
 
 await test('PROGRESS.md over 4 KB is flagged in the retro nudge and by done', () => {
-  for (const layout of ['legacy', 'retro']) {
-    const t = setup('big-' + layout, { goalAgo: 61 });
-    t.fresh();
-    const file = layout === 'retro' ? t.retro('PROGRESS.md') : path.join(t.proj, 'PROGRESS.md');
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, 'x'.repeat(5000));
-    assert.match(t.text(t.hook()), /超过 4 KB/, layout);
-    assert.match(t.cli('done').stdout, /超过 4 KB/, layout);
-    assert.match(fs.readFileSync(t.retro('log.tsv'), 'utf8'), /PROGRESS 4\.9KB/, layout);
-  }
+  const t = setup('big-progress', { goalAgo: 61 });
+  t.fresh();
+  fs.writeFileSync(t.retro('PROGRESS.md'), 'x'.repeat(5000));
+  assert.match(t.text(t.hook()), /超过 4 KB/);
+  assert.match(t.cli('done').stdout, /超过 4 KB/);
+  assert.match(fs.readFileSync(t.retro('log.tsv'), 'utf8'), /PROGRESS 4\.9KB/);
 });
 
-await test('PROGRESS.md: status prefers .retro, falls back to legacy and never moves either file', () => {
+await test('PROGRESS.md: active goals do not read unscoped content or fall back when their snapshot is missing', () => {
   const t = setup('progress-path', { goalAgo: 61 });
-  const legacy = path.join(t.proj, 'PROGRESS.md'), current = t.retro('PROGRESS.md');
-  const old = 'legacy progress\n' + 'x'.repeat(5000), next = 'current progress\n';
-  fs.writeFileSync(legacy, old);
-  const legacyTime = fs.statSync(legacy).mtimeMs;
-  assert.match(t.cli('status').stdout, /## PROGRESS\.md[\s\S]*legacy progress/);
-  assert.ok(!fs.existsSync(current), 'reading legacy progress created a new copy');
-  fs.mkdirSync(path.dirname(current), { recursive: true });
+  const unscoped = path.join(t.proj, 'PROGRESS.md'), current = t.retro('PROGRESS.md');
+  const old = 'unscoped progress\n' + 'x'.repeat(5000), next = 'current progress\n';
+  fs.writeFileSync(unscoped, old);
+  const unscopedTime = fs.statSync(unscoped).mtimeMs;
+  assert.match(t.cli('status').stdout, /没有记录到/);
+  assert.doesNotMatch(t.cli('status').stdout, /unscoped progress/);
+  assert.notEqual(t.cli('records', 'show').status, 0);
+  assert.notEqual(t.cli('worker', 'start', 'unbound').status, 0);
+  const worker = spawnSync(process.execPath, [path.join(path.dirname(CLI), 'codex-worker.mjs'), 'run', 'unbound', '--root', t.proj], { env: t.env, encoding: 'utf8' });
+  assert.notEqual(worker.status, 0);
+  assert.match(worker.stdout, /--records/);
+  assert.ok(!fs.existsSync(path.join(t.proj, '.retro')), 'commands without a goal wrote project state');
+  assert.ok(!fs.existsSync(current), 'reading unscoped progress created a new copy');
+  t.hook();
   fs.writeFileSync(current, next);
   const currentTime = fs.statSync(current).mtimeMs;
   const status = t.cli('status');
   assert.equal(status.status, 0, status.stderr);
-  assert.match(status.stdout, /## \.retro[/\\]PROGRESS\.md[\s\S]*current progress/);
-  assert.doesNotMatch(status.stdout, /legacy progress/);
-  for (const [file, content, time] of [[legacy, old, legacyTime], [current, next, currentTime]]) {
+  assert.match(status.stdout, /goals[/\\][^\r\n]*PROGRESS\.md[\s\S]*current progress/);
+  assert.doesNotMatch(status.stdout, /unscoped progress/);
+  for (const [file, content, time] of [[unscoped, old, unscopedTime], [current, next, currentTime]]) {
     assert.equal(fs.readFileSync(file, 'utf8'), content);
     assert.equal(fs.statSync(file).mtimeMs, time);
   }
@@ -731,17 +748,19 @@ await test('PROGRESS.md: status prefers .retro, falls back to legacy and never m
   assert.doesNotMatch(t.cli('done').stdout, /超过 4 KB|缺失或为空/);
   assert.match(fs.readFileSync(t.retro('log.tsv'), 'utf8'), /PROGRESS 0\.0KB/);
   fs.writeFileSync(current, '');
-  assert.doesNotMatch(t.cli('status').stdout, /legacy progress/, 'empty current progress must not revive stale legacy content');
+  assert.doesNotMatch(t.cli('status').stdout, /unscoped progress/, 'empty current progress must not revive unscoped content');
+  fs.unlinkSync(current);
+  assert.doesNotMatch(t.cli('status').stdout, /unscoped progress/, 'missing current progress must not revive unscoped content');
 });
 
-await test('PROGRESS.md: goal recovery prefers .retro, even when the current file is empty', () => {
+await test('PROGRESS.md: goal recovery reads only its own directory, even when the current file is empty', () => {
   for (const content of ['目标（同 /goal）：current goal · 怎么证明：log\n', '']) {
     const t = setup(content ? 'progress-goal' : 'progress-empty', { cond: 'resume' });
-    fs.writeFileSync(path.join(t.proj, 'PROGRESS.md'), '目标：stale legacy goal\n');
-    fs.mkdirSync(t.retro(''), { recursive: true });
+    fs.writeFileSync(path.join(t.proj, 'PROGRESS.md'), '目标：unscoped goal\n');
+    fs.mkdirSync(t.records(), { recursive: true });
     fs.writeFileSync(t.retro('PROGRESS.md'), content);
     const text = t.text(t.hook());
-    assert.doesNotMatch(text, /stale legacy goal/);
+    assert.doesNotMatch(text, /unscoped goal/);
     if (content) assert.match(text, /原目标是「current goal」/);
     else assert.doesNotMatch(text, /原目标是/);
   }
@@ -755,7 +774,7 @@ await test('status digest reads the main transcript and subagents', () => {
   fs.mkdirSync(sub, { recursive: true });
   fs.writeFileSync(path.join(sub, 'agent-1.jsonl'), JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: '跑完第一组' }] } }) + '\n');
   fs.writeFileSync(path.join(sub, 'agent-1.meta.json'), JSON.stringify({ agentType: 'general-purpose', description: 'idea A' }));
-  t.hook();
+  t.hook(); t.sub('1', { agent_transcript_path: path.join(sub, 'agent-1.jsonl') });
   const out = t.cli('status').stdout;
   for (const s of ['目标：tests pass', '派出两个任务', 'Agent（try idea A）', '进度怎样', 'idea A（general-purpose', '跑完第一组', '全局侦察 running']) assert.ok(out.includes(s), `missing ${s}\n${out}`);
 });
@@ -773,13 +792,13 @@ await test('launching the reserved agent marks it started; a Stop right after do
 await test('a reservation not launched within 20 min is voided; the limit runs from launch', () => {
   const t = setup('unlaunched', { goalAgo: 90 });
   fs.mkdirSync(t.retro(''), { recursive: true });
-  fs.writeFileSync(t.retro('slot'), `state=running type=review start=${iso(Date.now() - 21 * MIN)} by=${t.sid} lastScout=${iso(Date.now() - 80 * MIN)}\n`);
+  fs.writeFileSync(t.retro('slot'), `state=running recordId=${path.basename(t.records())} goalStart=${t.initialStart} type=review start=${iso(Date.now() - 21 * MIN)} by=${t.sid} lastScout=${iso(Date.now() - 80 * MIN)}\n`);
   t.hook();
   assert.equal(t.slot().state, 'aborted');
   assert.match(fs.readFileSync(t.retro('log.tsv'), 'utf8'), /slot-unlaunched/);
   const u = setup('fromlaunch', { goalAgo: 90 });
   fs.mkdirSync(u.retro(''), { recursive: true });
-  fs.writeFileSync(u.retro('slot'), `state=running type=review start=${iso(Date.now() - 30 * MIN)} by=${u.sid} spawned=${iso(Date.now() - 5 * MIN)} lastScout=${iso(Date.now() - 80 * MIN)}\n`);
+  fs.writeFileSync(u.retro('slot'), `state=running recordId=${path.basename(u.records())} goalStart=${u.initialStart} type=review start=${iso(Date.now() - 30 * MIN)} by=${u.sid} spawned=${iso(Date.now() - 5 * MIN)} lastScout=${iso(Date.now() - 80 * MIN)}\n`);
   u.hook();
   assert.equal(u.slot().state, 'running');
 });
@@ -788,63 +807,51 @@ await test('finish past the deadline is refused; a busy lock exits 3, not 2', ()
   const t = setup('deadline', { goalAgo: 90 });
   fs.mkdirSync(t.retro(''), { recursive: true });
   const start = iso(Date.now() - 30 * MIN);
-  fs.writeFileSync(t.retro('slot'), `state=running type=review start=${start} by=x spawned=${iso(Date.now() - 25 * MIN)}\n`);
+  fs.writeFileSync(t.retro('slot'), `state=running recordId=${path.basename(t.records())} goalStart=${t.initialStart} type=review start=${start} by=x spawned=${iso(Date.now() - 25 * MIN)}\n`);
   const r = spawnSync(process.execPath, [CLI, 'finish', start, '-', '--root', t.proj], { env: t.env, input: '结论：保持', encoding: 'utf8' });
   assert.equal(r.status, 2); assert.equal(t.slot().state, 'aborted');
   assert.ok(!fs.existsSync(t.retro('route-review.md')));
-  fs.writeFileSync(t.retro('slot'), `state=running type=review start=${start} by=x\n`);
+  fs.writeFileSync(t.retro('slot'), `state=running recordId=${path.basename(t.records())} goalStart=${t.initialStart} type=review start=${start} by=x\n`);
   fs.writeFileSync(t.retro('slot.lock'), '');
   assert.equal(t.cli('spawned', start).status, 3);
 });
 
-await test('extending the goal text keeps the same goal (no note, same start, no new scout)', () => {
+await test('changed Claude goal text starts separately until explicitly linked', () => {
   const t = setup('extend', { goalAgo: 30, cond: 'reach 5 wins.' });
   t.hook(); t.cli('spawned', t.slot().start);
   const goalFile = path.join(t.tmp, `claude-retro-${t.sid}.goal`);
   const start1 = JSON.parse(fs.readFileSync(goalFile, 'utf8')).start;
   t.addTranscript(goalLine('reach 5 wins. Then do the items too.', Date.now()));
-  assert.doesNotMatch(t.text(t.hook()), /原目标|登记/);
-  assert.equal(JSON.parse(fs.readFileSync(goalFile, 'utf8')).start, start1);
+  t.hook();
+  assert.notEqual(JSON.parse(fs.readFileSync(goalFile, 'utf8')).start, start1);
 });
 
-await test('"/goal resume" in a fresh session finds the original goal from another session or PROGRESS.md', () => {
+await test('"/goal resume" in a fresh session can suggest session history but does not import an unowned PROGRESS.md', () => {
   const t = setup('resume2', { goalAgo: 1, cond: 'resume' });
   fs.mkdirSync(t.retro('sessions'), { recursive: true });
   fs.writeFileSync(t.retro('sessions/old.json'), JSON.stringify({ session_id: 'old', transcript_path: t.transcript, goal: 'beat mom 5 times' }));
   assert.match(t.text(t.hook()), /原目标是「beat mom 5 times」/);
   const u = setup('resume3', { goalAgo: 1, cond: 'resume' });
   fs.writeFileSync(path.join(u.proj, 'PROGRESS.md'), '# PROGRESS\n目标（同 /goal）：win 3 games · 怎么证明：log\n');
-  assert.match(u.text(u.hook()), /原目标是「win 3 games」/);
+  assert.doesNotMatch(u.text(u.hook()), /win 3 games/);
 });
 
 await test('a reservation left over from an earlier goal is voided and the new goal gets its scout', () => {
   const t = setup('stale', { goalAgo: 2 });
   fs.mkdirSync(t.retro(''), { recursive: true });
-  fs.writeFileSync(t.retro('slot'), `state=running type=review start=${iso(Date.now() - 10 * MIN)} by=${t.sid}\n`);
+  fs.writeFileSync(t.retro('slot'), `state=running recordId=${path.basename(t.records())} goalStart=${t.initialStart} type=review start=${iso(Date.now() - 10 * MIN)} by=${t.sid}\n`);
   assert.match(t.text(t.hook()), /已为你登记一次后台侦察/);
   assert.match(fs.readFileSync(t.retro('log.tsv'), 'utf8'), /slot-stale/);
 });
 
-await test('an existing .retro/ without .gitignore gets one for generated files only', () => {
-  const t = setup('oldretro');
+await test('.retro ignores all records and preserves an existing ignore file', () => {
+  const t = setup('ignore-records');
   fs.mkdirSync(t.retro('checkpoints'), { recursive: true });
   t.hook();
-  const gi = fs.readFileSync(t.retro('.gitignore'), 'utf8');
-  assert.match(gi, /^slot$/m); assert.match(gi, /^sessions\/$/m); assert.match(gi, /^backlog\.md$/m); assert.doesNotMatch(gi, /^\*$/m);
-  assert.match(gi, /^PROGRESS\.md$/m);
-});
-
-await test('a generated-files .gitignore picks up new names; a project-owned one is left alone', () => {
-  const t = setup('oldignore');
-  fs.mkdirSync(t.retro(''), { recursive: true });
-  fs.writeFileSync(t.retro('.gitignore'), 'slot\nideas.md\n');
+  assert.equal(fs.readFileSync(t.retro('.gitignore'), 'utf8'), '*\n');
+  fs.writeFileSync(t.retro('.gitignore'), 'my-notes/\n');
   t.hook();
-  const gi = fs.readFileSync(t.retro('.gitignore'), 'utf8');
-  assert.ok(gi.startsWith('slot\nideas.md\n')); assert.match(gi, /^backlog\.md$/m); assert.equal(gi.match(/^slot$/gm).length, 1);
-  assert.match(gi, /^PROGRESS\.md$/m);
-  fs.writeFileSync(t.retro('.gitignore'), 'slot\nmy-notes/\n');
-  t.hook();
-  assert.equal(fs.readFileSync(t.retro('.gitignore'), 'utf8'), 'slot\nmy-notes/\n');
+  assert.equal(fs.readFileSync(t.retro('.gitignore'), 'utf8'), 'my-notes/\n');
 });
 
 await test('local records: init excludes process records in the checkout and its worktrees', () => {
@@ -864,7 +871,10 @@ await test('local records: init excludes process records in the checkout and its
   assert.equal(t.cli('init').status, 0);
   assert.equal(fs.readFileSync(exclude, 'utf8'), configured, 'init is not idempotent');
   assert.equal(fs.readFileSync(path.join(t.proj, '.gitignore'), 'utf8'), 'node_modules/\n');
-  const records = ['PROGRESS.md', 'RUNBOOK.md', 'runbook/trace.md', 'results.tsv', '.retro/tasks/a/report.md', '.retro/PROGRESS.md', '.retro/RUNBOOK.md'];
+  const records = ['.retro/goals/20261021-12345678/PROGRESS.md', '.retro/goals/20261021-12345678/RUNBOOK.md', '.retro/goals/20261021-12345678/tasks/a/report.md'];
+  for (const f of ['PROGRESS.md', 'RUNBOOK.md', 'runbook/trace.md', 'results.tsv']) {
+    assert.equal(spawnSync('git', ['-C', t.proj, 'check-ignore', '-q', f]).status, 1, f + ' is not a retro record');
+  }
   const writeRecords = cwd => { for (const f of records) { const p = path.join(cwd, f); fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, 'local evidence\n'); } };
   writeRecords(t.proj);
   git(t.proj, 'add', '-A');
@@ -888,27 +898,29 @@ await test('local records: init scopes escaped paths to a project subdirectory',
   fs.mkdirSync(sub);
   const r = spawnSync(process.execPath, [CLI, 'init', '--root', sub], { env: t.env, encoding: 'utf8' });
   assert.equal(r.status, 0, r.stdout + r.stderr);
-  for (const p of [t.proj, sub]) fs.writeFileSync(path.join(p, 'PROGRESS.md'), 'notes');
-  assert.equal(spawnSync('git', ['-C', t.proj, 'check-ignore', '-q', 'module[one]/PROGRESS.md']).status, 0);
-  assert.equal(spawnSync('git', ['-C', t.proj, 'check-ignore', '-q', 'PROGRESS.md']).status, 1, 'another project was hidden');
+  for (const p of [t.proj, sub]) { fs.mkdirSync(path.join(p, '.retro'), { recursive: true }); fs.writeFileSync(path.join(p, '.retro', 'log.tsv'), 'notes'); }
+  assert.equal(spawnSync('git', ['-C', t.proj, 'check-ignore', '-q', 'module[one]/.retro/log.tsv']).status, 0);
+  assert.equal(spawnSync('git', ['-C', t.proj, 'check-ignore', '-q', '.retro/log.tsv']).status, 1, 'another project was hidden');
 });
 
 await test('local records: tracked files and conflicting repository rules are reported without changing them', () => {
   const t = setup('tracked-records');
   assert.equal(spawnSync('git', ['init', '-q', t.proj]).status, 0);
-  const progress = path.join(t.proj, 'PROGRESS.md');
+  const progress = path.join(t.proj, '.retro/goals/20261021-12345678/PROGRESS.md');
+  fs.mkdirSync(path.dirname(progress), { recursive: true });
   fs.writeFileSync(progress, 'previously tracked notes\n');
-  assert.equal(spawnSync('git', ['-C', t.proj, 'add', 'PROGRESS.md']).status, 0);
+  assert.equal(spawnSync('git', ['-C', t.proj, 'add', '.retro']).status, 0);
   const r = t.cli('init');
   assert.equal(r.status, 0, r.stdout + r.stderr);
   assert.match(r.stdout, /已跟踪[\s\S]*PROGRESS\.md/);
   assert.equal(fs.readFileSync(progress, 'utf8'), 'previously tracked notes\n');
-  assert.equal(spawnSync('git', ['-C', t.proj, 'ls-files', '--error-unmatch', 'PROGRESS.md']).status, 0);
-  fs.writeFileSync(path.join(t.proj, '.gitignore'), '!/PROGRESS.md\n');
+  assert.equal(spawnSync('git', ['-C', t.proj, 'ls-files', '--error-unmatch', '.retro/goals/20261021-12345678/PROGRESS.md']).status, 0);
+  fs.writeFileSync(path.join(t.proj, '.gitignore'), '!/.retro/\n!/.retro/**\n');
+  fs.unlinkSync(t.retro('.gitignore'));
   const blocked = t.cli('init');
   assert.notEqual(blocked.status, 0, 'a repository rule overrode the local exclusion silently');
-  assert.match(blocked.stdout, /PROGRESS\.md/);
-  assert.equal(fs.readFileSync(path.join(t.proj, '.gitignore'), 'utf8'), '!/PROGRESS.md\n');
+  assert.match(blocked.stdout, /\.retro/);
+  assert.equal(fs.readFileSync(path.join(t.proj, '.gitignore'), 'utf8'), '!/.retro/\n!/.retro/**\n');
 });
 
 await test('inbox --since-last review|scout: a background agent sees everything since its previous round', () => {
@@ -924,9 +936,9 @@ await test('inbox --since-last review|scout: a background agent sees everything 
   const goalStart = JSON.parse(fs.readFileSync(t.state('goal'), 'utf8')).start;
   for (const [type, mins, delivered] of [['review', 70, 60], ['scout', 58, 45]]) {
     const start = iso(Date.now() - mins * MIN);
-    fs.writeFileSync(t.retro('slot'), `state=running type=${type} start=${start} by=${t.sid} goalStart=${goalStart} spawned=${iso(Date.now())}\n`);
+    fs.writeFileSync(t.retro('slot'), `state=running type=${type} start=${start} by=${t.sid} goalStart=${goalStart} recordId=${path.basename(t.records(typeof owner === 'undefined' ? t.sid : owner))} spawned=${iso(Date.now())}\n`);
     const r = spawnSync(process.execPath, [CLI, 'finish', start, '-', '--root', t.proj], { env: t.env, input: `结果：${type}-previous`, encoding: 'utf8' });
-    assert.equal(r.status, 0, r.stdout);
+    assert.equal(r.status, 0, r.stdout + r.stderr);
     const file = type === 'review' ? 'route-review.md' : `tasks/${fs.readdirSync(t.retro('tasks')).find(n => n.startsWith('scout-'))}/report.md`;
     t.setTime(t.retro(file), delivered);
   }
@@ -1030,10 +1042,13 @@ await test('segment logging: parallel first calls log one start; follow-ups log 
 });
 
 await test('metrics after the run: the window ends at the last event; labels in bold or bullets still count', () => {
-  const t = setup('metricsdone', { goalAgo: null });
+  const t = setup('metricsdone', { goalAgo: 600, cond: 'g' });
+  t.hook();
+  t.addTranscript({ type: 'attachment', timestamp: iso(Date.now()), attachment: { type: 'goal_status', met: true, condition: 'g' } });
+  t.hook();
+  fs.writeFileSync(t.retro('log.tsv'), '');
   const at = mins => iso(Date.now() - mins * MIN);
-  fs.mkdirSync(t.retro('sessions'), { recursive: true });
-  fs.writeFileSync(t.retro('sessions/old.json'), JSON.stringify({ session_id: 'old', transcript_path: path.join(t.proj, 'none.jsonl'), goal: 'g', goal_start: at(600) }));
+
   const row = (mins, ev, d = '') => fs.appendFileSync(t.retro('log.tsv'), `${at(mins)}\t-\t${ev}\t${d}\n`);
   row(600, 'slots', '2 x'); row(600, 'agent-start', 'a1 w'); row(600, 'agent-start', 'a2 w');
   row(480, 'agent-stop', 'a1'); row(480, 'agent-stop', 'a2');
@@ -1054,6 +1069,7 @@ await test('metrics after the run: the window ends at the last event; labels in 
 // Codex executors for a Claude main agent: codex-worker.mjs drives a fake codex (test/fake-codex.mjs).
 const WORKER = path.join(here, '..', 'skills', 'retro', 'scripts', 'codex-worker.mjs');
 function codex(t, extra = {}) {
+  t.hook();
   const logFile = path.join(t.tmp, 'fake-codex.log');
   const env = { ...t.env, RETRO_CODEX: JSON.stringify([process.execPath, path.join(here, 'fake-codex.mjs')]), FAKE_CODEX_LOG: logFile, ...extra };
   const run = (...a) => spawnSync(process.execPath, [WORKER, ...a, '--root', t.proj], { env, encoding: 'utf8' });
@@ -1100,7 +1116,7 @@ await test('codex-worker run: brief and settings passed, final message and repor
   const report = t.retro('tasks/t1/report.md');
   c.brief('t1', `# 试一下 expectimax\nREPORT:${report}\n`);
   const r = c.run('run', 't1');
-  assert.equal(r.status, 0, r.stdout);
+  assert.equal(r.status, 0, r.stdout + r.stderr);
   assert.match(r.stdout, /Codex 执行者 t1：这一轮结束。线程 thread-\d+/);
   assert.match(r.stdout, /回报：.*report\.md/);
   assert.match(r.stdout, /最后的话：\n答复：# 试一下 expectimax/);
@@ -1177,7 +1193,7 @@ await test('codex-worker: a process codex leaves behind holding its output does 
   c.brief('lin', 'LINGER');
   const t0 = Date.now();
   const r = c.run('run', 'lin');
-  assert.equal(r.status, 0, r.stdout);
+  assert.equal(r.status, 0, r.stdout + r.stderr);
   assert.match(r.stdout, /lin：这一轮结束/);
   assert.ok(Date.now() - t0 < 10e3, `took ${Date.now() - t0} ms`);
 });
@@ -1259,7 +1275,7 @@ await test('codex-worker: a timeout stops the turn; a failed turn and a missing 
   }
 });
 
-await test('workers in the hook: heartbeat is distinct from activity; old drivers remain readable; silence and overtime do not stop workers', () => {
+await test('workers in the hook: missing activity uses heartbeat; silence and overtime do not stop workers', () => {
   const t = setup('cw-hook', { goalAgo: 90 });
   t.hook(); t.cli('spawned', t.slot().start); t.cli('slots', '4', 'x'); t.cli('done');
   for (const id of ['long', 'quiet', 'busy', 'other']) assert.equal(t.cli('worker', 'start', id, `任务 ${id}`, '--pid', String(process.pid), '--type', 'codex').status, 0);
@@ -1417,10 +1433,11 @@ await test('retro.mjs finds the main checkout from inside a worktree', () => {
   const input = { session_id: 'wt', transcript_path: t.transcript, cwd: wt, hook_event_name: 'PostToolUse', tool_name: 'Bash' };
   spawnSync(process.execPath, [HOOK], { input: JSON.stringify(input), env: { ...t.env, CLAUDE_PROJECT_DIR: wt }, encoding: 'utf8' });
   assert.ok(fs.existsSync(path.join(repo, '.retro', 'slot')) && !fs.existsSync(path.join(wt, '.retro')));
-  fs.writeFileSync(path.join(repo, '.retro', 'PROGRESS.md'), 'shared current progress\n');
+  const record = JSON.parse(spawnSync(process.execPath, [CLI, 'records', 'show', '--root', wt], { env, encoding: 'utf8' }).stdout);
+  fs.writeFileSync(record.progress, 'shared current progress\n');
   const status = spawnSync(process.execPath, [CLI, 'status', '--root', wt], { env, encoding: 'utf8' });
   assert.equal(status.status, 0, status.stderr);
-  assert.match(status.stdout, /## \.retro[/\\]PROGRESS\.md[\s\S]*shared current progress/);
+  assert.match(status.stdout, /goals[/\\][^\r\n]*PROGRESS\.md[\s\S]*shared current progress/);
 });
 
 await test('install.mjs: BOM is fine, JSONC is refused untouched, CRLF agents convert', () => {
@@ -1492,7 +1509,7 @@ await test('setting the long goal again after a detour or a pause keeps its star
   const goalFile = path.join(t.tmp, `claude-retro-${t.sid}.goal`);
   const start1 = JSON.parse(fs.readFileSync(goalFile, 'utf8')).start;
   const start = iso(Date.now() - 5 * MIN);
-  fs.writeFileSync(t.retro('slot'), `state=running type=review start=${start} by=${t.sid} spawned=${start} lastScout=${iso(Date.now() - 39 * MIN)}\n`);
+  fs.writeFileSync(t.retro('slot'), `state=running recordId=${path.basename(t.records())} goalStart=${t.initialStart} type=review start=${start} by=${t.sid} spawned=${start} lastScout=${iso(Date.now() - 39 * MIN)}\n`);
   t.addTranscript({ type: 'system', timestamp: iso(Date.now() - 2 * MIN), content: '<local-command-stdout>Goal cleared</local-command-stdout>' });
   t.addTranscript(goalLine('long goal', Date.now() - MIN));
   const r = t.text(t.hook());
@@ -1511,7 +1528,7 @@ await test('a session with a newer goal does not take an unlaunched reservation 
   const a = setup('steal', { sid: 'A', goalAgo: 30 });
   fs.mkdirSync(a.retro(''), { recursive: true });
   const start = iso(Date.now() - 3 * MIN);
-  fs.writeFileSync(a.retro('slot'), `state=running type=review start=${start} by=A lastScout=${iso(Date.now() - 29 * MIN)}\n`);
+  fs.writeFileSync(a.retro('slot'), `state=running recordId=${path.basename(a.records())} goalStart=${a.initialStart} type=review start=${start} by=A lastScout=${iso(Date.now() - 29 * MIN)}\n`);
   const b = setup('steal', { sid: 'B', goalAgo: 1 });
   b.hook();
   assert.equal(a.slot().state, 'running'); assert.equal(a.slot().by, 'A');
@@ -1522,7 +1539,7 @@ await test('a launched review gets the 2-minute grace before the hook voids it',
   const t = setup('grace', { goalAgo: 50 });
   fs.mkdirSync(t.retro(''), { recursive: true });
   const start = iso(Date.now() - 21 * MIN);
-  fs.writeFileSync(t.retro('slot'), `state=running type=review start=${start} by=${t.sid} spawned=${start} lastScout=${iso(Date.now() - 49 * MIN)}\n`);
+  fs.writeFileSync(t.retro('slot'), `state=running recordId=${path.basename(t.records())} goalStart=${t.initialStart} type=review start=${start} by=${t.sid} spawned=${start} lastScout=${iso(Date.now() - 49 * MIN)}\n`);
   t.hook();
   assert.equal(t.slot().state, 'running');
   const fin = spawnSync(process.execPath, [CLI, 'finish', start, '-', '--root', t.proj], { env: t.env, input: '结论：保持', encoding: 'utf8' });
@@ -1554,7 +1571,7 @@ await test('Codex: the goal database overrules the rollout (completed or cleared
   fs.mkdirSync(home, { recursive: true });
   const db = new DatabaseSync(path.join(home, 'goals_1.sqlite'));
   db.exec('CREATE TABLE thread_goals (thread_id TEXT PRIMARY KEY, goal_id TEXT, objective TEXT, status TEXT, created_at_ms INTEGER, updated_at_ms INTEGER)');
-  db.prepare('INSERT INTO thread_goals VALUES (?, ?, ?, ?, ?, ?)').run(t.sid, 'g1', 'codex goal', 'active', created * 1000 + 123, Date.now());
+  db.prepare('INSERT INTO thread_goals VALUES (?, ?, ?, ?, ?, ?)').run(t.sid, 'g1', 'codex goal', 'active', created * 1000, Date.now());
   const goalFile = path.join(t.tmp, `claude-retro-${t.sid}.goal`);
   const state = () => JSON.parse(fs.readFileSync(goalFile, 'utf8'));
   const r = t.text(t.hook());
@@ -1586,8 +1603,8 @@ await test('Codex: status reads the main rollout and finds child rollouts by par
     { timestamp: iso(Date.now()), type: 'response_item', payload: { type: 'custom_tool_call', name: 'exec', input: 'text(await tools.exec_command({cmd:"node eval.mjs --seeds 1-100"}))' } }];
   fs.writeFileSync(main, lines.map(l => JSON.stringify(l)).join('\n') + '\n');
   fs.writeFileSync(kid, [codexMeta('kid-id', { subagent: { thread_spawn: { parent_thread_id: 'main-id', agent_path: '/root/try_expectimax', agent_role: 'worker' } } }), msg('assistant', '深度 3 跑完')].map(l => JSON.stringify(l)).join('\n') + '\n');
-  fs.mkdirSync(t.retro('sessions'), { recursive: true });
-  fs.writeFileSync(t.retro('sessions/main-id.json'), JSON.stringify({ session_id: 'main-id', transcript_path: main, goal: 'codex goal', goal_start: iso(Date.now() - MIN) }));
+  t.hook({ session_id: 'main-id', transcript_path: main });
+  t.sub('kid-id', { session_id: 'main-id', transcript_path: main, agent_transcript_path: kid });
   const out = t.cli('status').stdout;
   for (const s of ['派出两个执行者', '进度怎样', 'exec（node eval.mjs --seeds 1-100）', 'try_expectimax（worker', '深度 3 跑完']) assert.ok(out.includes(s), `missing ${s}\n${out}`);
   assert.ok(!out.includes('rollout-guardian'), 'guardian listed as a subagent');
@@ -1639,21 +1656,21 @@ await test('tell: the user\'s words reach the main agent once, at its next tool 
   assert.match(fs.readFileSync(t.retro('log.tsv'), 'utf8'), /\ttold\t/);
 });
 
-await test('regression: queued instructions stay with their goal; legacy messages are retained but not delivered', () => {
+await test('regression: queued instructions stay with their goal; messages missing a goal identity are not delivered', () => {
   for (const platform of ['claude', 'codex']) {
-    const created = Date.now() - 5 * MIN, name = 'tell-goal-' + platform;
+    const created = Math.floor((Date.now() - 5 * MIN) / 1000), name = 'tell-goal-' + platform;
     const t = setup(name, platform === 'codex'
       ? { goalAgo: null, extra: [codexMeta('sess-' + name), codexGoal('Goal A', created)] }
       : { cond: 'Goal A' });
     t.hook();
     assert.equal(t.cli('tell', '立即停止 A 及其执行者').status, 0);
-    t.addTranscript(platform === 'codex' ? codexGoal('Goal B', Date.now()) : goalLine('Goal B', Date.now()));
+    t.addTranscript(platform === 'codex' ? codexGoal('Goal B', Math.floor(Date.now() / 1000)) : goalLine('Goal B', Date.now()));
     assert.doesNotMatch(t.text(t.hook()), /立即停止 A 及其执行者/);
     assert.match(fs.readFileSync(t.retro('user-said.md'), 'utf8'), /没有送达[^\n]*Goal A[^\n]*立即停止 A/);
     assert.equal(fs.readFileSync(t.retro('user-inbox.jsonl'), 'utf8'), '');
-    fs.appendFileSync(t.retro('user-inbox.jsonl'), JSON.stringify({ to: t.sid, at: iso(Date.now()), text: '旧格式指令' }) + '\n');
-    assert.doesNotMatch(t.text(t.hook()), /旧格式指令/);
-    assert.match(fs.readFileSync(t.retro('user-said.md'), 'utf8'), /没有送达[^\n]*旧格式指令/);
+    fs.appendFileSync(t.retro('user-inbox.jsonl'), JSON.stringify({ to: t.sid, at: iso(Date.now()), text: '无归属指令' }) + '\n');
+    assert.doesNotMatch(t.text(t.hook()), /无归属指令/);
+    assert.match(fs.readFileSync(t.retro('user-said.md'), 'utf8'), /没有送达[^\n]*无归属指令/);
     assert.equal(t.cli('tell', '处理 B 的新指令').status, 0);
     assert.match(t.text(t.hook()), /处理 B 的新指令/);
   }
@@ -1680,6 +1697,7 @@ await test('regression: checkpoint readers and reminders are isolated by session
   assert.doesNotMatch(t.text(t.hook()), /检查点到期/);
   t.addTranscript(goalLine('Goal C', Date.now() - 10 * MIN));
   t.hook();
+  fs.mkdirSync(t.retro('tasks/a'), { recursive: true });
   fs.writeFileSync(t.retro('tasks/a/report.md'), 'C 的新回报');
   t.setTime(t.retro('tasks/a/report.md'), 5);
   assert.match(t.cli('inbox', '--session', 'A').stdout, /C 的新回报/);
@@ -1695,9 +1713,9 @@ await test('regression: background inbox uses its owner and that goal\'s previou
     t.hook({ session_id: 'B', transcript_path: b });
     for (const [owner, goalStart, mins] of [['A', aStart, 70], ['B', bStart, 2]]) {
       const start = iso(Date.now() - mins * MIN);
-      fs.writeFileSync(t.retro('slot'), `state=running type=${type} start=${start} by=${owner} goalStart=${goalStart} spawned=${iso(Date.now())}\n`);
+      fs.writeFileSync(t.retro('slot'), `state=running recordId=${path.basename(t.records(owner))} type=${type} start=${start} by=${owner} goalStart=${goalStart} spawned=${iso(Date.now())}\n`);
       const r = spawnSync(process.execPath, [CLI, 'finish', start, '-', '--root', t.proj], { env: t.env, input: `${owner} 的评审`, encoding: 'utf8' });
-      assert.equal(r.status, 0, r.stdout);
+      assert.equal(r.status, 0, r.stdout + r.stderr);
     }
     fs.mkdirSync(t.retro('tasks/a'), { recursive: true });
     fs.writeFileSync(t.retro('tasks/a/report.md'), 'A 的未处理回报');
@@ -1708,21 +1726,8 @@ await test('regression: background inbox uses its owner and that goal\'s previou
     assert.match(t.cli('inbox', '--since-last', type, '--session', 'A').stdout, /A 的未处理回报/);
     assert.doesNotMatch(t.cli('inbox', '--since-last', type, '--session', 'A').stdout, /A 上轮已经读过的回报/);
     assert.doesNotMatch(t.cli('inbox', '--since-last', type, '--session', 'B').stdout, /A 的未处理回报/);
-    fs.writeFileSync(t.retro('slot'), `state=running type=${type} start=${iso(Date.now())} by=A goalStart=${aStart}\n`);
+    fs.writeFileSync(t.retro('slot'), `state=running recordId=${path.basename(t.records())} type=${type} start=${iso(Date.now())} by=A goalStart=${aStart}\n`);
     assert.match(t.cli('inbox', '--since-last', type).stdout, /A 的未处理回报/);
-  }
-});
-
-await test('regression: unscoped legacy cursors never hide a current goal\'s reports', () => {
-  const t = setup('legacy-cursors', { goalAgo: 120 });
-  t.hook();
-  for (const file of ['retro-done', 'inbox-at', 'review-start', 'scout-start']) fs.writeFileSync(t.retro(file), iso(Date.now()) + '\n');
-  fs.writeFileSync(t.retro('route-review.md'), `<!-- route-review start=${iso(Date.now())} -->\n旧评审\n`);
-  fs.mkdirSync(t.retro('tasks/old-scout'), { recursive: true });
-  fs.writeFileSync(t.retro('tasks/old-scout/report.md'), '需要重读的旧回报');
-  t.setTime(t.retro('tasks/old-scout/report.md'), 30);
-  for (const args of [[], ['--since-last', 'review'], ['--since-last', 'scout']]) {
-    assert.match(t.cli('inbox', ...args).stdout, /需要重读的旧回报/);
   }
 });
 
@@ -1731,7 +1736,7 @@ await test('regression: expired reservations cannot start or finish through any 
     const t = setup('expired-' + entry, { goalAgo: 90 });
     t.hook();
     const start = iso(Date.now() - 31 * MIN);
-    fs.writeFileSync(t.retro('slot'), `state=running type=review start=${start} by=${t.sid}\n`);
+    fs.writeFileSync(t.retro('slot'), `state=running recordId=${path.basename(t.records())} goalStart=${t.initialStart} type=review start=${start} by=${t.sid}\n`);
     if (entry === 'launched') t.hook({ tool_name: 'Agent', tool_input: { subagent_type: 'route-reviewer', run_in_background: true } });
     else {
       const args = entry === 'spawned' ? ['spawned', start] : ['finish', start, '-'];
@@ -1753,10 +1758,10 @@ await test('regression: rounds in the same minute retain separate reports and pr
     const minute = Math.floor((Date.now() - MIN) / MIN) * MIN;
     for (const ms of [100, 200]) {
       const start = iso(minute + ms);
-      fs.writeFileSync(t.retro('slot'), `state=running type=${type} start=${start} by=${t.sid} goalStart=${goalStart}\n`);
+      fs.writeFileSync(t.retro('slot'), `state=running type=${type} start=${start} by=${t.sid} goalStart=${goalStart} recordId=${path.basename(t.records())}\n`);
       assert.equal(t.cli('spawned', start).status, 0);
       const r = spawnSync(process.execPath, [CLI, 'finish', start, '-', '--root', t.proj], { env: t.env, input: `报告 ${ms}`, encoding: 'utf8' });
-      assert.equal(r.status, 0, r.stdout);
+      assert.equal(r.status, 0, r.stdout + r.stderr);
     }
     assert.equal(fs.readdirSync(t.retro('probes')).length, 2);
     const base = t.retro(type === 'review' ? 'reviews' : 'tasks');
@@ -1791,6 +1796,7 @@ await test('concurrency: old live locks cannot be stolen; process exit and excep
 
 await test('concurrency: worker heartbeat cannot undo stop or write into a restarted segment', async () => {
   const t = setup('worker-serialization');
+  t.hook();
   const started = t.cli('worker', 'start', 'w');
   assert.equal(started.status, 0, started.stdout + started.stderr);
   const first = JSON.parse(fs.readFileSync(t.retro('workers/w.json'), 'utf8')).seg;
@@ -1828,6 +1834,7 @@ await test('concurrency: worker heartbeat cannot undo stop or write into a resta
 
 await test('concurrency: stale cleanup cannot delete a worker restarted after its snapshot', async () => {
   const t = setup('worker-prune');
+  t.hook();
   t.cli('worker', 'start', 'w');
   const f = t.retro('workers/w.json'), old = Date.now() - 2 * 864e5;
   fs.writeFileSync(f, JSON.stringify({ seg: old, stopAt: old }));
@@ -1885,6 +1892,7 @@ await test('concurrency: requests and executor plans stay with their session and
   t.cli('abort', t.slot().start);
   assert.doesNotMatch(t.text(bHook()), /按你的请求/);
   assert.ok(fs.existsSync(t.control('request', 'A')), 'another session consumed A request');
+  t.cli('abort', t.slot().start); // B's first scoped round may already be reserved.
   assert.equal(t.cli('request', 'scout', '--session', 'B').status, 0);
   assert.match(t.text(bHook()), /后台侦察（按你的请求）/);
   assert.ok(fs.existsSync(t.control('request', 'A')));
@@ -1894,10 +1902,109 @@ await test('concurrency: requests and executor plans stay with their session and
   t.cli('request', 'review', '--session', 'A');
   t.cli('abort', t.slot().start);
   t.addTranscript(goalLine('Goal C', Date.now()));
-  fs.writeFileSync(t.retro('slots'), JSON.stringify({ n: 9, at: iso(Date.now()), why: 'legacy' }));
   assert.doesNotMatch(t.text(t.hook()), /按你的请求/);
   assert.ok(!fs.existsSync(t.control('slots')), 'new goal inherited the old plan');
-  assert.doesNotMatch(t.cli('status').stdout, /9 个（legacy/);
+});
+
+await test('goal records: unrelated goals ignore old snapshots, ideas, results and late reports', () => {
+  const t = setup('record-isolation', { cond: 'Goal A', goalAgo: 60 });
+  t.hook();
+  const a = t.records();
+  fs.writeFileSync(path.join(a, 'PROGRESS.md'), '目标：A_ONLY_SNAPSHOT\n');
+  fs.writeFileSync(path.join(a, 'ideas.md'), '- [ ] A_ONLY_IDEA\n');
+  fs.writeFileSync(path.join(a, 'RUNBOOK.md'), 'A_ONLY_METHOD');
+  fs.mkdirSync(path.join(a, 'tasks', 'old'), { recursive: true });
+  t.addTranscript({ type: 'attachment', timestamp: iso(Date.now() - 1000), attachment: { type: 'goal_status', met: true, condition: 'Goal A' } });
+  t.addTranscript(goalLine('Goal B', Date.now()));
+  t.hook();
+  const b = t.records();
+  assert.notEqual(a, b);
+  assert.ok(!fs.existsSync(path.join(b, 'RUNBOOK.md')));
+  fs.writeFileSync(path.join(a, 'tasks', 'old', 'report.md'), 'A_ONLY_LATE_REPORT');
+  fs.writeFileSync(path.join(a, 'results.tsv'), 'A_ONLY_RESULTS\n');
+  fs.writeFileSync(path.join(t.proj, 'results.tsv'), 'LEGACY_ONLY_RESULTS\n');
+  for (const command of ['inbox', 'status', 'done']) assert.doesNotMatch(t.cli(command).stdout, /A_ONLY|LEGACY_ONLY/);
+  assert.match(fs.readFileSync(path.join(a, 'PROGRESS.md'), 'utf8'), /A_ONLY_SNAPSHOT/);
+  assert.match(fs.readFileSync(path.join(b, 'PROGRESS.md'), 'utf8'), /Goal B/);
+});
+
+await test('goal records: explicit continuation reuses evidence and switching within a native goal is durable', () => {
+  const t = setup('record-continue', { cond: 'reach 90', goalAgo: 60 });
+  t.hook();
+  const a = t.records(), id = path.basename(a);
+  fs.mkdirSync(path.join(a, 'tasks', 'trial'), { recursive: true });
+  const report = path.join(a, 'tasks', 'trial', 'report.md');
+  fs.writeFileSync(report, 'PREVIOUS_EVIDENCE'); t.setTime(report, 30);
+  t.addTranscript(goalLine('reach 95', Date.now())); t.hook();
+  assert.notEqual(t.records(), a);
+  const used = t.cli('records', 'use', id);
+  assert.equal(used.status, 0, used.stdout + used.stderr);
+  assert.equal(JSON.parse(used.stdout).directory, a);
+  assert.match(t.cli('inbox').stdout, /PREVIOUS_EVIDENCE/);
+  t.hook(); assert.equal(t.records(), a);
+  const fresh = t.cli('records', 'new');
+  assert.equal(fresh.status, 0, fresh.stdout + fresh.stderr);
+  assert.notEqual(JSON.parse(fresh.stdout).directory, a);
+  t.hook(); assert.doesNotMatch(t.cli('inbox').stdout, /PREVIOUS_EVIDENCE/);
+  const before = t.cli('records', 'show').stdout;
+  assert.notEqual(t.cli('records', 'use', '../../outside').status, 0);
+  assert.equal(t.cli('records', 'show').stdout, before);
+});
+
+await test('goal records: pause resumes the same directory, completion followed by the same text starts fresh', () => {
+  const t = setup('record-lifecycle'); t.hook();
+  const first = t.records();
+  t.addTranscript({ type: 'system', timestamp: iso(Date.now() - 2000), content: 'Goal cleared' }); t.hook();
+  t.addTranscript(goalLine('tests pass', Date.now() - 1000)); t.hook();
+  assert.equal(t.records(), first);
+  t.addTranscript({ type: 'attachment', timestamp: iso(Date.now()), attachment: { type: 'goal_status', met: true, condition: 'tests pass' } }); t.hook();
+  t.addTranscript(goalLine('tests pass', Date.now() + 1000)); t.hook();
+  assert.notEqual(t.records(), first);
+});
+
+await test('goal records: review delivery remains pinned when the native goal switches records', () => {
+  const t = setup('record-review'); t.hook();
+  const a = t.records(), start = t.slot().start;
+  assert.equal(t.cli('spawned', start).status, 0);
+  assert.equal(t.cli('records', 'new').status, 0);
+  const b = t.records();
+  const r = spawnSync(process.execPath, [CLI, 'finish', start, '-', '--root', t.proj], { env: t.env, input: 'OLD_REVIEW_RESULT', encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.ok(fs.existsSync(path.join(a, 'tasks')));
+  assert.ok(!fs.existsSync(path.join(b, 'tasks')));
+  assert.doesNotMatch(t.cli('inbox').stdout, /OLD_REVIEW_RESULT/);
+});
+
+await test('goal records: active writers cannot share a directory and status requires an explicit session', () => {
+  const t = setup('record-owners', { sid: 'A' }); t.hook();
+  const a = path.basename(t.records());
+  const transcript = path.join(t.proj, 'other.jsonl');
+  fs.writeFileSync(transcript, JSON.stringify(goalLine('other goal', Date.now())) + '\n');
+  t.hook({ session_id: 'B', transcript_path: transcript });
+  assert.notEqual(t.cli('records', 'use', a, '--session', 'B').status, 0);
+  assert.notEqual(t.cli('status').status, 0);
+  assert.notEqual(t.cli('metrics').status, 0);
+  const status = t.cli('status', '--session', 'B');
+  assert.equal(status.status, 0, status.stdout + status.stderr);
+  assert.match(status.stdout, /other goal/);
+  assert.equal(t.cli('status', '--session', 'A').status, 0);
+});
+
+await test('goal records: queued messages and child summaries cannot cross a directory switch', () => {
+  const t = setup('record-messages'); t.hook();
+  const sub = t.transcript.replace(/\.jsonl$/, '') + '/subagents';
+  fs.mkdirSync(sub, { recursive: true });
+  const file = path.join(sub, 'agent-old.jsonl');
+  fs.writeFileSync(file, JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'OLD_AGENT_RESULT' }] } }) + '\n');
+  t.sub('old', { agent_transcript_path: file });
+  assert.match(t.cli('status').stdout, /OLD_AGENT_RESULT/);
+  assert.equal(t.cli('tell', 'OLD_GOAL_MESSAGE').status, 0);
+  assert.equal(t.cli('records', 'new').status, 0);
+  assert.doesNotMatch(t.text(t.hook()), /OLD_GOAL_MESSAGE/);
+  assert.match(fs.readFileSync(t.retro('user-said.md'), 'utf8'), /没有送达.*OLD_GOAL_MESSAGE/);
+  assert.doesNotMatch(t.cli('status').stdout, /OLD_AGENT_RESULT/);
+  assert.equal(t.cli('tell', 'NEW_GOAL_MESSAGE').status, 0);
+  assert.match(t.text(t.hook()), /NEW_GOAL_MESSAGE/);
 });
 
 await test('concurrency: per-task result files reach the checkpoint and progress desk before aggregation', () => {

@@ -1,16 +1,16 @@
 // Shared by the hook (retro-nudge.mjs) and the helper CLI (retro.mjs). All project state lives in <root>/.retro/:
 //   slot             one line, the background slot (route review or idea scout), "key=value ..." — see readSlot
 //   checkpoints/<session>/<goal-start>/   retro-done, inbox-at, review/scout starts, slots {n, at, why}, request
-//   probes/          background agents' probe scripts and the notes behind their reports
 //   workers/<task>.json   executors another harness runs (Codex threads driven by codex-worker.mjs), see workers()
 //   log.tsv          append-only event log (time, session, event, detail), for the progress desk and later analysis
 //   sessions/<id>.json   sessions that hold an active /goal here, for the progress desk
-//   tasks/<task>/report.md   executor reports; ideas.md, backlog.md, results.tsv, route-review.md, reviews/ are written by agents
+//   goals/<date-id>/   goal.json, PROGRESS.md, RUNBOOK.md, runbook/, tasks/, ideas.md, backlog.md, results.tsv, reviews/
 //   user-inbox.jsonl what the user said at the progress desk, until the hook hands it over; then kept in user-said.md
 // Per session, in the system temp dir (claude-retro-<session>.*): the goal cache, what the hook and the watch said
 // when (.said, see claimSaid), the subagent tracker
 // (.agents/, see trackedAgents), elapsed tool calls (.tools/, see timedTools), and the background watch (.watch).
 import fs from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
 import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
@@ -61,27 +61,13 @@ export const safe = id => String(id).replace(/[^\w-]/g, '_');
 export const mtime = f => { try { return fs.statSync(f).mtimeMs; } catch { return 0; } };
 export const read = f => { try { return fs.readFileSync(f, 'utf8'); } catch { return ''; } };
 
-export function progressFile(root) {
-  const current = path.join(dir(root), 'PROGRESS.md'), legacy = path.join(root, 'PROGRESS.md');
-  return fs.existsSync(current) || !fs.existsSync(legacy) ? current : legacy;
-}
+export const progressFile = records => path.join(records, 'PROGRESS.md');
 
 // Files the scripts and agents generate; kept out of git so worktrees don't carry stale copies.
-const GENERATED = ['slot', 'slot.lock', 'slot.lock.db', 'slot.lock.db-journal', 'slots', 'retro-done', 'inbox-at', 'review-start', 'scout-start', 'checkpoints/', 'log.tsv', 'sessions/', 'tasks/', 'reviews/', 'probes/', 'workers/', 'recovery/', 'PROGRESS.md', 'RUNBOOK.md', 'runbook/', 'ideas.md', 'backlog.md', 'results.tsv', 'route-review.md', 'user-inbox.jsonl', 'user-said.md'];
-// A new .retro/ ignores everything. An existing one (some projects commit parts of it) gets a .gitignore for the
-// generated files only, unless it already has one. A list we wrote earlier picks up names added since.
 export function ensureDir(root) {
   const d = dir(root);
-  if (!fs.existsSync(d)) {
-    fs.mkdirSync(d, { recursive: true });
-    fs.writeFileSync(path.join(d, '.gitignore'), '*\n');
-  } else if (!fs.existsSync(path.join(d, '.gitignore'))) {
-    fs.writeFileSync(path.join(d, '.gitignore'), GENERATED.join('\n') + '\n');
-  } else {
-    const gi = path.join(d, '.gitignore'), raw = read(gi), have = raw.split(/\r?\n/).filter(Boolean);
-    const add = GENERATED.filter(g => !have.includes(g));
-    if (add.length && have.length && have.every(l => GENERATED.includes(l))) fs.appendFileSync(gi, (raw.endsWith('\n') ? '' : '\n') + add.join('\n') + '\n');
-  }
+  fs.mkdirSync(d, { recursive: true });
+  try { fs.writeFileSync(path.join(d, '.gitignore'), '*\n', { flag: 'wx' }); } catch (e) { if (e.code !== 'EEXIST') throw e; }
   return d;
 }
 
@@ -162,13 +148,55 @@ export function log(root, session, event, detail = '') {
   } catch {}
 }
 
-export const checkpointDir = (root, sessionId, start) => sessionId && start
-  ? path.join(dir(root), 'checkpoints', safe(sessionId), String(start)) : dir(root);
+export function checkpointDir(root, sessionId, start) {
+  if (!sessionId || !(start > 0 && Number.isFinite(start))) throw new Error('缺少有效的目标身份');
+  return path.join(dir(root), 'checkpoints', safe(sessionId), String(start));
+}
 export const lastRetro = (root, sessionId, start) => Date.parse(read(path.join(checkpointDir(root, sessionId, start), 'retro-done')).trim().split(/\s/)[0]) || 0;
 
+// Native goal identity selects a directory; only an explicit decision can reuse another goal's records.
+export function recordPath(root, id) {
+  if (!/^\d{8}-[a-f0-9]{8,12}$/.test(id)) throw new Error('无效的目标记录 ID');
+  return path.join(dir(root), 'goals', id);
+}
+export function recordDir(root, sessionId, start) {
+  const bound = read(path.join(checkpointDir(root, sessionId, start), 'record-id')).trim();
+  const id = bound || iso(start).slice(0, 10).replaceAll('-', '') + '-' + createHash('sha256').update(JSON.stringify([sessionId, start])).digest('hex').slice(0, 12);
+  return recordPath(root, id);
+}
+export function ensureRecords(root, sessionId, start, objective, target) {
+  if (!sessionId || !(start > 0)) throw new Error('缺少目标身份，不能创建记录');
+  ensureDir(root);
+  const records = target || recordDir(root, sessionId, start);
+  fs.mkdirSync(records, { recursive: true });
+  const create = (file, text) => { try { fs.writeFileSync(path.join(records, file), text, { flag: 'wx' }); } catch (e) { if (e.code !== 'EEXIST') throw e; } };
+  create('goal.json', JSON.stringify({ id: path.basename(records), session: sessionId, start, objective }) + '\n');
+  create('PROGRESS.md', `# PROGRESS\n目标（同 /goal）：${String(objective).replace(/[\r\n]+/g, ' ')}\n记录 ID：${path.basename(records)}\n继承来源：无；旧目标记录仅按需查阅。\n`);
+  return records;
+}
+// Called under the project lock. Never move old files: late writers keep their original absolute paths.
+export function selectRecords(root, sessionId, start, objective, id) {
+  const records = id ? recordPath(root, id) : recordPath(root, iso(Date.now()).slice(0, 10).replaceAll('-', '') + '-' + randomBytes(6).toString('hex'));
+  if (id && !mtime(path.join(records, 'goal.json'))) throw new Error('目标记录不存在');
+  for (const s of sessions(root)) {
+    const g = goalCache(s.session_id);
+    if (s.session_id !== sessionId && g?.active && recordDir(root, s.session_id, g.start) === records) throw new Error('另一个活跃主会话正在使用这份记录，先完成交接');
+  }
+  const previous = recordDir(root, sessionId, start);
+  ensureRecords(root, sessionId, start, objective, records);
+  const d = checkpointDir(root, sessionId, start);
+  fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(path.join(d, 'record-id.tmp'), path.basename(records) + '\n');
+  fs.renameSync(path.join(d, 'record-id.tmp'), path.join(d, 'record-id'));
+  if (previous !== records) for (const name of ['retro-done', 'inbox-at', 'review-start', 'scout-start']) {
+    try { fs.unlinkSync(path.join(d, name)); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  }
+  return records;
+}
+
 // Task artifacts, newest first. Scout artifacts are flagged, since they aren't task progress.
-function taskFiles(root, name) {
-  const base = path.join(dir(root), 'tasks');
+function taskFiles(records, name) {
+  const base = path.join(records, 'tasks');
   let names = [];
   try { names = fs.readdirSync(base); } catch {}
   const out = [];
@@ -181,13 +209,13 @@ function taskFiles(root, name) {
   }
   return out.sort((a, b) => b.mtime - a.mtime);
 }
-export const reports = root => taskFiles(root, 'report.md');
-export const resultFiles = root => [path.join(dir(root), 'results.tsv'), path.join(root, 'results.tsv'),
-  ...taskFiles(root, 'results.tsv').filter(r => !r.scout).map(r => r.file)];
+export const reports = records => taskFiles(records, 'report.md');
+export const resultFiles = records => [path.join(records, 'results.tsv'),
+  ...taskFiles(records, 'results.tsv').filter(r => !r.scout).map(r => r.file)];
 
 // Untested ideas in the pool ("- [ ] ..." lines), or null when the project has no pool.
-export function openIdeas(root) {
-  const f = path.join(dir(root), 'ideas.md');
+export function openIdeas(records) {
+  const f = path.join(records, 'ideas.md');
   return fs.existsSync(f) ? (read(f).match(/^\s*[-*] \[ \]/gm) || []).length : null;
 }
 
@@ -267,7 +295,7 @@ export function trackedAgents(sessionId) {
     try { h = JSON.parse(read(path.join(d, f))); } catch {}
     const stopAt = mtime(path.join(d, `${id}.stop`));
     const last = mtime(path.join(d, f)); // a header caught mid-write reads as a fresh segment
-    return { id, type: h.type || '?', seg: h.seg || last, tp: h.tp || '', last, stopAt, active: !stopAt };
+    return { id, type: h.type || '?', seg: h.seg || last, tp: h.tp || '', recordId: h.recordId || '', last, stopAt, active: !stopAt };
   });
 }
 
@@ -379,11 +407,11 @@ function updateWorker(root, id, change) {
   return result;
 }
 // A new segment: what the last one said and how it ended don't carry over. thread: undefined keeps the old one.
-export function workerStart(root, id, { desc, type = 'external', driver = '', pid = null, child = null, thread, cwd } = {}) {
+export function workerStart(root, id, { desc, type = 'external', driver = '', pid = null, child = null, thread, cwd, recordId } = {}) {
   const w = updateWorker(root, id, prev => ({
     desc: desc || prev?.desc || '', type, driver, seg: Math.max(Date.now(), (prev?.seg || 0) + 1), stopAt: 0, pid, child,
     thread: thread === undefined ? prev?.thread ?? null : thread,
-    cwd: cwd ?? prev?.cwd ?? null, rollout: '', childAt: 0, cmd: null, cmdAt: 0, said: '', asks: 0, exit: null, why: null, activityAt: 0, waiting: null,
+    cwd: cwd ?? prev?.cwd ?? null, recordId: recordId ?? prev?.recordId ?? '', rollout: '', childAt: 0, cmd: null, cmdAt: 0, said: '', asks: 0, exit: null, why: null, activityAt: 0, waiting: null,
   }));
   log(root, '-', 'agent-start', `${safe(id)} ${type}`);
   return w;
@@ -410,7 +438,7 @@ export function workers(root) {
     const last = mtime(path.join(workersDir(root), f));
     const gone = !w.stopAt && (w.pid ? !alive(w.pid) : now - last >= C.GONE);
     return {
-      id: f.slice(0, -5), worker: true, type: w.type || 'external', driver: w.driver || '', desc: w.desc || '', tp: '', seg: w.seg, last,
+      id: f.slice(0, -5), worker: true, type: w.type || 'external', driver: w.driver || '', desc: w.desc || '', tp: '', recordId: w.recordId || '', seg: w.seg, last,
       stopAt: w.stopAt || (gone ? last : 0), active: !w.stopAt && !gone, gone, cmd: w.cmd || '', cmdAt: w.cmdAt || 0, said: w.said || '',
       asks: w.asks || 0, activityAt: Number(w.activityAt) || last, waiting: w.waiting || null,
     };
@@ -434,11 +462,15 @@ const forget = (sessionId, root, a, now) => {
 export function goalAgents(sessionId, since, now = Date.now(), root = null, prune = true) {
   const all = [...trackedAgents(sessionId), ...(root ? workers(root) : [])];
   if (prune) for (const a of all) if (now - Math.max(a.last, a.stopAt) > 864e5) forget(sessionId, root, a, now);
-  const agents = all.filter(a => Math.max(a.seg, a.last, a.stopAt) >= since && now - Math.max(a.last, a.stopAt) <= 864e5);
+  const records = root && since > 0 ? path.basename(recordDir(root, sessionId, since)) : '';
+  const agents = all.filter(a => (!records || a.recordId === records) && Math.max(a.seg, a.last, a.stopAt) >= since && now - Math.max(a.last, a.stopAt) <= 864e5);
   return { agents, running: agents.filter(a => a.active && (a.worker || now - a.last < C.GONE)) };
 }
 // When executors handed back (subagents of the session and the project's workers): progress for the checkpoint.
-export const handbacks = (sessionId, root) => [...trackedAgents(sessionId), ...workers(root)].map(a => a.stopAt).filter(Boolean);
+export const handbacks = (sessionId, root) => {
+  const goal = goalCache(sessionId);
+  return goal ? goalAgents(sessionId, goal.start, Date.now(), root, false).agents.map(a => a.stopAt).filter(Boolean) : [];
+};
 // A name the main agent knows the subagent by. Claude Code: the description in subagents/agent-<id>.meta.json next to
 // the main transcript. Codex: the agent path its rollout's first record names. A worker: what its driver called it.
 // Else the id.
@@ -600,9 +632,9 @@ export function sessions(root) {
 
 // Newest sign of task progress in the project: a task report, a ledger row, a commit on any branch or worktree, or
 // one of `extra` (times subagents finished).
-export function newestResult(root, extra = []) {
-  return Math.max(0, ...extra, ...reports(root).filter(r => !r.scout).map(r => r.mtime),
-    ...resultFiles(root).map(mtime), gitActivity(root));
+export function newestResult(root, extra = [], records) {
+  return Math.max(0, ...extra, ...reports(records).filter(r => !r.scout).map(r => r.mtime),
+    ...resultFiles(records).map(mtime), gitActivity(root));
 }
 
 function gitActivity(root) {
@@ -624,7 +656,7 @@ function gitActivity(root) {
 }
 
 // The goal text recorded in PROGRESS.md ("目标（同 /goal）：… · 怎么证明：…"), for when a session lost track of it.
-export function progressGoal(root) {
-  const m = read(progressFile(root)).match(/^目标[^：:\n]*[：:]\s*(.+)$/m);
+export function progressGoal(records) {
+  const m = read(progressFile(records)).match(/^目标[^：:\n]*[：:]\s*(.+)$/m);
   return m ? m[1].split(' · ')[0].trim() : '';
 }

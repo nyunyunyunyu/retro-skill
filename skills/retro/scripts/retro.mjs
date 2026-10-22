@@ -3,6 +3,7 @@
 // project is CLAUDE_PROJECT_DIR, else the nearest directory up from here holding .retro/, else the current directory;
 // inside a git worktree, the same place in the main checkout (so worktrees share one .retro/). Exit codes: 2 = slot
 // voided/replaced, 3 = busy.
+//   records show|new|use <id> [--session <id>]   inspect or explicitly select the goal document directory
 //   init                   keep process records local using Git's shared info/exclude; report already tracked files
 //   done [--session <id>]  mark a checkpoint finished; the next is due 60 min later, once something came back. Its
 //                          window starts where this checkpoint's inbox looked, so reports landing meanwhile count next time
@@ -13,8 +14,8 @@
 //   spawned <start>        a review/scout subagent marks itself started and learns its deadline
 //   finish <start> <file>  a review/scout subagent hands in its report (file, or - for stdin)
 //   abort <start>          the main agent couldn't start the subagent; frees the slot
-//   status                 progress digest for the progress desk (read-only)
-//   metrics [--since <ISO>]   process metrics since the goal started, for analysis after a run (read-only)
+//   status [--session <id>] progress digest for the progress desk (read-only)
+//   metrics [--session <id>] [--since <ISO>]   process metrics since the goal started, for analysis after a run (read-only)
 //   tell <text>            the progress desk passes on what the user said; delivered at the main agent's next tool call
 //   watch [--session <id>] runs in the background (Claude Code) and exits, waking the main agent, when an executor is
 //                          silent, stuck or past its hour (the hook then says what to do), when the goal stops, or when
@@ -28,7 +29,7 @@ import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  C, EXIT_BUSY, EXIT_GONE, WATCH_TICK, activity, agentName, alive, checkpointDir, dir, ensureDir, executorNotes, goalAgents, goalCache,
+  recordDir, recordPath, selectRecords, C, EXIT_BUSY, EXIT_GONE, WATCH_TICK, activity, agentName, alive, checkpointDir, dir, ensureDir, executorNotes, goalAgents, goalCache,
   harnessLimit, headOf, iso, lastRetro, lastWrite, limitOf, locked, log, mainCheckout, mtime, openIdeas, progressFile, read, readSlot,
   readRequest, readSlots, reports, resultFiles, safe, sessions, slotExpired, tailRecords, timedTools, watchFile, workerBeat, workerStart, workerStop, writeSlot,
 } from './lib.mjs';
@@ -45,9 +46,9 @@ const ago = t => (t ? `${clock(t)}（${Math.max(0, Math.round((now - t) / 60e3))
 const fail = (msg, code = 1) => { console.log(msg); process.exit(code); };
 const busy = () => fail('状态文件被其他进程占用：等几秒后重试同一条命令。', EXIT_BUSY);
 
-const commands = { init, done, inbox, slots, request, spawned, finish, abort, status, metrics, tell, watch, worker, root: () => console.log(root) };
-if (!commands[cmd]) fail('用法：node retro.mjs <init|done [--session <id>]|inbox [--session <id>] [--since-last review|scout]|slots <N> <理由> [--session <id>]|request review|scout [--session <id>]|spawned <start>|finish <start> <file>|abort <start>|status|metrics [--since <ISO>]|tell <话>|watch [--session <id>]|worker start|beat|stop <id>> [--root <项目>]');
-commands[cmd]();
+const commands = { records, init, done, inbox, slots, request, spawned, finish, abort, status, metrics, tell, watch, worker, root: () => console.log(root) };
+if (!commands[cmd]) fail('用法：node retro.mjs <records show|new|use <记录ID> [--session <id>]|init|done [--session <id>]|inbox [--session <id>] [--since-last review|scout]|slots <N> <理由> [--session <id>]|request review|scout [--session <id>]|spawned <start>|finish <start> <file>|abort <start>|status|metrics [--since <ISO>]|tell <话>|watch [--session <id>]|worker start|beat|stop <id>> [--root <项目>]');
+try { await commands[cmd](); } catch (error) { fail(error.message); }
 
 // Same mapping as the hook: a worktree path stands for the same place in the main checkout.
 function findRoot(arg) {
@@ -67,7 +68,7 @@ function init() {
   const meta = git(['rev-parse', '--path-format=absolute', '--git-path', 'info/exclude', '--show-prefix']);
   if (meta.status !== 0) fail(`无法定位 Git 本地排除文件：${meta.error?.message || meta.stderr.trim()}`);
   const [file, prefix = ''] = meta.stdout.trimEnd().split(/\r?\n/);
-  const records = ['.retro/', 'PROGRESS.md', 'RUNBOOK.md', 'runbook/', 'results.tsv'];
+  const records = ['.retro/'];
   const rules = records.map(p => '/' + (prefix + p).replace(/([\\*?\[\]])/g, '\\$1'));
   try {
     const raw = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
@@ -114,10 +115,11 @@ function checkpointSession(kind) {
     selected = choices[0];
   }
   const id = selected?.session_id;
+  if (!id) fail('需要已被 hook 记录的目标；在目标会话触发一次工具调用后重试。');
   const owner = slot?.state === 'running' && slot.type === kind && slot.by === safe(id);
-  const start = (owner && Number(slot.kv.goalStart)) || (id && Number(goalCache(id)?.start)) || Date.parse(selected?.goal_start) || 0;
-  if (id && !(start > 0 && Number.isFinite(start))) fail('会话记录缺少有效的目标开始时间，无法确定读取位置。');
-  return { id, start };
+  const start = owner ? Number(slot.kv.goalStart) : Number(goalCache(id)?.start) || Date.parse(selected.goal_start);
+  if (!(start > 0 && Number.isFinite(start))) fail('会话记录缺少有效的目标开始时间，无法确定读取位置。');
+  return { id, start, records: owner ? recordPath(root, slot.kv.recordId) : recordDir(root, id, start) };
 }
 
 function activeSession() {
@@ -126,39 +128,67 @@ function activeSession() {
   return owner;
 }
 
+// Read-only views select an explicit session, or the sole active session; never guess between live goals.
+function selectedSession(all) {
+  const i = rest.indexOf('--session');
+  if (i >= 0) {
+    const selected = all.find(s => s.session_id === rest[i + 1]);
+    if (!selected) fail('找不到指定会话');
+    return selected;
+  }
+  const active = all.filter(s => goalCache(s.session_id)?.active);
+  if (active.length > 1) fail('项目有多个活跃目标，请用 --session <会话 ID> 选择');
+  return active[0] || all[0];
+}
+
+function records() {
+  const action = rest[0] || 'show';
+  if (!['show', 'new', 'use'].includes(action)) fail('用法：records show|new|use <记录ID> --session <会话>');
+  const owner = action === 'show' ? checkpointSession() : activeSession();
+  let target = owner.records;
+  if (action !== 'show') {
+    if (action === 'use' && !rest[1]) fail('records use 缺少记录 ID');
+    target = locked(root, () => selectRecords(root, owner.id, owner.start, goalCache(owner.id).cond, action === 'use' ? rest[1] : null), 50);
+    if (!target) busy();
+    log(root, owner.id, 'records', action + ' ' + path.basename(target));
+  }
+  console.log(JSON.stringify({ session: owner.id, goalStart: owner.start, objective: goalCache(owner.id)?.cond, id: path.basename(target), directory: target, progress: progressFile(target) }, null, 2));
+}
+
 function done() {
-  const { id, start } = checkpointSession();
+  const { id, start, records } = checkpointSession();
   const d = checkpointDir(root, id, start);
   ensureDir(root);
   fs.mkdirSync(d, { recursive: true });
   const looked = Date.parse(read(path.join(d, 'inbox-at')).trim()) || 0;
   fs.writeFileSync(path.join(d, 'retro-done'), iso(looked > lastRetro(root, id, start) ? Math.min(looked, now) : now) + '\n');
   log(root, id, 'checkpoint-done', rest.join(' ').trim());
-  log(root, id, 'snapshot', snapshot());
-  const file = progressFile(root), size = mtime(file) ? fs.statSync(file).size : 0;
-  const open = openIdeas(root);
+  log(root, id, 'snapshot', snapshot(records));
+  const file = progressFile(records), size = mtime(file) ? fs.statSync(file).size : 0;
+  const open = openIdeas(records);
   const out = [`已记录检查点（${clock(now)}）。下一个最早在 60 分钟后，期间有新结果才会提醒。`];
   if (!/抽查/.test(rest.join(' '))) out.push('这次没有写抽查结果：下次检查点记得抽查一份回报，用 done "抽查 <任务>：一致" 记下。');
   if (!size) out.push(`${file} 缺失或为空。`);
   else if (size > C.PROGRESS_MAX) out.push(`${file} 有 ${(size / 1024).toFixed(1)} KB，超过 4 KB，请压缩。`);
-  out.push(open === null ? '还没有想法池 .retro/ideas.md。' : `想法池里未验证的想法 ${open} 条${open < C.OPEN_IDEAS_MIN ? '，偏少' : ''}。`);
+  out.push(open === null ? '还没有当前目标的想法池。' : `想法池里未验证的想法 ${open} 条${open < C.OPEN_IDEAS_MIN ? '，偏少' : ''}。`);
   console.log(out.join(''));
 }
 
 function inbox() {
   // Since this goal's last checkpoint, or since this goal started.
   // A background agent asks for everything since its previous round, which the last checkpoint may have cut short.
-  const review = path.join(dir(root), 'route-review.md');
   const si = rest.indexOf('--since-last'), kind = si >= 0 ? rest[si + 1] : null;
   if (si >= 0 && kind !== 'review' && kind !== 'scout') fail('用法：inbox [--since-last review|scout]');
-  const { id, start } = checkpointSession(kind), d = checkpointDir(root, id, start);
-  // Old unscoped cursors cannot be attributed safely; replay from the goal start on first use.
+  const { id, start, records } = checkpointSession(kind), d = checkpointDir(root, id, start);
+  const review = path.join(records, 'route-review.md');
   const from = kind ? Date.parse(read(path.join(d, `${kind}-start`)).trim()) || 0 : lastRetro(root, id, start);
-  const R = Math.max(from, start);
+  let since = start;
+  try { since = Number(JSON.parse(read(path.join(records, 'goal.json'))).start) || start; } catch {}
+  const R = Math.max(from, since);
   if (!kind) { ensureDir(root); fs.mkdirSync(d, { recursive: true }); fs.writeFileSync(path.join(d, 'inbox-at'), iso(now) + '\n'); }
   console.log(`# ${{ review: '上次路线评审', scout: '上次侦察' }[kind] || '上次检查点'}以来交回的内容（从 ${ago(R)} 起）`);
   // The newest reports that fit, printed oldest first.
-  const list = reports(root).filter(r => r.mtime > R);
+  const list = reports(records).filter(r => r.mtime > R);
   const shown = [];
   let budget = 16000;
   for (const r of list) {
@@ -168,9 +198,9 @@ function inbox() {
     shown.unshift({ r, body });
   }
   for (const { r, body } of shown) console.log(`\n## ${r.scout ? '侦察' : '任务'} ${r.task}（${clock(r.mtime)}）\n${body}`);
-  if (list.length > shown.length) console.log(`\n（更早的 ${list.length - shown.length} 份回报超出长度没有列出，需要时直接读 .retro/tasks/*/report.md）`);
+  if (list.length > shown.length) console.log(`\n（更早的 ${list.length - shown.length} 份回报超出长度没有列出，需要时直接读 ${records}/tasks/*/report.md）`);
   if (mtime(review) > R) console.log(`\n## 路线评审（${clock(mtime(review))}）\n${clip(read(review), 2000)}`);
-  const tables = resultFiles(root).filter(f => mtime(f) > R);
+  const tables = resultFiles(records).filter(f => mtime(f) > R);
   let shownTables = 0;
   for (const f of tables) {
     const rows = read(f).split('\n').filter(Boolean);
@@ -179,7 +209,7 @@ function inbox() {
     budget -= body.length; shownTables++;
     console.log(`\n## 结果表 ${path.relative(root, f)}（共 ${rows.length} 行，最后更新 ${clock(mtime(f))}），第一行和最后 5 行：\n${body}`);
   }
-  if (tables.length > shownTables) console.log(`\n另有 ${tables.length - shownTables} 份结果表超出长度，需要时按任务读取 .retro/tasks/*/results.tsv 或项目总表。`);
+  if (tables.length > shownTables) console.log(`\n另有 ${tables.length - shownTables} 份结果表超出长度，需要时按任务读取 ${records}/tasks/*/results.tsv 或该目标总表。`);
   if (!list.length && mtime(review) <= R) console.log('\n没有新的任务回报或评审。');
 }
 
@@ -223,19 +253,21 @@ function request() {
 }
 
 // What the idea pool, backlog and PROGRESS.md look like at a checkpoint, for metrics later (they get rewritten).
-function snapshot() {
-  const ideas = read(path.join(dir(root), 'ideas.md'));
+function snapshot(records) {
+  const ideas = read(path.join(records, 'ideas.md'));
   const dead = (ideas.split(/^#{2,}\s*死路.*$/m)[1] || '').split(/^#{1,}\s/m)[0].split(/\r?\n/).filter(l => /^[-*]\s/.test(l));
-  const backlog = read(path.join(dir(root), 'backlog.md')).split('\n').filter(l => /^\s*[-*]\s/.test(l)).length;
-  const file = progressFile(root), size = mtime(file) ? fs.statSync(file).size : 0;
-  return `想法 ${openIdeas(root) ?? 0} 死路 ${dead.length} 可疑 ${dead.filter(l => /可疑/.test(l)).length} 积压 ${backlog} PROGRESS ${(size / 1024).toFixed(1)}KB`;
+  const backlog = read(path.join(records, 'backlog.md')).split('\n').filter(l => /^\s*[-*]\s/.test(l)).length;
+  const file = progressFile(records), size = mtime(file) ? fs.statSync(file).size : 0;
+  return `想法 ${openIdeas(records) ?? 0} 死路 ${dead.length} 可疑 ${dead.filter(l => /可疑/.test(l)).length} 积压 ${backlog} PROGRESS ${(size / 1024).toFixed(1)}KB`;
 }
 
 // Process metrics since the goal started, from log.tsv, the review archive and the task reports. What needs judgment
 // (were decisions overturned, did briefs need clarifying) is left to whoever reads this.
 function metrics() {
   // From the earliest start of this goal across its sessions; to now while it runs, else to the last event.
-  const all = sessions(root), ms = all[0];
+  const all = sessions(root), ms = selectedSession(all);
+  if (!ms) { console.log('没有记录到在这个项目里跑 /goal 的会话。'); return; }
+  const records = recordDir(root, ms.session_id, Date.parse(ms.goal_start));
   const starts = all.filter(s => ms && s.goal === ms.goal).map(s => Date.parse(s.goal_start)).filter(Boolean);
   const si = rest.indexOf('--since');
   const since = (si >= 0 && Date.parse(rest[si + 1])) || (starts.length ? Math.min(...starts) : 0);
@@ -268,8 +300,8 @@ function metrics() {
 
   const reserved = rows.filter(r => r.ev === 'slot-reserved');
   const startLag = reserved.map(r => rows.find(x => x.ev === 'spawned' && x.d === r.d.split(' ')[1])?.t - r.t).filter(x => x >= 0);
-  const reviews = (() => { try { return fs.readdirSync(path.join(dir(root), 'reviews')); } catch { return []; } })()
-    .map(n => read(path.join(dir(root), 'reviews', n)))
+  const reviews = (() => { try { return fs.readdirSync(path.join(records, 'reviews')); } catch { return []; } })()
+    .map(n => read(path.join(records, 'reviews', n)))
     .filter(t => (Date.parse(t.match(/start=(\S+)/)?.[1]) || 0) >= since);
   out.push(`\n## 后台评审\n登记 ${reserved.length} 次（评审 ${reserved.filter(r => r.d.startsWith('review')).length}，侦察 ${reserved.filter(r => r.d.startsWith('scout')).length}，按请求 ${reserved.filter(r => /requested/.test(r.d)).length}）；启动 ${count('spawned')}，交付 ${count('finished')}，放弃 ${count('aborted')}，超时作废 ${rows.filter(r => /^slot-(timeout|unlaunched|stale)$/.test(r.ev)).length}；从登记到启动 ${stats(startLag)}。停滞 ${count('stall')} 次。`);
   out.push(`路线评审存档 ${reviews.length} 份。结论：${tally(reviews, new RegExp(label('结论') + '(保持|调整优先级|先探测|换路线)'))}。上轮建议：${tally(reviews, new RegExp(label('上轮建议') + '(部分采纳|未采纳|采纳|未记录)'))}。判断依据有意见的 ${reviews.filter(t => has(t, label('判断依据') + '(?![（(]?无)[^\\s*]')).length} 份。`);
@@ -296,12 +328,12 @@ function metrics() {
   }
   out.push(lines.join(''));
 
-  const texts = reports(root).filter(r => !r.scout && r.mtime >= since).map(r => read(r.file));
+  const texts = reports(records).filter(r => !r.scout && r.mtime >= since).map(r => read(r.file));
   out.push(`\n## 任务回报\n${texts.length} 份；标“推翻前提”的 ${texts.filter(t => has(t, '(^|[：:])\\s*([-*]\\s+)?\\**推翻前提\\**\\s*[：:—-]')).length} 份；核实：一致 ${texts.filter(t => has(t, label('核实') + '一致')).length}，不一致 ${texts.filter(t => has(t, label('核实') + '不一致')).length}。`);
 
   const snaps = rows.filter(r => r.ev === 'snapshot');
   if (snaps.length) out.push(`\n## 想法池和积压（检查点时的快照）\n第一次：${snaps[0].d}\n最近一次：${snaps.at(-1).d}`);
-  out.push(`\n## 需要判断的\n主 agent 的决定被推翻了几次、任务说明是否要反复澄清、${progressFile(root)} 是否和实际一致：派一个子代理读这份输出、.retro/reviews/、任务回报和 git log 来判断。`);
+  out.push(`\n## 需要判断的\n主 agent 的决定被推翻了几次、任务说明是否要反复澄清、${progressFile(records)} 是否和实际一致：派一个子代理读这份输出、${path.join(records, 'reviews')}、任务回报和 git log 来判断。`);
   console.log(out.join('\n'));
 }
 
@@ -316,15 +348,16 @@ function spawned() {
       return 'gone';
     }
     const at = s.spawned ? s.spawnedAt : checked;
+    const records = recordPath(root, s.kv.recordId);
     if (!s.spawned) writeSlot(root, { ...s.kv, spawned: iso(checked) });
-    return { end: at + limitOf(s.type), type: s.type };
+    return { end: at + limitOf(s.type), type: s.type, records };
   }, 50);
   if (r === 'gone') fail('这一轮已作废、已完成或不是这个开始时间：不要继续，也不要写任何文件，直接结束。', EXIT_GONE);
   if (r === undefined) busy();
   log(root, '', 'spawned', start);
-  const notes = path.join(dir(root), 'probes', `${r.type}-${start.replace(/[-:]/g, '')}`, 'notes.md');
+  const notes = path.join(r.records, 'probes', `${r.type}-${start.replace(/[-:]/g, '')}`, 'notes.md');
   fs.mkdirSync(path.dirname(notes), { recursive: true });
-  console.log(`已标记启动。限时到 ${clock(r.end)}（${iso(r.end)}），超过就会作废。细节边做边写进 ${notes.replace(/\\/g, '/')}。`);
+  console.log(`已标记启动。记录目录 ${r.records}；先核对其中 PROGRESS.md 与主会话传入的目标。限时到 ${clock(r.end)}（${iso(r.end)}），超过就会作废。细节边做边写进 ${notes.replace(/\\/g, '/')}。`);
 }
 
 function finish() {
@@ -340,20 +373,21 @@ function finish() {
       log(root, s.by, s.spawned ? 'slot-timeout' : 'slot-unlaunched', `${s.type} ${start}`);
       return 'gone';
     }
+    const records = recordPath(root, s.kv.recordId);
+    const d = checkpointDir(root, s.by, Number(s.kv.goalStart));
     const stamp = start.replace(/[-:]/g, '');
     let out;
     if (s.type === 'scout') {
-      out = path.join(dir(root), 'tasks', `scout-${stamp}`, 'report.md');
+      out = path.join(records, 'tasks', `scout-${stamp}`, 'report.md');
       fs.mkdirSync(path.dirname(out), { recursive: true });
       fs.writeFileSync(out, text.trim() + '\n');
     } else {
-      out = path.join(dir(root), 'route-review.md');
+      out = path.join(records, 'route-review.md');
       const body = `<!-- route-review start=${start} end=${iso(now)} -->\n${text.trim()}\n`;
-      fs.mkdirSync(path.join(dir(root), 'reviews'), { recursive: true });
-      fs.writeFileSync(path.join(dir(root), 'reviews', `${stamp}.md`), body);
+      fs.mkdirSync(path.join(records, 'reviews'), { recursive: true });
+      fs.writeFileSync(path.join(records, 'reviews', `${stamp}.md`), body);
       fs.writeFileSync(out, body);
     }
-    const d = checkpointDir(root, s.by, Number(s.kv.goalStart));
     fs.mkdirSync(d, { recursive: true });
     fs.writeFileSync(path.join(d, `${s.type}-start`), start + '\n');
     writeSlot(root, { ...s.kv, state: 'done', end: iso(now) });
@@ -372,7 +406,7 @@ function tell() {
   if (!text) fail('用法：tell <用户的原话>（或 tell - 从标准输入读）');
   const target = sessions(root).map(s => ({ ...s, current: goalCache(s.session_id) })).find(s => s.current?.active && s.current.start);
   if (!target) fail('没有找到目标还在进行的主会话（目标可能已结束或暂停），转达不了：请用户直接在主会话里说。', EXIT_GONE);
-  const line = JSON.stringify({ at: iso(now), to: target.session_id, goal_start: iso(target.current.start), goal: target.current.cond, text }) + '\n';
+  const line = JSON.stringify({ at: iso(now), to: target.session_id, goal_start: iso(target.current.start), recordId: path.basename(recordDir(root, target.session_id, target.current.start)), goal: target.current.cond, text }) + '\n';
   if (!locked(root, () => { fs.appendFileSync(path.join(dir(root), 'user-inbox.jsonl'), line); return true; }, 50)) busy();
   log(root, '', 'tell', text);
   const idle = Math.round((now - target.active) / 60e3);
@@ -432,7 +466,7 @@ function worker() {
   const pid = Number(flag('--pid')) || null, type = flag('--type') || 'external';
   const [sub, id, ...desc] = rest;
   if (!id || safe(id) !== id) fail('用法：node retro.mjs worker start <id> [说明] [--pid <驱动进程>] [--type <类型>] | beat <id> | stop <id>（id 只用字母、数字、_ 和 -）');
-  if (sub === 'start') { workerStart(root, id, { desc: desc.join(' '), type, pid }); console.log(`已登记 ${id}。`); }
+  if (sub === 'start') { const owner = activeSession(); workerStart(root, id, { desc: desc.join(' '), type, pid, recordId: path.basename(owner.records) }); console.log(`已登记 ${id}。`); }
   else if (sub === 'beat') { if (!workerBeat(root, id)) fail(`${id} 没有登记或已经停了。`); }
   else if (sub === 'stop') console.log(workerStop(root, id) ? `已记下 ${id} 停了。` : `${id} 没有登记或已经停了。`);
   else fail('用法：worker start|beat|stop <id>');
@@ -441,9 +475,11 @@ function worker() {
 function status() {
   const all = sessions(root);
   const out = [`# 进度快照（${new Date(now).toLocaleString('zh-CN', { hour12: false })}，项目 ${root}）`];
-  if (!all.length) out.push('没有记录到在这个项目里跑 /goal 的会话。');
-  if (all.length > 1) out.push(`有 ${all.length} 个会话在这里设过 /goal：${all.map(s => `「${clip(s.goal, 40)}」（最后活动 ${ago(s.active)}）`).join('；')}。下面看最近活动的那个。`);
-  const ms = all[0] || {};
+  if (!all.length) { console.log(out.concat('没有记录到在这个项目里跑 /goal 的会话。').join('\n')); return; }
+  if (all.length > 1) out.push(`有 ${all.length} 个会话在这里设过 /goal：${all.map(s => `「${clip(s.goal, 40)}」（最后活动 ${ago(s.active)}）`).join('；')}。下面按明确选择的会话或唯一活跃会话查看。`);
+  const ms = selectedSession(all);
+  const records = recordDir(root, ms.session_id, Date.parse(ms.goal_start) || 0);
+  out.push(`记录目录：${records}`);
   if (ms.goal) out.push(`目标：${ms.goal}（开始于 ${ago(Date.parse(ms.goal_start))}）`);
   const cache = ms.session_id ? goalCache(ms.session_id) : null;
   if (cache) out.push(`目标状态：hook 最后一次看到时${cache.active ? '进行中' : '已结束或暂停'}。`);
@@ -473,16 +509,16 @@ function status() {
   const kind = { review: '路线评审', scout: '全局侦察', stall: '停滞提醒' }[s.type] || s.type;
   const pending = readRequest(root, ms.session_id, start);
   out.push(`后台评审：${s.state === 'none' ? '还没用过' : `${kind} ${s.state}，登记于 ${ago(s.start)}${s.spawned ? `，启动于 ${ago(s.spawnedAt)}` : ''}`}${pending ? `；当前目标已请求一次${pending === 'scout' ? '侦察' : '评审'}` : ''}`);
-  const reps = reports(root);
+  const reps = reports(records);
   out.push(`\n## 任务回报（${reps.length} 份，最近 8 份）`);
   for (const r of reps.slice(0, 8)) out.push(`- ${r.task}（${ago(r.mtime)}）：${firstLine(read(r.file))}`);
-  const tables = resultFiles(root).filter(f => mtime(f));
+  const tables = resultFiles(records).filter(f => mtime(f));
   for (const f of tables.slice(0, 8)) {
     const rows = read(f).split('\n').filter(Boolean);
     out.push(`\n## 结果表 ${path.relative(root, f)}（${rows.length} 行，更新于 ${ago(mtime(f))}）\n${clip([rows[0], ...rows.slice(-3)].join('\n'), 2000)}`);
   }
   if (tables.length > 8) out.push(`\n另有 ${tables.length - 8} 份结果表，按需读取对应任务的 results.tsv。`);
-  const progressPath = progressFile(root), progress = read(progressPath);
+  const progressPath = progressFile(records), progress = read(progressPath);
   if (progress) out.push(`\n## ${path.relative(root, progressPath)}（更新于 ${ago(mtime(progressPath))}，前 20 行）\n${progress.split('\n').slice(0, 20).join('\n')}`);
   const events = read(path.join(dir(root), 'log.tsv')).split('\n').filter(Boolean).slice(-8);
   if (events.length) out.push(`\n## 最近事件\n${events.join('\n')}`);
@@ -546,7 +582,7 @@ function subagents({ transcript_path: transcript, session_id: sessionId, goal_st
         const f = path.join(d, n), head = headOf(f, 8192);
         if (!head.includes('"thread_spawn"') || !head.includes(`"parent_thread_id":"${sessionId}"`)) continue;
         const pick = k => head.match(new RegExp(`"${k}":"([^"]*)"`))?.[1];
-        list.push({ f, t: lastWrite(f), name: path.basename(pick('agent_path') || n), type: pick('agent_role') || '?' });
+        list.push({ id: pick('id') || pick('session_id'), f, t: lastWrite(f), name: path.basename(pick('agent_path') || n), type: pick('agent_role') || '?' });
       }
     }
   } else {
@@ -557,9 +593,11 @@ function subagents({ transcript_path: transcript, session_id: sessionId, goal_st
       const f = path.join(d, n);
       let meta = {};
       try { meta = JSON.parse(read(f.replace(/\.jsonl$/, '.meta.json'))); } catch {}
-      return { f, t: mtime(f), name: meta.description || n, type: meta.agentType || '?', stopped: meta.stoppedByUser };
+      return { id: n.slice(6, -6), f, t: mtime(f), name: meta.description || n, type: meta.agentType || '?', stopped: meta.stoppedByUser };
     });
   }
+  const current = goalAgents(sessionId, Date.parse(goal_start) || 0, now, root, false).agents.filter(a => !a.worker);
+  list = list.filter(a => current.some(t => t.id === a.id || t.tp === a.f));
   if (!list.length) return [];
   list = list.sort((a, b) => b.t - a.t).slice(0, 6);
   const out = [`\n## 子代理（最近活动的 ${list.length} 个）`];

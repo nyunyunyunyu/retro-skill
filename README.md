@@ -1,5 +1,7 @@
 # retro-skill
 
+版本见 [VERSION](VERSION)，发布规则见 [VERSIONING.md](VERSIONING.md)。
+
 A coordination layer for long coding tasks in Claude Code and Codex. The main agent stays responsive; subagents execute and investigate. Scripts record facts and raise reminders. Native `/goal` owns continuation and lifecycle.
 
 retro 把长任务中的执行、观察和决定分开，让主 agent 能及时处理用户指令与回报。当前交付是 **两个 skill、hook、辅助脚本和两个评审角色**，用安装脚本部署；尚未打包成平台 plugin。
@@ -26,8 +28,6 @@ node retro-skill/install.mjs
 
 只安装一个平台用 `--codex` 或 `--claude`。安装器会复制两个 skill 及其参考文件、安装评审角色，并合并缺少的 hook；Claude 配置修改前备份为 `.bak-retro`，已有 Codex hook 条目保留。
 
-从旧版文件锁升级时，先停止旧的 worker、watch、恢复监控及使用这些脚本的会话，再更新所有共用项目状态的安装副本。新锁使用持久的 `*.lock.db`，进程退出自动释放，不能按文件年龄删除；新旧锁协议不能混跑。遗留的旧 `*.lock` 会阻止新脚本写入，只有确认没有旧进程后才能清理对应旧锁文件，保留 `.db` 文件。
-
 | 内容 | Claude Code | Codex |
 |---|---|---|
 | skill | `~/.claude/skills/` | `~/.agents/skills/` |
@@ -36,12 +36,12 @@ node retro-skill/install.mjs
 
 `agents/claude/` 是两个平台共用的角色源文件，目录名表示源文件采用 Claude 的 Markdown 格式。Claude 安装时直接复制；Codex 安装时从同一文件生成 `name`、`description`、推理强度和正文指令，不照搬 Claude 专有的工具列表、后台与轮数参数。它们注册在平台的 **agent 列表**，不是另外两个 skill。
 
-Codex 安装后在 `/hooks` 中信任新增条目，包括用于工具开始计时的 `PreToolUse`。旧条目的信任保留。新会话更适合确认 skill 和角色已经可用；旧会话是否发现新能力取决于平台刷新机制，fork 也不保证重新发现。
+Codex 安装后在 `/hooks` 中信任新增条目，并在新会话确认 skill 和角色可用。
 
 设定可验证的目标，再调用 retro：Codex 用 `$retro`，Claude Code 用 `/retro`。建议在项目常驻规则中写：
 
 ```text
-- 设了 /goal 的长任务，开始时调用 retro skill；开始工作前先读 .retro/PROGRESS.md，不存在时兼容读取根目录的 PROGRESS.md。
+- 设了 /goal 的长任务，开始时调用 retro skill；开始时核对原生 goal，用 records show 定位目标目录并读其中的 PROGRESS.md。
 - 评测或构建预计超过约 1 分钟时，放到后台运行，等待期间做不冲突的事；不要改它依赖的文件，也不要抢同一 GPU/CPU。
 ```
 
@@ -82,7 +82,7 @@ hook 是全局安装、按会话目标状态过滤的：没有活跃目标时不
 
 正常可响应时，目标是在长调用启动后 **20 分钟内完成第一次瓶颈判断**。hook 不能抢占前台长调用、权限等待或不可响应的模型；它不保证墙钟时间内强制唤醒。主 agent 用有界等待，耗时工作留给执行者。选择继续后留下复查点，由后续主循环处理；当前没有任意复查点的定时器。
 
-Claude Code 可在后台运行 `retro.mjs watch`，让待判断的事件结束该后台命令；收到完成通知后，主 agent 查看 `status`，下一次工具事件送达提醒。Codex 使用原生子代理与有界等待。Stop 保留兼容注册但不输出续跑要求。
+Claude Code 可在后台运行 `retro.mjs watch`，让待判断的事件结束该后台命令；收到完成通知后，主 agent 查看 `status`，下一次工具事件送达提醒。Codex 使用原生子代理与有界等待。
 
 ## 常用命令与状态
 
@@ -90,6 +90,7 @@ Claude Code 可在后台运行 `retro.mjs watch`，让待判断的事件结束�
 
 | 命令 | 作用 |
 |---|---|
+| `retro.mjs records show\|new\|use <记录ID> --session <会话>` | 查看当前目标目录、创建独立记录或显式延续原记录 |
 | `retro.mjs init` | 配置过程记录的 Git 本地排除，列出已经被跟踪的记录路径 |
 | `retro.mjs status` | 目标、回报、执行者、评审和近期事件 |
 | `retro.mjs inbox --session <会话>` / `done "<决定>" --session <会话>` | 该会话当前目标尚未处理的结果 / 标记检查点完成 |
@@ -101,17 +102,19 @@ Claude Code 可在后台运行 `retro.mjs watch`，让待判断的事件结束�
 | `retro.mjs tell "<用户原话>"` | 进度台转达；下一次主 agent 工具事件交付 |
 | `codex-recover.mjs start\|status\|stop` | 为当前本机 Codex 目标启用、查看或停用临时故障恢复 |
 
-`.retro/PROGRESS.md` 是主 agent 的简短恢复快照，不存在时兼容读取根目录旧版 `PROGRESS.md`。任务细节在 `.retro/tasks/<任务>/`。想法池、积压与结果表按需要维护，具体归属见 [state.md](skills/retro/references/state.md)。`.retro/` 由主 checkout 与 worktree 共用，新建时写入忽略规则；会话提醒和追踪文件在系统临时目录。不要手改脚本维护的登记和锁。
+项目保留一个 `.retro/`，目标记录放在 `.retro/goals/<记录ID>/`。ID 用 UTC 日期加短十六进制 ID，例如 `20261021-7c2f8a91`；目标名称写在进度文件里。该目录包含 PROGRESS.md、RUNBOOK.md、runbook/、ideas.md、backlog.md、tasks/、results.tsv 和评审记录。RUNBOOK.md 与进度同属当前目标，记录方法、参数和适用条件；确认可跨目标复用的知识再整理进项目正式文档。
 
-并行执行者各自在任务 `notes.md` 记录方法和踩坑，回报后由主 agent 按需要指派一名执行者合并到共享 RUNBOOK；其他执行者只读手册。影响当前工作的发现及时回报，不等到收尾才共享。
+新原生目标默认新建记录；进行中的微调或恢复保持同一目录。平台给了新身份但仍是同一项未完成工作时，用 `records use <记录ID> --session <会话>` 明确关联；平台身份不变但本质上已换目标时，用 `records new`。目标已完成后追加相关工作使用新目录，仅摘取适用的证据并记录来源。判断延续关系由主 agent 负责，不按文字相似度猜测。
 
-项目指定一个协调主会话写共享进度和想法；backlog 委托期间主会话停写，确认交回或停止后才收回写入权。任务 ID 在项目内唯一。各评测写自己的任务结果表，再由唯一汇总者合并项目总表；hook 和进度台直接识别任务表。独立目标需要各自维护共享状态时使用独立 clone，worktree 不隔离 `.retro/`。
+每个目标目录只有一个协调主会话写共享进度和想法；目标手册由该目标指定的合并者维护。执行者拿到当前目标、记录 ID 和绝对目录，写自己的任务笔记和结果表，之后由唯一汇总者合并该目标总表。不同目标可在同一项目独立记录；worktree 仍共用项目状态，不能并发改同一文件。任务 ID 在项目内唯一。
 
-过程记录默认不纳入版本控制。Git 项目写记录前运行 `retro.mjs init --root <项目>`，将 `.retro/` 和旧布局的 PROGRESS.md、RUNBOOK.md、runbook/、results.tsv 加入本地 `info/exclude`；不修改项目 `.gitignore`，同仓库 worktree 共用。新进度与工作手册分别放 `.retro/PROGRESS.md`、`.retro/RUNBOOK.md`，中间笔记与报告也留在 `.retro/`。已跟踪文件会被列出，确认属于过程记录后仅取消索引跟踪，保留本地文件。代码、测试、AGENTS.md 中的项目规则和正式交付文档照常按需提交。
+`inbox`、`status`、检查点和评审按目标目录读取；旧任务的迟到回报留在原目录。具体协议见 [state.md](skills/retro/references/state.md)。
 
-检查点、评审读取位置、名额与待处理评审请求按会话和目标分别保存。`inbox`、`done`、`slots`、`request` 只有一个候选主会话时可以省略 `--session`，多个候选时必须明确指定；后台 `inbox --since-last review|scout` 从当前登记取得归属。升级后无法归属的旧读取位置、名额和请求不沿用，首次可能重读回报，需重新记录名额或请求。报告和结果表仍在项目内共享，读取位置不代表报告归属。
+过程记录默认不纳入版本控制。Git 项目写记录前运行 `retro.mjs init --root <项目>`，将 `.retro/` 加入本地 `info/exclude`；不修改项目 `.gitignore`，同仓库 worktree 共用。新进度与目标手册分别放目标目录的 PROGRESS.md、`<目标目录>/RUNBOOK.md`，中间笔记与报告也留在 `.retro/`。已跟踪文件会被列出，确认属于过程记录后仅取消索引跟踪，保留本地文件。代码、测试、AGENTS.md 中的项目规则和正式交付文档照常按需提交。
 
-`tell` 排队时绑定会话和目标身份；交付时目标已变更，或旧格式消息缺少目标身份，会存入 `.retro/user-said.md` 并标为未送达，不自动交给新目标执行。
+检查点、评审读取位置、名额与待处理评审请求按会话和目标分别保存。`inbox`、`done`、`slots`、`request` 只有一个候选主会话时可以省略 `--session`，多个候选时必须明确指定；后台 `inbox --since-last review|scout` 从当前登记取得归属。
+
+`tell` 排队时绑定会话和目标身份；交付时目标已变更，或消息缺少目标身份，会存入 `.retro/user-said.md` 并标为未送达，不自动交给新目标执行。
 
 等待用户授权时，记录待授权事项并继续独立工作。有项目追问约定就按它安排真实的一次性提醒；没有可用定时能力时说明未设定，不能只写笔记就声称已安排。
 
@@ -126,12 +129,12 @@ paused、预算或额度限制、安全阻止、未知错误都不自动继续�
 Codex 当主 agent 通常使用原生子代理。只有用户选择跨平台执行时使用 `codex-worker.mjs`：
 
 ```text
-codex-worker.mjs run <任务> --root <项目> [--cd <worktree>] [--timeout <分钟>]
-codex-worker.mjs resume <任务> "<追问>" --root <项目>
+codex-worker.mjs run <任务> --records <记录ID> --root <项目> [--cd <worktree>] [--timeout <分钟>]
+codex-worker.mjs resume <任务> "<追问>" --records <记录ID> --root <项目>
 codex-worker.mjs stop <任务> --root <项目>
 ```
 
-先写 `.retro/tasks/<任务>/brief.md`，run/resume 在后台运行。驱动登记线程、命令、rollout 活动和心跳，事件存到 `codex-events.jsonl`，最后消息存到 `codex-last.md`。**静默不再自动 stop/resume**；心跳与模型活动分开记录，让 hook 提醒主 agent 判断。
+先写 `<目标目录>/tasks/<任务>/brief.md`，run/resume 在后台运行。驱动登记线程、命令、rollout 活动和心跳，事件存到 `codex-events.jsonl`，最后消息存到 `codex-last.md`。**静默不再自动 stop/resume**；心跳与模型活动分开记录，让 hook 提醒主 agent 判断。
 
 每次 run/resume 默认 **120 分钟硬超时**，可用 `--timeout` 改变。显式 stop 或硬超时尝试终止进程树，未落盘结果可能丢失。运行中的线程不能直接收追问，需要等结束或明确停止后再 resume。驱动失联时，停止结果仍须核对实际进程。
 
@@ -143,7 +146,7 @@ codex-worker.mjs stop <任务> --root <项目>
 
 Windows 默认查找桌面版目录中同时含 `codex.exe` 和 `codex-code-mode-host.exe` 的版本，并带上对应功能开关；找不到或其他系统用 PATH 上的 codex。可用 `RETRO_CODEX` 指定可执行文件或 JSON 数组，例如 `["C:/tools/codex.exe", "-c", "model_reasoning_effort=\"high\""]`；指定后不再自动发现。模型与思考强度沿用 Codex 配置。
 
-其他驱动可使用 `retro.mjs worker start|beat|stop` 登记；未提供进程号时，60 分钟无心跳视为失联。旧登记格式仍可读，新驱动可额外报告 `activityAt` 和 `waiting`，区分心跳与真实活动。
+其他驱动可使用 `retro.mjs worker start|beat|stop` 登记；未提供进程号时，60 分钟无心跳视为失联。驱动可报告 `activityAt` 和 `waiting`，区分心跳与真实活动。
 
 ## 验证与限制
 
@@ -151,8 +154,8 @@ Windows 默认查找桌面版目录中同时含 `codex.exe` 和 `codex-code-mode
 
 - 目标与活动读取依赖 Claude/Codex 内部记录、Codex 目标数据库和 rollout 格式。平台变化可能让检测失效。
 - hook 只能在平台提供的事件触发。代码模式的外层 exec 单元不一定触发，不能把所有命令都看见作为前提。
-- 子代理追踪可能滞后；外部执行者按项目登记，同项目多个目标会话可能看到同一执行者。
-- Claude 同一目标文本在 12 小时内重设沿用旧计时；不能可靠区分“恢复”与“从头开始”。Codex 使用目标创建时间。
+- 子代理追踪可能滞后；执行者按目标记录 ID 归属。
+- Claude 未完成目标的同一文本在 12 小时内重设沿用原计时；不能可靠区分“恢复”与“从头开始”。Codex 使用目标创建时间。
 - 取消目标会停止后续提醒，不自动取消已运行的进程，也不会清空上下文；主 agent 要安排执行者收尾。
 
 ## License

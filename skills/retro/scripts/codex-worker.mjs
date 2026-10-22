@@ -3,8 +3,8 @@
 // and registers it as a worker (.retro/workers/, see lib.mjs): the hook counts it in the slots and notices a long
 // segment, and the checkpoint sees it hand back. Silence is reported for the main agent to assess; only an explicit
 // stop or the hard timeout ends a running turn. Every command takes --root <project>.
-//   run <task> [--brief <file>] [--cd <dir>] [--desc <name>] [--timeout <min>]
-//                 a new thread on the brief (default .retro/tasks/<task>/brief.md), working in --cd (default the project)
+//   run <task> [--records <id>] [--brief <file>] [--cd <dir>] [--desc <name>] [--timeout <min>]
+//                 a new thread on the brief (default <goal-records>/tasks/<task>/brief.md), working in --cd (default the project)
 //   resume <task> <message> [--brief <file>] [--timeout <min>]   the same thread again, in the same directory: a
 //                 follow-up, or more time
 //   stop <task>   asks the run/resume driving the thread to stop it with its process tree (.retro/workers/<task>.stop)
@@ -22,12 +22,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  C, alive, codexCommand, dir, mainCheckout, mtime, read, readWorker, rolloutStep, safe, withLock, workerBeat, workerStart, workerStop,
+  recordDir, recordPath, sessions, goalCache, C, alive, codexCommand, dir, mainCheckout, mtime, read, readWorker, rolloutStep, safe, withLock, workerBeat, workerStart, workerStop,
 } from './lib.mjs';
 
 const args = process.argv.slice(2);
 const opt = name => { const i = args.indexOf(name); if (i < 0) return null; const v = args[i + 1]; args.splice(i, 2); return v ?? ''; };
 const rootArg = opt('--root'), briefArg = opt('--brief'), cdArg = opt('--cd'), descArg = opt('--desc'), timeoutArg = opt('--timeout');
+const recordArg = opt('--records');
 const [cmd, task, ...words] = args;
 const root = mainCheckout(rootArg || process.env.CLAUDE_PROJECT_DIR || process.cwd());
 const SELF = fileURLToPath(import.meta.url).replace(/\\/g, '/');
@@ -39,10 +40,22 @@ const TICK = Math.min(1000, C.SILENT / 20);
 
 if (!['run', 'resume', 'stop'].includes(cmd) || !task) fail('用法：node codex-worker.mjs run <任务> [--brief <文件>] [--cd <目录>] [--desc <名字>] [--timeout <分钟>] | resume <任务> <话> | stop <任务>，都要加 --root <项目>');
 if (safe(task) !== task) fail(`任务名只用字母、数字、_ 和 -：${task}`);
-const taskDir = path.join(dir(root), 'tasks', task), workersDir = path.join(dir(root), 'workers');
+const prev = readWorker(root, task);
+let records;
+try {
+  const active = sessions(root).filter(s => goalCache(s.session_id)?.active);
+  if (recordArg && prev?.recordId && prev.recordId !== recordArg) fail('任务已属于另一份目标记录，请使用新的任务名');
+  if (cmd === 'run' && prev?.recordId && !recordArg && (active.length !== 1 || path.basename(recordDir(root, active[0].session_id, goalCache(active[0].session_id).start)) !== prev.recordId)) fail('任务名已属于其他或未确认的目标，请用新任务名或显式 --records');
+  if (recordArg || prev?.recordId) records = recordPath(root, recordArg || prev.recordId);
+  else if (active.length === 1) records = recordDir(root, active[0].session_id, goalCache(active[0].session_id).start);
+  else if (active.length > 1) fail('有多个活跃目标，必须用 --records <记录ID> 指定归属');
+  else fail('请用 --records <记录ID> 指定任务归属');
+  if (!mtime(path.join(records, 'goal.json'))) fail('目标记录不存在');
+} catch (error) { fail(error.message); }
+const recordId = path.basename(records);
+const taskDir = path.join(records, 'tasks', task), workersDir = path.join(dir(root), 'workers');
 const stopFile = path.join(workersDir, `${task}.stop`), lockFile = path.join(workersDir, `${task}.lock`);
 const lastFile = path.join(taskDir, 'codex-last.md'), eventsFile = path.join(taskDir, 'codex-events.jsonl');
-const prev = readWorker(root, task);
 const isRunning = w => !!w && !w.stopAt && !!w.pid && alive(w.pid);
 let exe, pre;
 try { [exe, ...pre] = codexCommand(); } catch { fail('RETRO_CODEX 不是合法的 JSON 数组。'); }
@@ -83,7 +96,7 @@ const ro = { file: '', off: 0, rest: Buffer.alloc(0), lookedAt: 0, saved: '' };
 const got = withLock(lockFile, () => {
   if (isRunning(readWorker(root, task))) return 'busy';
   for (const f of [lastFile, stopFile]) try { fs.unlinkSync(f); } catch {}
-  seg = workerStart(root, task, { desc, type: 'codex', driver: 'codex-worker', pid: process.pid, thread: thread0, cwd }).seg;
+  seg = workerStart(root, task, { desc, type: 'codex', driver: 'codex-worker', pid: process.pid, thread: thread0, cwd, recordId }).seg;
   try {
     launch(thread0, prompt);
     workerBeat(root, task, { child: child.pid ?? null }, seg);

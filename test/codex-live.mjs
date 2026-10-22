@@ -36,11 +36,12 @@ const hook = (extra = {}) => {
   return r.stdout ? JSON.parse(r.stdout).hookSpecificOutput.additionalContext : '';
 };
 const cli = (...a) => spawnSync(process.execPath, [path.join(SCRIPTS, 'retro.mjs'), ...a, '--root', proj], { env: hookEnv, encoding: 'utf8' }).stdout;
-const retro = p => path.join(proj, '.retro', p);
+let record;
+const retro = p => path.join(p.startsWith('tasks/') ? record.directory : path.join(proj, '.retro'), p);
 const worker = id => { try { return JSON.parse(fs.readFileSync(retro(`workers/${id}.json`), 'utf8')); } catch { return null; } };
 const start = (...a) => {
   const extra = typeof a.at(-1) === 'object' ? a.pop() : {};
-  const p = spawn(process.execPath, [path.join(SCRIPTS, 'codex-worker.mjs'), ...a, '--root', proj], { env: { ...env, ...extra } });
+  const p = spawn(process.execPath, [path.join(SCRIPTS, 'codex-worker.mjs'), ...a, '--records', record.id, '--root', proj], { env: { ...env, ...extra } });
   let out = '';
   p.stdout.on('data', d => (out += d));
   p.stderr.on('data', d => (out += d));
@@ -61,10 +62,11 @@ const step = (name, t0 = Date.now()) => () => console.log(`ok   ${name}（${Math
 
 try {
   assert.doesNotMatch(hook(), /检查点到期/);
+  record = JSON.parse(cli('records', 'show', '--session', 'live'));
   const slot = Object.fromEntries([...fs.readFileSync(retro('slot'), 'utf8').matchAll(/(\w+)=(\S+)/g)].map(m => [m[1], m[2]]));
   cli('spawned', slot.start);
   cli('slots', '1', 'live');
-  fs.writeFileSync(retro('slots'), JSON.stringify({ n: 1, at: new Date(Date.now() - 6 * MIN).toISOString(), why: 'live' }));
+  fs.writeFileSync(retro(`checkpoints/live/${record.goalStart}/slots`), JSON.stringify({ n: 1, at: new Date(Date.now() - 6 * MIN).toISOString(), why: 'live' }));
 
   let ok = step('a task brief runs as a Codex thread; the hook counts it while it runs; it follows executor.md, commits and reports');
   brief('t1', `# 写 hello.txt\n任务：在项目根目录 ${proj.replace(/\\/g, '/')} 用一条 shell 命令创建 hello.txt，内容只有一行 hi from codex，然后用 git 提交它（提交信息 add hello）。\n验收：文件存在，内容正确；提交不了就在回报里写原因，不要绕过。验证档位：探索，验证预算 2 分钟。时间上限 10 分钟。\n任务目录：${retro('tasks/t1').replace(/\\/g, '/')}\n开始前先读 ${EXECUTOR}，按其中的规则执行和回报。\n`);

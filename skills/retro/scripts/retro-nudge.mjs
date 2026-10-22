@@ -27,7 +27,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   C, SLOT_AGENTS, agentName, agentsDir, checkpointDir, claimSaid, codexGoal, ensureDir, executorNotes, goalAgents, handbacks, harnessLimit, iso, lastRetro,
-  locked, log, mainCheckout, newestResult, openIdeas, progressFile, progressGoal, read, readRequest, readSlot, readSlots, safe, said, sessions,
+  ensureRecords, recordDir, goalCache, locked, log, mainCheckout, newestResult, openIdeas, progressFile, progressGoal, read, readRequest, readSlot, readSlots, safe, said, sessions,
   slotExpired, trackTool, watching, writeSlot,
 } from './lib.mjs';
 
@@ -74,10 +74,12 @@ const WORKER = fileURLToPath(new URL('./codex-worker.mjs', import.meta.url)).rep
 const cmd = sub => `\`node "${CLI}" ${sub} --root "${root.replace(/\\/g, '/')}"\``;
 const wcmd = sub => `\`node "${WORKER}" ${sub} --root "${root.replace(/\\/g, '/')}"\``;
 const tool = goal.codex ? 'Codex' : 'Claude Code';
+let records;
+try { records = ensureRecords(root, input.session_id, goal.start, goal.cond); } catch { process.exit(0); }
 
 if (event === 'SessionStart') {
   if (input.source === 'compact') {
-    process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: `上下文刚被压缩。你在用 retro 推进 /goal「${goal.cond}」。先重读精简入口 ${SKILL} 的职责边界和主循环，再读 ${progressFile(root)}，运行 ${cmd('status')} 核对任务。主 agent 保持响应，具体执行和深入复盘交给子代理；参考文件只按当前需要读取。` } }));
+    process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: `上下文刚被压缩。你在用 retro 推进 /goal「${goal.cond}」。先重读精简入口 ${SKILL} 的职责边界和主循环，再读 ${progressFile(records)}，运行 ${cmd('status')} 核对任务。主 agent 保持响应，具体执行和深入复盘交给子代理；参考文件只按当前需要读取。` } }));
   }
   process.exit(0);
 }
@@ -88,6 +90,7 @@ try { if (event === 'PostToolUse') launched(); } catch {}
 try { userInbox(); } catch {}
 try { goalNote(); } catch {}
 try { sessionFile(); } catch {}
+if (claim(`records ${records} ${goal.cond}`, last => !last)) notes.push(`当前目标记录：${records}。先核对原生 goal 与其中的 PROGRESS.md。同一工作需要关联原目录时用 ${cmd(`records use <记录ID> --session ${input.session_id}`)}；本质不同的目标用 records new。`);
 try { checkpoint(); } catch {}
 try { slot(); } catch {}
 try { executors(); } catch {}
@@ -123,7 +126,7 @@ function track() {
   if (!type) return;
   const d = agentsDir(input.session_id), id = safe(input.agent_id || 'unknown');
   const f = path.join(d, `${id}.json`), stop = path.join(d, `${id}.stop`);
-  const header = () => JSON.stringify({ type, seg: now, tp: input.agent_transcript_path || input.transcript_path });
+  const header = () => JSON.stringify({ type, seg: now, tp: input.agent_transcript_path || input.transcript_path, recordId: path.basename(recordDir(where(), input.session_id, goalCache(input.session_id)?.start)) });
   fs.mkdirSync(d, { recursive: true });
   // The main session's project: a subagent's cwd may be a worktree, a subfolder or a fresh clone.
   const where = () => read(base + '.root') || mainCheckout(process.env.CLAUDE_PROJECT_DIR || input.cwd || process.cwd());
@@ -192,7 +195,7 @@ function userInbox() {
       let m;
       try { m = JSON.parse(l); } catch { continue; }
       if (m.to === input.session_id) {
-        if (m.goal_start === iso(goal.start)) { got.push(m.text); said.push(`- ${m.at} ${m.text}`); }
+        if (m.goal_start === iso(goal.start) && m.recordId === path.basename(records)) { got.push(m.text); said.push(`- ${m.at} ${m.text}`); }
         else {
           rejected++;
           said.push(`- ${m.at} （没有送达：${m.goal_start ? `目标已变更，原目标「${m.goal || '未知'}」 ${m.goal_start}` : '缺少目标身份'}）${m.text}`);
@@ -212,14 +215,14 @@ function userInbox() {
   if (!mine?.got.length) return;
   const text = mine.got.join('\n');
   log(root, sid, 'told', text);
-  notes.push(`用户在进度台说了下面的话，转给你：优先分清并处理指令、想法或问题，保留原意；有效的长期约束记进 ${progressFile(root)}，需要回答的及时回答。转达不扩大授权。\n${text}`);
+  notes.push(`用户在进度台说了下面的话，转给你：优先分清并处理指令、想法或问题，保留原意；有效的长期约束记进 ${progressFile(records)}，需要回答的及时回答。转达不扩大授权。\n${text}`);
 }
 
 // Record the session holding the goal, so the progress desk can find its transcript.
 // `unfinished` is the last goal this session replaced before it was done, for "/goal resume" in a later session.
 function sessionFile() {
   const f = path.join(root, '.retro', 'sessions', `${sid}.json`);
-  const want = JSON.stringify({ session_id: input.session_id, transcript_path: input.transcript_path, cwd: root, goal: goal.cond, goal_start: iso(goal.start), unfinished: goal.unfinished || undefined });
+  const want = JSON.stringify({ session_id: input.session_id, transcript_path: input.transcript_path, cwd: root, goal: goal.cond, goal_start: iso(goal.start), record_id: path.basename(records), unfinished: goal.unfinished || undefined });
   const had = read(f);
   if (had === want) return;
   ensureDir(root);
@@ -239,9 +242,9 @@ function goalNote() {
   if (resumeLike) {
     // PROGRESS.md holds the long-term goal; a temporary goal set in between may be the most recent one.
     const all = sessions(root);
-    const orig = [progressGoal(root), goal.unfinished, ...all.map(s => s.unfinished), goal.prev, ...all.map(s => s.goal), ...goal.past.map(p => p.cond).reverse()]
+    const orig = [progressGoal(records), goal.unfinished, ...all.map(s => s.unfinished), goal.prev, ...all.map(s => s.goal), ...goal.past.map(p => p.cond).reverse()]
       .find(g => g && !RESUME.test(g));
-    notes.push(`注意：当前 /goal 的条件只是字面上的「${goal.cond}」。Claude Code 的 /goal 没有恢复子命令，这样设的是一个新目标，评估器会按这几个字判断是否达成，原来的目标并没有恢复。请在回复里告诉用户：要恢复原目标，用 /goal 加原文重新设置。${orig ? `原目标是「${orig}」。` : `原文可以从 ${progressFile(root)} 的“目标”一栏找到。`}`);
+    notes.push(`注意：当前 /goal 的条件只是字面上的「${goal.cond}」。Claude Code 的 /goal 没有恢复子命令，这样设的是一个新目标，评估器会按这几个字判断是否达成，原来的目标并没有恢复。请在回复里告诉用户：要恢复原目标，用 /goal 加原文重新设置。${orig ? `原目标是「${orig}」。` : `原文可以从 ${progressFile(records)} 的“目标”一栏找到。`}`);
   } else {
     notes.push(`注意：/goal 刚被换成新条件，原来未完成的目标被替换了。原目标是「${goal.prev}」。如果新目标只是临时任务，完成时在回复里提醒用户用 /goal 加原文恢复。`);
   }
@@ -251,12 +254,12 @@ function checkpoint() {
   const R = Math.max(goal.start, lastRetro(root, input.session_id, goal.start));
   const due = R + C.CHECKPOINT_EVERY;
   // Only once something came back since the last one: with nothing to sort, the stall and idle-slot notes speak instead.
-  if (now < due || newestResult(root, handbacks(input.session_id, root)) <= R) return;
+  if (now < due || newestResult(root, handbacks(input.session_id, root), records) <= R) return;
   const first = !(saidMap().checkpoint >= due);
   if (!timely('checkpoint', due)) return;
   const mins = Math.round((now - R) / 60e3);
   if (first) log(root, sid, 'checkpoint-due', `${mins}min`);
-  const file = progressFile(root);
+  const file = progressFile(records);
   let text = `检查点到期（距上次检查点或目标开始 ${mins} 分钟）。在可响应的断点运行 ${cmd(`inbox --session ${input.session_id}`)} 汇集尚未处理的结果，更新关键决定和 ${file}，再运行 ${cmd(`done "<决定或核对结果>" --session ${input.session_id}`)}。深入复盘或核实交给子代理；主 agent 继续处理用户和回报。`;
   const size = fs.existsSync(file) ? fs.statSync(file).size : 0;
   if (size > C.PROGRESS_MAX) text += ` ${file} 现在 ${(size / 1024).toFixed(1)} KB，超过 4 KB：这次先压缩它（命令和环境移到手册，过程细节移到任务笔记）。`;
@@ -296,7 +299,7 @@ function slot() {
     const how = goal.codex
       ? `用 spawn_agent 启动 ${name} 子代理（agent_type 设为 "${name}"，fork_turns 设为 "none"），message 写`
       : `在后台启动 ${name} 子代理（Agent 工具，subagent_type 设为 ${name}，run_in_background 设为 true），提示写`;
-    return `${how}：“${type === 'scout' ? '侦察本项目' : '评审本项目的路线'}。开始时间 ${start}；脚本 ${CLI}；项目 ${root.replace(/\\/g, '/')}”。`;
+    return `${how}：“${type === 'scout' ? '侦察本项目' : '评审本项目的路线'}。开始时间 ${start}；脚本 ${CLI}；项目 ${root.replace(/\\/g, '/')}；记录目录 ${records}；当前目标 ${goal.cond}”。`;
   };
   const stopNote = `你启动的后台评审/侦察超过时间上限，已自动作废。能停就停掉它（${goal.codex ? 'interrupt_agent' : 'TaskStop'}）；停不掉也没关系，它交结论时会发现已作废，不会写入。`;
   // Tell the owner once to stop a voided subagent it launched, then drop `spawned` so it isn't told again.
@@ -309,12 +312,12 @@ function slot() {
   if (s.state === 'running') {
     // My own reservation, never launched, left over from an earlier goal. A launched one runs to its deadline; another
     // session's waits out its 20 minutes. The deadline includes the grace `finish` allows.
-    const stale = s.start < goal.start && !s.spawned && mine();
+    const stale = mine() && !s.spawned && (s.start < goal.start || (s.kv.recordId && s.kv.recordId !== path.basename(records)));
     const late = slotExpired(s, now);
     if (stale || late) {
       // Any session may void it (keeping `spawned`, so the owner still learns to stop it).
       const voided = locked(root, t => {
-        if (t.state !== 'running' || t.kv.start !== s.kv.start || !(slotExpired(t, now) || (t.start < goal.start && !t.spawned && t.by === sid))) return false;
+        if (t.state !== 'running' || t.kv.start !== s.kv.start || !(slotExpired(t, now) || (!t.spawned && t.by === sid && (t.start < goal.start || (t.kv.recordId && t.kv.recordId !== path.basename(records)))))) return false;
         writeSlot(root, { ...t.kv, state: 'aborted', end: iso(now) });
         return true;
       });
@@ -336,11 +339,11 @@ function slot() {
     if (t.state === 'running') return null;
     const requested = readRequest(root, input.session_id, goal.start);
     if (requested) return { type: requested, asked: true };
-    const first = t.start < goal.start; // nothing reserved yet for this goal
+    const first = t.start < goal.start || (t.kv.recordId && t.kv.recordId !== path.basename(records)); // nothing reserved yet for this goal
     if (!first && now - t.start < C.SLOT_EVERY) return null;
-    if (!first && newestResult(root, finished) < t.start) return { stall: true };
+    if (!first && newestResult(root, finished, records) < t.start) return { stall: true };
     const lastScout = t.lastScout >= goal.start ? t.lastScout : 0;
-    const open = openIdeas(root);
+    const open = openIdeas(records);
     const scout = !lastScout || now - lastScout >= C.SCOUT_EVERY || (open !== null && open < C.OPEN_IDEAS_MIN && t.type !== 'scout');
     return { type: scout ? 'scout' : 'review' };
   };
@@ -349,8 +352,8 @@ function slot() {
     const p = plan(t);
     if (!p) return null;
     const start = iso(now);
-    if (p.stall) writeSlot(root, { state: 'stalled', type: 'stall', start, by: sid, lastScout: t.kv.lastScout });
-    else writeSlot(root, { state: 'running', type: p.type, start, by: sid, goalStart: goal.start, lastScout: p.type === 'scout' ? start : t.kv.lastScout });
+    if (p.stall) writeSlot(root, { state: 'stalled', type: 'stall', start, by: sid, recordId: path.basename(records), lastScout: t.kv.lastScout });
+    else writeSlot(root, { state: 'running', type: p.type, start, by: sid, goalStart: goal.start, recordId: path.basename(records), lastScout: p.type === 'scout' ? start : t.kv.lastScout });
     if (p.asked) fs.unlinkSync(path.join(checkpointDir(root, input.session_id, goal.start), 'request'));
     return { ...p, start };
   });
@@ -368,30 +371,29 @@ function slot() {
 // Latest goal state of the transcript. The cache keeps the byte offset already scanned, so each run reads only what
 // was appended since; a corrupt or missing cache just means one full scan. A goal is identified by its condition
 // text (Codex: its createdAt), so the goal_status record Claude Code rewrites on resume or compaction doesn't restart
-// it; a condition that extends the current one ("…，成功后…") counts as the same goal, and so does one set again
+// it; a changed condition gets its own records until explicitly linked. An identical unfinished goal set again
 // within 12 h after it stopped (paused with /goal clear, or set aside for a temporary goal): it keeps its start.
 // Codex's rollout only records what the user sets, pauses or resumes, so its goal database has the last word.
 function goalState(transcript, cacheFile) {
   // v: bump whenever a field is added that is only computed on a full scan, so older caches get rebuilt.
-  const fresh = { v: 2, path: transcript, off: 0, active: false, start: 0, cond: '', prev: '', replaced: false, unfinished: '', past: [], codex: false, child: false };
+  const fresh = { v: 3, completed: false, path: transcript, off: 0, active: false, start: 0, cond: '', prev: '', replaced: false, unfinished: '', past: [], codex: false, child: false };
   const norm = s => String(s ?? '').trim();
-  const same = (a, b) => norm(a) === norm(b) || (norm(b) !== '' && norm(a).startsWith(norm(b)));
+  const same = (a, b) => norm(a) === norm(b);
   // The current goal stops being current: remember it (last 5), so setting it again soon continues it.
   const shelve = (st, at) => {
-    if (norm(st.cond)) st.past = [...st.past.filter(p => norm(p.cond) !== norm(st.cond)), { cond: st.cond, start: st.start, end: at }].slice(-5);
+    if (norm(st.cond)) st.past = [...st.past.filter(p => norm(p.cond) !== norm(st.cond)), { cond: st.cond, start: st.start, end: at, completed: st.completed }].slice(-5);
   };
   // One goal record: active or not, its condition (null: unchanged), its creation time (Codex only, else 0).
-  const apply = (st, at, active, cond, created) => {
+  const apply = (st, at, active, cond, created, completed = false) => {
     const changed = cond !== null && norm(cond) !== norm(st.cond);
     if (active && st.active && created && created === st.start) {
       if (cond !== null) st.cond = cond; // Codex: the same goal, its objective edited in place
-    } else if (active && changed && st.active && !created && same(cond, st.cond)) {
-      st.cond = cond; // extended the same goal
+
     } else if (active && (changed || !st.active || (created && created !== st.start))) {
       // A new goal, or a goal set again (Codex: a different createdAt means a new one).
       const c = cond ?? st.cond;
       if (st.active) shelve(st, at);
-      const back = created ? null : [...st.past].reverse().find(p => same(c, p.cond) && at - p.end < C.SAME_GOAL_GAP);
+      const back = created ? null : [...st.past].reverse().find(p => !p.completed && same(c, p.cond) && at - p.end < C.SAME_GOAL_GAP);
       st.replaced = st.active && changed && !back;
       if (st.replaced) st.unfinished = st.cond;
       if (back && same(st.unfinished, back.cond)) st.unfinished = '';
@@ -399,9 +401,11 @@ function goalState(transcript, cacheFile) {
       st.cond = c;
       st.start = created || back?.start || at;
     } else if (!active && st.active) {
+      st.completed = completed;
       shelve(st, at);
     }
     st.active = active;
+    st.completed = !active && (completed || st.completed);
   };
   let st = fresh;
   try {
@@ -430,24 +434,26 @@ function goalState(transcript, cacheFile) {
       let o;
       try { o = JSON.parse(buf.toString('utf8', s, buf.indexOf(10, s))); } catch { continue; }
       const at = Date.parse(o.timestamp) || now;
-      let active = null, cond = null, created = 0;
+      let active = null, cond = null, created = 0, completed = false;
       if (o.type === 'attachment' && o.attachment?.type === 'goal_status') {
         active = !o.attachment.met && !o.attachment.failed;
+        completed = !!o.attachment.met;
         cond = o.attachment.condition == null ? null : String(o.attachment.condition);
       } else if (o.type === 'system' && /^\s*(<local-command-stdout>)?\s*Goal cleared/.test(String(o.content))) {
         active = false;
       } else if (o.type === 'event_msg' && o.payload?.type === 'thread_goal_updated') {
         const g = o.payload.goal || {};
         active = g.status === 'active';
+        completed = g.status === 'complete' || g.status === 'completed';
         cond = g.objective == null ? null : String(g.objective);
         created = g.createdAt ? g.createdAt * 1000 : 0;
       }
-      if (active !== null) apply(st, at, active, cond, created);
+      if (active !== null) apply(st, at, active, cond, created, completed);
     }
     st.off += end;
     if (st.codex) {
       const row = codexGoal(input.session_id);
-      if (row !== undefined) apply(st, now, row?.status === 'active', row ? String(row.objective) : null, row ? Math.floor(Number(row.created_at_ms) / 1000) * 1000 : 0);
+      if (row !== undefined) apply(st, now, row?.status === 'active', row ? String(row.objective) : null, row ? Number(row.created_at_ms) : 0, row?.status === 'complete' || row?.status === 'completed');
     }
     fs.writeFileSync(cacheFile, JSON.stringify(st));
   } catch {}
